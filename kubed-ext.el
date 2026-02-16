@@ -3,7 +3,7 @@
 ;; Author: Chetan Koneru
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "29.1") (kubed "0.1.0") (futur "1.0") (transient "0.5.0"))
-;; URL: https://github.com/CsBigDataHub/kubed-ext
+;; URL: https://github.com/yourusername/kubed-ext
 ;; Keywords: tools, kubernetes
 
 ;;; Commentary:
@@ -16,6 +16,7 @@
 ;; - Strimzi Kafka support
 ;; - CRD Auto-discovery
 ;; - Server-side Label Selectors
+;; - Optimized Terminal integration (vterm/eat/eshell)
 
 ;;; Code:
 
