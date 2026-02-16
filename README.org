@@ -1,0 +1,297 @@
+#+TITLE: kubed-ext.el
+
+* Kubed Extensions
+
+#+html: <p align="center">
+#+html: <img src="https://img.shields.io/badge/Emacs-29.1+-7F5AB6?logo=gnuemacs&logoColor=white" alt="Emacs 29.1+"/>
+#+html: <img src="https://img.shields.io/badge/License-GPL--3.0-blue.svg" alt="License: GPL v3"/>
+#+html: </p>
+
+* Features
+
+** 🚀 Core Features
+- *True Async Metrics* - Non-blocking ~kubectl top~ using ~futur.el~
+- *Advanced Port Forwarding* - Auto-complete ports, management buffer, visual markers
+- *CRD Auto-Discovery* - Automatically fetch and display custom resource columns
+- *Server-Side Filtering* - Label selector support with auto-completion
+- *Strimzi Kafka Support* - Pause/resume reconciliation, restart connectors, scale operations
+- *Enhanced Resource Views* - Extended columns for pods, services, ingresses, PVs, and more
+- *Command Logging* - Track all kubectl commands in a dedicated buffer
+
+** 📊 Supported Resources
+Standard resources with enhanced columns:
+- Pods (with restarts, IP, node info)
+- Services (with selectors)
+- Deployments, StatefulSets, DaemonSets, ReplicaSets
+- Ingresses (with class, hosts, addresses)
+- Persistent Volumes & Claims
+- Nodes (with roles, taints, allocatable resources)
+- ConfigMaps, Secrets
+- Events (color-coded)
+- NetworkPolicies
+- HorizontalPodAutoscalers
+- PodDisruptionBudgets
+
+Strimzi/Kafka resources:
+- Kafka, KafkaConnect, KafkaBridge
+- KafkaTopic, KafkaUser
+- KafkaConnector, KafkaMirrorMaker2
+- KafkaNodePool, KafkaRebalance
+- StrimziPodSet
+
+* Requirements
+
+| Package           | Version | Purpose                          |
+|-------------------+---------+----------------------------------|
+| Emacs             | 29.1+   | Native ~:vc~ package support     |
+| [[https://github.com/eshelyaron/kubed][kubed]]             | latest  | Core Kubernetes integration      |
+| [[https://github.com/alexmurray/futur][futur]]             | 1.0+    | Async operations (non-blocking)  |
+| [[https://github.com/magit/transient][transient]]         | 0.5.0+  | Enhanced UI                      |
+| ~kubectl~         | any     | Kubernetes CLI                   |
+
+* Installation
+
+** Using use-package with :vc (Emacs 29+)
+
+Add this to your Emacs configuration:
+
+#+begin_src emacs-lisp
+;; Install futur first (required dependency)
+(use-package futur
+  :vc (:url "https://github.com/alexmurray/futur" :branch "main"))
+
+;; Install kubed (if not already installed)
+(use-package kubed
+  :vc (:url "https://github.com/eshelyaron/kubed" :branch "master")
+  :demand t)
+
+;; Install kubed-ext
+(use-package kubed-ext
+  :vc (:url "https://github.com/yourusername/kubed-ext" :branch "main")
+  :after kubed
+  :demand t
+  :config
+  ;; Optional: Set custom kubectl path
+  ;; (setq kubed-kubectl-program "/path/to/kubectl")
+
+  ;; Optional: Enable command logging
+  ;; (setq kubed-ext-log-commands t)
+  )
+#+end_src
+
+** Manual Installation
+
+1. Clone the repository:
+   #+begin_src bash
+   git clone https://github.com/yourusername/kubed-ext ~/.emacs.d/site-lisp/kubed-ext
+   #+end_src
+
+2. Add to your init file:
+   #+begin_src emacs-lisp
+   (add-to-list 'load-path "~/.emacs.d/site-lisp/kubed-ext")
+   (require 'kubed-ext)
+   #+end_src
+
+* Quick Start
+
+** Basic Usage
+
+1. *List resources*: ~M-x kubed-list-pods~ (or any resource type)
+2. *Switch context*: ~C-u C-u M-x kubed-list-pods~
+3. *Filter namespace*: ~C-u M-x kubed-list-pods~
+4. *Port forwarding*: Select pod, press ~F~ or ~M-x kubed-ext-pods-forward-port~
+5. *View metrics*: ~M-x kubed-ext-top-pods~ or ~M-x kubed-ext-top-nodes~
+
+** Key Bindings in List Buffers
+
+| Key       | Command                        | Description                      |
+|-----------+--------------------------------+----------------------------------|
+| ~F~       | Forward port                   | Port-forward to resource         |
+| ~T~       | Top (metrics)                  | Show resource metrics            |
+| ~RET~     | Describe                       | View resource details            |
+| ~e~       | Edit                           | Edit resource YAML               |
+| ~D~       | Delete                         | Delete resource                  |
+| ~g~       | Refresh                        | Update list                      |
+| ~C-c C-l~ | Set label selector             | Server-side filtering            |
+
+** Port Forward Management
+
+View all active port-forwards:
+#+begin_src emacs-lisp
+M-x kubed-ext-list-port-forwards
+#+end_src
+
+In the port-forward buffer:
+- ~D~ - Stop selected forward
+- ~K~ - Stop all forwards
+- ~g~ - Refresh list
+
+* Advanced Usage
+
+** Server-Side Label Selectors
+
+Filter resources server-side (more efficient than client-side):
+
+#+begin_src emacs-lisp
+;; In any kubed list buffer
+M-x kubed-ext-list-set-label-selector
+
+;; Example selectors:
+;; app=nginx
+;; environment=production,tier=frontend
+;; version!=v1.0.0
+#+end_src
+
+Auto-discover available labels:
+#+begin_src emacs-lisp
+M-x kubed-ext-discover-labels
+#+end_src
+
+** Strimzi Kafka Operations
+
+*** Pause/Resume Reconciliation
+#+begin_src emacs-lisp
+M-x kubed-ext-strimzi-pause-reconciliation
+M-x kubed-ext-strimzi-resume-reconciliation
+#+end_src
+
+*** Restart Kafka Connector
+#+begin_src emacs-lisp
+M-x kubed-ext-strimzi-restart-connector
+#+end_src
+
+*** Scale KafkaConnect
+#+begin_src emacs-lisp
+M-x kubed-ext-scale-kafkaconnect
+#+end_src
+
+** CRD Column Refresh
+
+After deploying new CRDs or changing contexts:
+#+begin_src emacs-lisp
+M-x kubed-ext-refresh-crd-columns
+#+end_src
+
+** Command Logging
+
+View all executed kubectl commands:
+#+begin_src emacs-lisp
+M-x kubed-ext-show-command-log
+#+end_src
+
+* Configuration
+
+** Customization Group
+
+#+begin_src emacs-lisp
+M-x customize-group RET kubed-ext RET
+#+end_src
+
+** Available Options
+
+#+begin_src emacs-lisp
+;; Enable command logging (default: nil)
+(setq kubed-ext-log-commands t)
+
+;; Custom kubectl binary path
+(setq kubed-kubectl-program "/usr/local/bin/kubectl")
+
+;; Port-forward face customization
+(custom-set-faces
+ '(kubed-ext-port-forward-face
+   ((((background dark)) :background "#2a3a2a")
+    (((background light)) :background "#d8f5d8"))))
+#+end_src
+
+* Comparison with Other Tools
+
+| Feature                      | kubed-ext | k9s | Lens | kubectl |
+|------------------------------+-----------+-----+------+---------|
+| Emacs Integration            | ✓         | ✗   | ✗    | ✗       |
+| Async/Non-blocking           | ✓         | ✓   | ✓    | ✗       |
+| CRD Auto-discovery           | ✓         | ✓   | ✓    | ✗       |
+| Port-forward Management      | ✓         | ✓   | ✓    | ✗       |
+| Server-side Label Filtering  | ✓         | ✓   | ✓    | ✓       |
+| Strimzi Operations           | ✓         | ✓   | ✗    | ✗       |
+| Terminal/Shell Integration   | ✓         | ✓   | ✓    | ✓       |
+| Resource Editing             | ✓         | ✓   | ✓    | ✓       |
+| Keyboard-driven              | ✓         | ✓   | ✗    | ✓       |
+
+* Troubleshooting
+
+** Metrics not showing
+Ensure metrics-server is installed in your cluster:
+#+begin_src bash
+kubectl top nodes  # Test from command line first
+#+end_src
+
+** CRD columns not appearing
+Manually refresh the CRD cache:
+#+begin_src emacs-lisp
+M-x kubed-ext-refresh-crd-columns
+#+end_src
+
+** Port-forward fails
+Check:
+1. Resource exists: ~kubectl get <resource>~
+2. Port is available: ~netstat -an | grep <port>~
+3. Context is correct: ~kubectl config current-context~
+
+** Async operations hanging
+Verify ~futur.el~ is installed:
+#+begin_src emacs-lisp
+M-: (require 'futur)
+#+end_src
+
+* Contributing
+
+Contributions are welcome! Please:
+
+1. Fork the repository
+2. Create a feature branch (~git checkout -b feature/amazing-feature~)
+3. Commit your changes (~git commit -m 'Add amazing feature'~)
+4. Push to the branch (~git push origin feature/amazing-feature~)
+5. Open a Pull Request
+
+** Development Guidelines
+- Follow Emacs Lisp conventions
+- Use ~kubed-ext-~ prefix for all functions/variables
+- Add docstrings to all public functions
+- Include ~condition-case~ for external process calls
+- Test with multiple Kubernetes versions
+
+* License
+
+GPL-3.0 License - See LICENSE file for details
+
+* Acknowledgments
+
+- [[https://github.com/eshelyaron/kubed][Kubed]] by Eshel Yaron - Core Kubernetes integration
+- [[https://github.com/alexmurray/futur][futur.el]] by Alex Murray - Async operations
+- [[https://k9scli.io/][k9s]] - Inspiration for UX and features
+- [[https://kubernetes.io/][Kubernetes]] community
+
+* Roadmap
+
+** Planned Features
+- [ ] Helm chart management
+- [ ] Pod log streaming with auto-scroll
+- [ ] Resource usage graphs (sparklines)
+- [ ] YAML validation and syntax checking
+- [ ] Multi-cluster management
+- [ ] Custom resource templates
+- [ ] Integrated terminal (vterm/eat) for kubectl exec
+- [ ] ArgoCD/FluxCD integration
+
+** Community Requests
+Open an issue to suggest features!
+
+* Support
+
+- Issues: https://github.com/yourusername/kubed-ext/issues
+- Discussions: https://github.com/yourusername/kubed-ext/discussions
+- Matrix: #kubed-ext:matrix.org
+
+---
+
+*Made with ❤️ for the Emacs and Kubernetes communities*
