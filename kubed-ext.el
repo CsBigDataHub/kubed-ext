@@ -16,8 +16,6 @@
 ;; - Strimzi Kafka support
 ;; - CRD Auto-discovery
 ;; - Server-side Label Selectors
-;; - Optimized Terminal integration (vterm/eat/eshell)
-;;; kubed-ext.el --- Extensions for Kubed  -*- lexical-binding: t; -*-
 
 ;;; Code:
 
