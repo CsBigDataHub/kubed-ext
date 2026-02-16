@@ -3,7 +3,7 @@
 ;; Author: Chetan Koneru
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "29.1") (kubed "0.1.0") (futur "1.0") (transient "0.5.0"))
-;; URL: https://github.com/yourusername/kubed-ext
+;; URL: https://github.com/CsBigDataHub/kubed-ext
 ;; Keywords: tools, kubernetes
 
 ;;; Commentary:
@@ -1120,7 +1120,7 @@ Returns the process object."
                         (format "kubectl exited %d" exit-code))))))))))
 
 (defun kubed-ext--async-kubectl-2 (args1 args2 callback &optional errback)
-  "Run two kubectl commands concurrently via process sentinels.
+  "Run two kubectl commands with ARGS1 and ARGS2 concurrently.
 Call CALLBACK with (output1 output2) when both succeed.
 Call ERRBACK on first failure."
   (let ((results (cons nil nil))
@@ -1535,7 +1535,7 @@ Call ERRBACK on first failure."
 ;; ── ansi-term (direct kubectl exec) ──
 
 (defun kubed-ext-pods-ansi-term (click)
-  "Open ansi-term in Kubernetes pod at CLICK position."
+  "Open `ansi-term' in Kubernetes pod at CLICK position."
   (interactive (list last-nonmenu-event) kubed-pods-mode)
   (if-let ((pod (tabulated-list-get-id (mouse-set-point click))))
       (let* ((container (kubed-read-container pod "Container" t
@@ -1889,7 +1889,7 @@ Call ERRBACK on first failure."
     (user-error "No Kubernetes resource at point")))
 
 (transient-define-prefix kubed-ext-copy-popup ()
-  "Kubed Copy Menu"
+  "Kubed Copy Menu."
   ["Copy to kill ring"
    ("w" "Resource name"  kubed-list-copy-as-kill)
    ("l" "Log command"    kubed-ext-list-copy-log-command)
@@ -2038,7 +2038,7 @@ Call ERRBACK on first failure."
 ;; ── Command Log ──
 
 (defun kubed-ext--make-process-logger (orig-fn &rest args)
-  "Log kubectl make-process calls; ORIG-FN is the advised function, ARGS its args."
+  "Log kubectl `make-process' call; ORIG-FN is the advised function, ARGS its args."
   (when-let* ((cmd (plist-get args :command))
               ((stringp (car cmd)))
               ((string-suffix-p "kubectl"
