@@ -3,7 +3,7 @@
 ;; Author: Chetan Koneru
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "29.1") (kubed "0.1.0") (futur "1.0") (transient "0.5.0"))
-;; URL: https://github.com/yourusername/kubed-ext
+;; URL: https://github.com/CsBigDataHub/kubed-ext
 ;; Keywords: tools, kubernetes
 
 ;;; Commentary:
@@ -17,6 +17,7 @@
 ;; - CRD Auto-discovery
 ;; - Server-side Label Selectors
 ;; - Optimized Terminal integration (vterm/eat/eshell)
+;;; kubed-ext.el --- Extensions for Kubed  -*- lexical-binding: t; -*-
 
 ;;; Code:
 
@@ -25,14 +26,6 @@
 (require 'transient)
 (require 'cl-lib)
 (require 'json)
-
-;; FIX #2: soft-require futur + declare its functions
-(require 'futur nil t)
-(declare-function futur-all "futur")
-(declare-function futur-then "futur")
-(declare-function futur-catch "futur")
-(declare-function futur-command "futur")
-(declare-function futur-completed-p "futur")
 
 (defgroup kubed-ext nil
   "Extensions for Kubed."
@@ -780,6 +773,7 @@
 ;;; § 7.  New Built-in Resources
 ;;; ═══════════════════════════════════════════════════════════════
 
+;; Node: per-node "top" action restored from original config
 (eval '(kubed-define-resource node
            ((status ".status.conditions[-1:].status" 10
                     nil
@@ -824,7 +818,44 @@
             (creationtimestamp ".metadata.creationTimestamp" 20))
          :namespaced nil
          (top "T" "Show resource metrics for"
-              (kubed-ext-top-nodes kubed-list-context)))
+              (let* ((ctx kubed-list-context)
+                     (top-out (with-temp-buffer
+                                (call-process kubed-kubectl-program nil t nil
+                                              "top" "node" node
+                                              "--no-headers" "--context" ctx)
+                                (buffer-string)))
+                     (top-f (split-string (string-trim top-out) nil t))
+                     (cpu-used (kubed-ext-parse-cpu (nth 1 top-f)))
+                     (mem-used (kubed-ext-parse-mem (nth 3 top-f)))
+                     (alloc-out (with-temp-buffer
+                                  (call-process
+                                   kubed-kubectl-program nil t nil
+                                   "get" "node" node "--no-headers"
+                                   "--context" ctx "-o"
+                                   "custom-columns=CPU:.status.allocatable.cpu,MEM:.status.allocatable.memory")
+                                  (buffer-string)))
+                     (alloc-f (split-string (string-trim alloc-out) nil t))
+                     (cpu-a (kubed-ext-parse-cpu (nth 0 alloc-f)))
+                     (mem-a (kubed-ext-parse-mem (nth 1 alloc-f)))
+                     (buf (get-buffer-create
+                           (format "*kubed-top node/%s[%s]*" node ctx))))
+                (with-current-buffer buf
+                  (let ((inhibit-read-only t))
+                    (erase-buffer)
+                    (insert (propertize (format "Node Metrics: %s\n" node)
+                                        'face 'bold))
+                    (insert (make-string 60 ?-) "\n\n")
+                    (insert (format "  CPU:  %s used  /  %s allocatable  (%s)\n"
+                                    (kubed-ext-format-cpu cpu-used)
+                                    (kubed-ext-format-cpu cpu-a)
+                                    (kubed-ext-format-pct cpu-used cpu-a)))
+                    (insert (format "  MEM:  %s used  /  %s allocatable  (%s)\n"
+                                    (kubed-ext-format-mem mem-used)
+                                    (kubed-ext-format-mem mem-a)
+                                    (kubed-ext-format-pct mem-used mem-a)))
+                    (goto-char (point-min))
+                    (special-mode)))
+                (display-buffer buf))))
       t)
 
 (eval '(kubed-define-resource persistentvolumeclaim
@@ -1060,149 +1091,208 @@
   (eval (cons 'kubed-define-resource spec) t))
 
 ;;; ═══════════════════════════════════════════════════════════════
-;;; § 10.  Async Top Commands (futur.el)
+;;; § 10.  Async Helpers (native Emacs process sentinels)
+;;; ═══════════════════════════════════════════════════════════════
+
+(defun kubed-ext--async-kubectl (args callback &optional errback)
+  "Run kubectl with ARGS asynchronously via process sentinel.
+Call CALLBACK with output string on success.
+Call ERRBACK with error message on failure.
+Returns the process object."
+  (let* ((output-buf (generate-new-buffer " *kubed-ext-async*"))
+         (default-directory temporary-file-directory))
+    (make-process
+     :name "kubed-ext-kubectl"
+     :buffer output-buf
+     :command (cons kubed-kubectl-program args)
+     :noquery t
+     :sentinel
+     (lambda (proc _event)
+       (when (memq (process-status proc) '(exit signal))
+         (let ((exit-code (process-exit-status proc))
+               (output ""))
+           (when (buffer-live-p output-buf)
+             (setq output (with-current-buffer output-buf (buffer-string)))
+             (kill-buffer output-buf))
+           (if (zerop exit-code)
+               (funcall callback output)
+             (when errback
+               (funcall errback
+                        (format "kubectl exited %d" exit-code))))))))))
+
+(defun kubed-ext--async-kubectl-2 (args1 args2 callback &optional errback)
+  "Run two kubectl commands concurrently via process sentinels.
+Call CALLBACK with (output1 output2) when both succeed.
+Call ERRBACK on first failure."
+  (let ((results (cons nil nil))
+        (count 0)
+        (failed nil))
+    (kubed-ext--async-kubectl
+     args1
+     (lambda (out)
+       (unless failed
+         (setcar results out)
+         (cl-incf count)
+         (when (= count 2)
+           (funcall callback (list (car results) (cdr results))))))
+     (lambda (err)
+       (unless failed
+         (setq failed t)
+         (when errback (funcall errback err)))))
+    (kubed-ext--async-kubectl
+     args2
+     (lambda (out)
+       (unless failed
+         (setcdr results out)
+         (cl-incf count)
+         (when (= count 2)
+           (funcall callback (list (car results) (cdr results))))))
+     (lambda (err)
+       (unless failed
+         (setq failed t)
+         (when errback (funcall errback err)))))))
+
+;;; ═══════════════════════════════════════════════════════════════
+;;; § 10b.  Top Commands (k9s-style with %, limits, requests)
 ;;; ═══════════════════════════════════════════════════════════════
 
 (defvar-local kubed-ext-top-context nil "Context for top buffer.")
 (defvar-local kubed-ext-top-namespace nil "Namespace for top buffer.")
-(defvar-local kubed-ext-top-future nil "Future object for metrics fetch.")
+(defvar-local kubed-ext-top--fetching nil "Non-nil when async fetch in progress.")
 
-;; FIX #5: early-return when fetch already in progress + guard futur calls
 (defun kubed-ext-top-refresh ()
   "Refresh the current top buffer asynchronously."
   (interactive)
-  (when (and kubed-ext-top-future
-             (fboundp 'futur-completed-p)
-             (not (futur-completed-p kubed-ext-top-future)))
-    (message "Metrics fetch already in progress...")
-    (cl-return-from kubed-ext-top-refresh))
+  (if kubed-ext-top--fetching
+      (message "Metrics fetch already in progress...")
+    (setq kubed-ext-top--fetching t)
+    (setq tabulated-list-entries nil)
+    (let ((inhibit-read-only t))
+      (erase-buffer)
+      (insert (propertize "\n  Fetching metrics from API...\n" 'face 'shadow)))
+    (cond
+     ((derived-mode-p 'kubed-ext-top-nodes-mode)
+      (kubed-ext--top-nodes-fetch))
+     ((derived-mode-p 'kubed-ext-top-pods-mode)
+      (kubed-ext--top-pods-fetch)))))
 
-  (setq tabulated-list-entries nil)
-  (let ((inhibit-read-only t))
-    (erase-buffer)
-    (insert (propertize "\n  Fetching metrics from API...\n" 'face 'shadow)))
+;; ── Node Top ──
 
-  (cond
-   ((derived-mode-p 'kubed-ext-top-nodes-mode) (kubed-ext-top-nodes-async))
-   ((derived-mode-p 'kubed-ext-top-pods-mode)  (kubed-ext-top-pods-async))))
-
-(defun kubed-ext--kubectl-future (args)
-  "Run kubectl asynchronously with ARGS, returning a future."
-  (let ((default-directory temporary-file-directory))
-    (apply #'futur-command kubed-kubectl-program args)))
-
-(defun kubed-ext-top-nodes-async ()
-  "Fetch node metrics asynchronously."
+(defun kubed-ext--top-nodes-fetch ()
+  "Fetch node metrics asynchronously and populate the table."
   (let ((ctx kubed-ext-top-context)
         (buf (current-buffer)))
-    (setq kubed-ext-top-future
-          (futur-all
-           (list (kubed-ext--kubectl-future
-                  (list "top" "nodes" "--no-headers" "--context" ctx))
-                 (kubed-ext--kubectl-future
-                  (list "get" "nodes" "--no-headers" "--context" ctx
-                        "-o" (concat "custom-columns=NAME:.metadata.name,"
-                                     "CPU:.status.allocatable.cpu,"
-                                     "MEM:.status.allocatable.memory"))))))
+    (kubed-ext--async-kubectl-2
+     (list "top" "nodes" "--no-headers" "--context" ctx)
+     (list "get" "nodes" "--no-headers" "--context" ctx
+           "-o" (concat "custom-columns=NAME:.metadata.name,"
+                        "CPU:.status.allocatable.cpu,"
+                        "MEM:.status.allocatable.memory"))
+     ;; success
+     (lambda (results)
+       (when (buffer-live-p buf)
+         (with-current-buffer buf
+           (setq kubed-ext-top--fetching nil)
+           (let* ((top-out (nth 0 results))
+                  (alloc-out (nth 1 results))
+                  (alloc-map (make-hash-table :test 'equal))
+                  (entries nil))
+             (dolist (line (split-string alloc-out "\n" t))
+               (let ((f (split-string line nil t)))
+                 (puthash (nth 0 f)
+                          (list (kubed-ext-parse-cpu (nth 1 f))
+                                (kubed-ext-parse-mem (nth 2 f)))
+                          alloc-map)))
+             (dolist (line (split-string top-out "\n" t))
+               (let* ((f (split-string line nil t))
+                      (name (nth 0 f))
+                      (cpu-u (kubed-ext-parse-cpu (nth 1 f)))
+                      (mem-u (kubed-ext-parse-mem (nth 3 f)))
+                      (alloc (gethash name alloc-map '(0 0)))
+                      (cpu-a (nth 0 alloc))
+                      (mem-a (nth 1 alloc)))
+                 (push (list name
+                             (vector name
+                                     (kubed-ext-format-cpu cpu-u)
+                                     (kubed-ext-format-cpu cpu-a)
+                                     (kubed-ext-format-pct cpu-u cpu-a)
+                                     (kubed-ext-format-mem mem-u)
+                                     (kubed-ext-format-mem mem-a)
+                                     (kubed-ext-format-pct mem-u mem-a)))
+                       entries)))
+             (setq tabulated-list-entries (nreverse entries))
+             (tabulated-list-print t)))))
+     ;; error
+     (lambda (err)
+       (when (buffer-live-p buf)
+         (with-current-buffer buf
+           (setq kubed-ext-top--fetching nil)
+           (message "Node metrics failed: %s" err)))))))
 
-    (futur-then kubed-ext-top-future
-                (lambda (results)
-                  (when (buffer-live-p buf)
-                    (with-current-buffer buf
-                      (let* ((top-out (nth 0 results))
-                             (alloc-out (nth 1 results))
-                             (alloc-map (make-hash-table :test 'equal))
-                             (entries nil))
-                        (dolist (line (split-string alloc-out "\n" t))
-                          (let ((f (split-string line nil t)))
-                            (puthash (nth 0 f)
-                                     (list (kubed-ext-parse-cpu (nth 1 f))
-                                           (kubed-ext-parse-mem (nth 2 f)))
-                                     alloc-map)))
-                        (dolist (line (split-string top-out "\n" t))
-                          (let* ((f (split-string line nil t))
-                                 (name (nth 0 f))
-                                 (cpu-u (kubed-ext-parse-cpu (nth 1 f)))
-                                 (mem-u (kubed-ext-parse-mem (nth 3 f)))
-                                 (alloc (gethash name alloc-map '(0 0)))
-                                 (cpu-a (nth 0 alloc))
-                                 (mem-a (nth 1 alloc)))
-                            (push (list name (vector name
-                                                     (kubed-ext-format-cpu cpu-u)
-                                                     (kubed-ext-format-cpu cpu-a)
-                                                     (kubed-ext-format-pct cpu-u cpu-a)
-                                                     (kubed-ext-format-mem mem-u)
-                                                     (kubed-ext-format-mem mem-a)
-                                                     (kubed-ext-format-pct mem-u mem-a)))
-                                  entries)))
-                        (setq tabulated-list-entries (nreverse entries))
-                        (tabulated-list-print t))))))
-    (futur-catch kubed-ext-top-future
-                 (lambda (err) (message "Node metrics failed: %s" err)))))
+;; ── Pod Top ──
 
-(defun kubed-ext-top-pods-async ()
-  "Fetch pod metrics asynchronously."
+(defun kubed-ext--top-pods-fetch ()
+  "Fetch pod metrics asynchronously and populate the table."
   (let ((ctx kubed-ext-top-context)
         (ns kubed-ext-top-namespace)
         (buf (current-buffer)))
-    (setq kubed-ext-top-future
-          (futur-all
-           (list (kubed-ext--kubectl-future
-                  (append (list "top" "pods" "--no-headers" "--context" ctx)
-                          (when ns (list "-n" ns))))
-                 (kubed-ext--kubectl-future
-                  (append
-                   (list "get" "pods" "--no-headers" "--context" ctx
-                         "-o" (concat
-                               "custom-columns=NAME:.metadata.name,"
-                               "CR:.spec.containers[*].resources.requests.cpu,"
-                               "CL:.spec.containers[*].resources.limits.cpu,"
-                               "MR:.spec.containers[*].resources.requests.memory,"
-                               "ML:.spec.containers[*].resources.limits.memory"))
-                   (when ns (list "-n" ns)))))))
+    (kubed-ext--async-kubectl-2
+     (append (list "top" "pods" "--no-headers" "--context" ctx)
+             (when ns (list "-n" ns)))
+     (append (list "get" "pods" "--no-headers" "--context" ctx
+                   "-o" (concat
+                         "custom-columns=NAME:.metadata.name,"
+                         "CR:.spec.containers[*].resources.requests.cpu,"
+                         "CL:.spec.containers[*].resources.limits.cpu,"
+                         "MR:.spec.containers[*].resources.requests.memory,"
+                         "ML:.spec.containers[*].resources.limits.memory"))
+             (when ns (list "-n" ns)))
+     ;; success
+     (lambda (results)
+       (when (buffer-live-p buf)
+         (with-current-buffer buf
+           (setq kubed-ext-top--fetching nil)
+           (let* ((top-out (nth 0 results))
+                  (spec-out (nth 1 results))
+                  (spec-map (make-hash-table :test 'equal))
+                  (entries nil))
+             (dolist (line (split-string spec-out "\n" t))
+               (let ((f (split-string line nil t)))
+                 (puthash (nth 0 f)
+                          (list (kubed-ext-sum-cpu (nth 1 f))
+                                (kubed-ext-sum-cpu (nth 2 f))
+                                (kubed-ext-sum-mem (nth 3 f))
+                                (kubed-ext-sum-mem (nth 4 f)))
+                          spec-map)))
+             (dolist (line (split-string top-out "\n" t))
+               (let* ((f (split-string line nil t))
+                      (name (nth 0 f))
+                      (cpu-u (kubed-ext-parse-cpu (nth 1 f)))
+                      (mem-u (kubed-ext-parse-mem (nth 2 f)))
+                      (spec (gethash name spec-map '(0 0 0 0))))
+                 (push (list name
+                             (vector name
+                                     (kubed-ext-format-cpu cpu-u)
+                                     (kubed-ext-format-mem mem-u)
+                                     (kubed-ext-format-cpu (nth 0 spec))
+                                     (kubed-ext-format-cpu (nth 1 spec))
+                                     (kubed-ext-format-pct cpu-u (nth 0 spec))
+                                     (kubed-ext-format-pct cpu-u (nth 1 spec))
+                                     (kubed-ext-format-mem (nth 2 spec))
+                                     (kubed-ext-format-mem (nth 3 spec))
+                                     (kubed-ext-format-pct mem-u (nth 2 spec))
+                                     (kubed-ext-format-pct mem-u (nth 3 spec))))
+                       entries)))
+             (setq tabulated-list-entries (nreverse entries))
+             (tabulated-list-print t)))))
+     ;; error
+     (lambda (err)
+       (when (buffer-live-p buf)
+         (with-current-buffer buf
+           (setq kubed-ext-top--fetching nil)
+           (message "Pod metrics failed: %s" err)))))))
 
-    (futur-then kubed-ext-top-future
-                (lambda (results)
-                  (when (buffer-live-p buf)
-                    (with-current-buffer buf
-                      (let* ((top-out (nth 0 results))
-                             (spec-out (nth 1 results))
-                             (spec-map (make-hash-table :test 'equal))
-                             (entries nil))
-                        (dolist (line (split-string spec-out "\n" t))
-                          (let ((f (split-string line nil t)))
-                            (puthash (nth 0 f)
-                                     (list (kubed-ext-sum-cpu (nth 1 f))
-                                           (kubed-ext-sum-cpu (nth 2 f))
-                                           (kubed-ext-sum-mem (nth 3 f))
-                                           (kubed-ext-sum-mem (nth 4 f)))
-                                     spec-map)))
-                        (dolist (line (split-string top-out "\n" t))
-                          (let* ((f (split-string line nil t))
-                                 (name (nth 0 f))
-                                 (cpu-u (kubed-ext-parse-cpu (nth 1 f)))
-                                 (mem-u (kubed-ext-parse-mem (nth 2 f)))
-                                 (spec (gethash name spec-map '(0 0 0 0))))
-                            (push (list name (vector name
-                                                     (kubed-ext-format-cpu cpu-u)
-                                                     (kubed-ext-format-mem mem-u)
-                                                     (kubed-ext-format-cpu (nth 0 spec))
-                                                     (kubed-ext-format-cpu (nth 1 spec))
-                                                     (kubed-ext-format-pct
-                                                      cpu-u (nth 0 spec))
-                                                     (kubed-ext-format-pct
-                                                      cpu-u (nth 1 spec))
-                                                     (kubed-ext-format-mem (nth 2 spec))
-                                                     (kubed-ext-format-mem (nth 3 spec))
-                                                     (kubed-ext-format-pct
-                                                      mem-u (nth 2 spec))
-                                                     (kubed-ext-format-pct
-                                                      mem-u (nth 3 spec))))
-                                  entries)))
-                        (setq tabulated-list-entries (nreverse entries))
-                        (tabulated-list-print t))))))
-    (futur-catch kubed-ext-top-future
-                 (lambda (err) (message "Pod metrics failed: %s" err)))))
+;; ── Modes ──
 
 (define-derived-mode kubed-ext-top-nodes-mode tabulated-list-mode
   "Kubed Top Nodes"
@@ -1245,6 +1335,8 @@
 (keymap-set kubed-ext-top-pods-mode-map "g" #'kubed-ext-top-refresh)
 (keymap-set kubed-ext-top-pods-mode-map "q" #'quit-window)
 
+;; ── Interactive entry points ──
+
 (defun kubed-ext-top-nodes (&optional context)
   "Display k9s-style node resource usage in CONTEXT."
   (interactive
@@ -1286,19 +1378,21 @@
   "Shell to run when opening a terminal in a Kubernetes pod."
   :type 'string :group 'kubed-ext)
 
-;; FIX #6: correct hook name + guard tramp-method reference
+(defvar kubed-ext--tramp-optimized nil
+  "Non-nil when TRAMP has already been optimized for kubed.")
+
 (defun kubed-ext-optimize-tramp ()
   "Configure TRAMP to cache connections, improving Eshell/Dired speed."
-  (require 'tramp)
-  (when (require 'kubed-tramp nil t)
-    (when (boundp 'kubed-tramp-method)
-      (add-to-list 'tramp-connection-properties
-                   (list (regexp-quote (format "/%s:" kubed-tramp-method))
-                         "direct-async-process" t))))
-  ;; Avoid byte-compile warning if this TRAMP variable isn't defined
-  ;; (varies by Emacs version / TRAMP configuration).
-  (when (boundp 'tramp-completion-reread-directory-timeout)
-    (setq tramp-completion-reread-directory-timeout nil)))
+  (unless kubed-ext--tramp-optimized
+    (setq kubed-ext--tramp-optimized t)
+    (require 'tramp)
+    (when (require 'kubed-tramp nil t)
+      (when (boundp 'kubed-tramp-method)
+        (add-to-list 'tramp-connection-properties
+                     (list (regexp-quote (format "/%s:" kubed-tramp-method))
+                           "direct-async-process" t))))
+    (when (boundp 'tramp-completion-reread-directory-timeout)
+      (setq tramp-completion-reread-directory-timeout nil))))
 
 (add-hook 'kubed-list-mode-hook #'kubed-ext-optimize-tramp)
 
@@ -1316,8 +1410,6 @@
 
 ;; ── vterm (direct kubectl exec) ──
 
-;; `vterm' defines this variable; declare it here to avoid compile warnings
-;; when we set it buffer-locally.
 (defvar vterm-shell)
 
 (defun kubed-ext-pods-vterm (click)
@@ -1337,10 +1429,7 @@
               (format "*Kubed vterm %s*"
                       (kubed-display-resource-short-description
                        "pods" pod kubed-list-context kubed-list-namespace))))
-        (let ((vterm-buffer (vterm vterm-buffer-name)))
-          (with-current-buffer vterm-buffer
-            ;; `vterm-shell' controls what `vterm' runs.
-            (setq-local vterm-shell vterm-shell))))
+        (vterm vterm-buffer-name))
     (user-error "No Kubernetes pod at point")))
 
 (defun kubed-ext-vterm-pod (pod &optional context namespace)
@@ -1363,9 +1452,7 @@
           (format "*Kubed vterm %s*"
                   (kubed-display-resource-short-description
                    "pods" pod context namespace))))
-    (let ((vterm-buffer (vterm vterm-buffer-name)))
-      (with-current-buffer vterm-buffer
-        (setq-local vterm-shell vterm-shell)))))
+    (vterm vterm-buffer-name)))
 
 ;; ── eat (direct kubectl exec) ──
 
@@ -1495,7 +1582,6 @@
 ;;; § 12.  Describe Resource (kubectl describe)
 ;;; ═══════════════════════════════════════════════════════════════
 
-;; FIX #3: capture buffer-local vars BEFORE switching to output buffer
 (defun kubed-ext-list-describe-resource (click)
   "Describe Kubernetes resource at CLICK position using kubectl describe."
   (interactive (list last-nonmenu-event) kubed-list-mode)
@@ -1712,7 +1798,6 @@
 ;;; § 14.  Jab / Bounce Deployment
 ;;; ═══════════════════════════════════════════════════════════════
 
-;; FIX #4: was referencing my/kubed--dq → now kubed-ext--dq
 (defun kubed-ext-jab-deployment (deployment &optional context namespace)
   "Force rolling update of DEPLOYMENT in CONTEXT/NAMESPACE."
   (interactive
@@ -1844,7 +1929,7 @@
          (mapcan
           (lambda (line)
             (let ((trimmed (string-trim line)))
-              (when (string-match "^map$$$.+$$$$" trimmed)
+              (when (string-match "^map$$$.+$$$" trimmed)
                 (mapcar (lambda (pair)
                           (replace-regexp-in-string ":" "=" pair))
                         (split-string (match-string 1 trimmed) " ")))))
