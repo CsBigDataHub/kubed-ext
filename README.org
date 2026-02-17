@@ -1,4 +1,3 @@
-```org
 #+TITLE: kubed-ext.el
 #+OPTIONS: toc:3
 
