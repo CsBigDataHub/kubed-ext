@@ -1120,7 +1120,7 @@ Returns the process object."
                         (format "kubectl exited %d" exit-code))))))))))
 
 (defun kubed-ext--async-kubectl-2 (args1 args2 callback &optional errback)
-  "Run two kubectl commands with ARGS1 and ARGS2 concurrently.
+  "Run two kubectl commands concurrently via process sentinels.
 Call CALLBACK with (output1 output2) when both succeed.
 Call ERRBACK on first failure."
   (let ((results (cons nil nil))
@@ -1535,7 +1535,7 @@ Call ERRBACK on first failure."
 ;; ── ansi-term (direct kubectl exec) ──
 
 (defun kubed-ext-pods-ansi-term (click)
-  "Open `ansi-term' in Kubernetes pod at CLICK position."
+  "Open ansi-term in Kubernetes pod at CLICK position."
   (interactive (list last-nonmenu-event) kubed-pods-mode)
   (if-let ((pod (tabulated-list-get-id (mouse-set-point click))))
       (let* ((container (kubed-read-container pod "Container" t
@@ -1889,7 +1889,7 @@ Call ERRBACK on first failure."
     (user-error "No Kubernetes resource at point")))
 
 (transient-define-prefix kubed-ext-copy-popup ()
-  "Kubed Copy Menu."
+  "Kubed Copy Menu"
   ["Copy to kill ring"
    ("w" "Resource name"  kubed-list-copy-as-kill)
    ("l" "Log command"    kubed-ext-list-copy-log-command)
@@ -2037,6 +2037,20 @@ Call ERRBACK on first failure."
 
 ;; ── Command Log ──
 
+(defun kubed-ext--log-kubectl-command (cmd-str)
+  "Log CMD-STR to the kubectl command log buffer."
+  (setq kubed-ext--last-kubectl-command cmd-str)
+  (when-let ((buf (get-buffer "*kubed-command-log*")))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (goto-char (point-max))
+        (insert (format "[%s] %s\n"
+                        (format-time-string "%H:%M:%S") cmd-str))
+        (when (> (line-number-at-pos) 500)
+          (goto-char (point-min))
+          (forward-line 100)
+          (delete-region (point-min) (point)))))))
+
 (defun kubed-ext--make-process-logger (orig-fn &rest args)
   "Log kubectl `make-process' call; ORIG-FN is the advised function, ARGS its args."
   (when-let* ((cmd (plist-get args :command))
@@ -2044,21 +2058,36 @@ Call ERRBACK on first failure."
               ((string-suffix-p "kubectl"
                                 (file-name-sans-extension
                                  (file-name-nondirectory (car cmd))))))
-    (setq kubed-ext--last-kubectl-command (mapconcat #'identity cmd " "))
-    (when-let ((buf (get-buffer "*kubed-command-log*")))
-      (with-current-buffer buf
-        (let ((inhibit-read-only t))
-          (goto-char (point-max))
-          (insert (format "[%s] %s\n"
-                          (format-time-string "%H:%M:%S")
-                          kubed-ext--last-kubectl-command))
-          (when (> (line-number-at-pos) 500)
-            (goto-char (point-min))
-            (forward-line 100)
-            (delete-region (point-min) (point)))))))
+    (kubed-ext--log-kubectl-command (mapconcat #'identity cmd " ")))
   (apply orig-fn args))
 
 (advice-add 'make-process :around #'kubed-ext--make-process-logger)
+
+(defun kubed-ext--call-process-logger (orig-fn program &rest args)
+  "Log kubectl `call-process' call; ORIG-FN is the advised function."
+  (when (and (stringp program)
+             (string-suffix-p "kubectl"
+                              (file-name-sans-extension
+                               (file-name-nondirectory program))))
+    (let ((cmd-args (seq-filter #'stringp (nthcdr 3 args))))
+      (kubed-ext--log-kubectl-command
+       (mapconcat #'identity (cons program cmd-args) " "))))
+  (apply orig-fn program args))
+
+(advice-add 'call-process :around #'kubed-ext--call-process-logger)
+
+(defun kubed-ext--call-process-region-logger (orig-fn start end program &rest args)
+  "Log kubectl `call-process-region' call; ORIG-FN is the advised function."
+  (when (and (stringp program)
+             (string-suffix-p "kubectl"
+                              (file-name-sans-extension
+                               (file-name-nondirectory program))))
+    (let ((cmd-args (seq-filter #'stringp (nthcdr 3 args))))
+      (kubed-ext--log-kubectl-command
+       (mapconcat #'identity (cons program cmd-args) " "))))
+  (apply orig-fn start end program args))
+
+(advice-add 'call-process-region :around #'kubed-ext--call-process-region-logger)
 
 (defun kubed-ext-show-command-log ()
   "Show the kubed command log buffer."
@@ -2113,7 +2142,7 @@ Call ERRBACK on first failure."
 ;; ── Prefix-map keybindings ──
 (keymap-set kubed-prefix-map "F" #'kubed-ext-list-port-forwards)
 (keymap-set kubed-prefix-map "b" #'kubed-ext-switch-buffer)
-(keymap-set kubed-prefix-map "$" #'kubed-ext-show-command-log)
+(keymap-set kubed-prefix-map "#" #'kubed-ext-show-command-log)
 (keymap-set kubed-prefix-map "d" #'kubed-ext-describe-resource)
 
 ;;; ═══════════════════════════════════════════════════════════════
@@ -2340,7 +2369,7 @@ Call ERRBACK on first failure."
                       ("b" "Switch Buffer"   kubed-ext-switch-buffer)
                       ("w" "Copy Name"       kubed-list-copy-as-kill)
                       ("y" "Copy Menu"       kubed-ext-copy-popup)
-                      ("$" "Command Log"     kubed-ext-show-command-log)]])))
+                      ("#" "Command Log"     kubed-ext-show-command-log)]])))
            t)
           (kubed-ext--dynamic-menu))
       (error
