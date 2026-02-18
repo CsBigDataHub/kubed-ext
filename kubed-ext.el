@@ -1121,6 +1121,7 @@ Returns the process object."
 
 (defun kubed-ext--async-kubectl-2 (args1 args2 callback &optional errback)
   "Run two kubectl commands concurrently via process sentinels.
+ARGS1 is the first arg list, ARGS2 is the second.
 Call CALLBACK with (output1 output2) when both succeed.
 Call ERRBACK on first failure."
   (let ((results (cons nil nil))
@@ -1535,7 +1536,7 @@ Call ERRBACK on first failure."
 ;; ── ansi-term (direct kubectl exec) ──
 
 (defun kubed-ext-pods-ansi-term (click)
-  "Open ansi-term in Kubernetes pod at CLICK position."
+  "Open `ansi-term' in Kubernetes pod at CLICK position."
   (interactive (list last-nonmenu-event) kubed-pods-mode)
   (if-let ((pod (tabulated-list-get-id (mouse-set-point click))))
       (let* ((container (kubed-read-container pod "Container" t
@@ -1889,7 +1890,7 @@ Call ERRBACK on first failure."
     (user-error "No Kubernetes resource at point")))
 
 (transient-define-prefix kubed-ext-copy-popup ()
-  "Kubed Copy Menu"
+  "Kubed Copy Menu."
   ["Copy to kill ring"
    ("w" "Resource name"  kubed-list-copy-as-kill)
    ("l" "Log command"    kubed-ext-list-copy-log-command)
@@ -2052,7 +2053,10 @@ Call ERRBACK on first failure."
           (delete-region (point-min) (point)))))))
 
 (defun kubed-ext--make-process-logger (orig-fn &rest args)
-  "Log kubectl `make-process' call; ORIG-FN is the advised function, ARGS its args."
+  "Log kubectl `make-process' call.
+ORIG-FN is the advised function,
+ARGS its ARGS1.
+ARGS1 should be a plist of keyword-argument pairs as used by `make-process'."
   (when-let* ((cmd (plist-get args :command))
               ((stringp (car cmd)))
               ((string-suffix-p "kubectl"
@@ -2064,7 +2068,12 @@ Call ERRBACK on first failure."
 (advice-add 'make-process :around #'kubed-ext--make-process-logger)
 
 (defun kubed-ext--call-process-logger (orig-fn program &rest args)
-  "Log kubectl `call-process' call; ORIG-FN is the advised function."
+  "Log kubectl `call-process'.
+
+Logs if PROGRAM is a kubectl executable.
+ORIG-FN is the advised function.
+PROGRAM is the kubectl executable, and ARGS are passed to it.
+PROGRAM and ARGS should appear in this docstring for clarity."
   (when (and (stringp program)
              (string-suffix-p "kubectl"
                               (file-name-sans-extension
@@ -2077,7 +2086,11 @@ Call ERRBACK on first failure."
 (advice-add 'call-process :around #'kubed-ext--call-process-logger)
 
 (defun kubed-ext--call-process-region-logger (orig-fn start end program &rest args)
-  "Log kubectl `call-process-region' call; ORIG-FN is the advised function."
+  "Logs if PROGRAM is a kubectl executable.
+ORIG-FN is the advised function.
+START and END are region bounds,
+PROGRAM is the kubectl binary, and ARGS are passed to it.
+START, PROGRAM, and ARGS should appear in this docstring for clarity."
   (when (and (stringp program)
              (string-suffix-p "kubectl"
                               (file-name-sans-extension
@@ -2350,7 +2363,7 @@ Call ERRBACK on first failure."
                  ((= (length agroups) 1) agroups)
                  ((<= (length agroups) 3)
                   (list (apply #'vector agroups)))
-                 (t (let (rows (rest agroups))
+                 (t (let ((rows nil) (rest agroups))
                       (while rest
                         (let ((chunk (seq-take rest 3)))
                           (push (if (= (length chunk) 1) (car chunk)
@@ -2371,7 +2384,7 @@ Call ERRBACK on first failure."
                       ("y" "Copy Menu"       kubed-ext-copy-popup)
                       ("#" "Command Log"     kubed-ext-show-command-log)]])))
            t)
-          (kubed-ext--dynamic-menu))
+          (funcall-interactively #'kubed-ext--dynamic-menu))
       (error
        (message "Dynamic transient error: %s" (error-message-string err))
        (when (fboundp 'kubed-list-transient)
