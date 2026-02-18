@@ -596,7 +596,7 @@
     (kubed-update "kafkaconnects" context namespace)))
 
 ;;; ═══════════════════════════════════════════════════════════════
-;;; § 5.  Column Helpers + Metrics Parsing
+;;; § 5.  Column Helpers + Metrics Parsing + Deployment Formatting
 ;;; ═══════════════════════════════════════════════════════════════
 
 (defun kubed-ext-append-columns (resource-plural fetch-columns display-columns)
@@ -732,7 +732,7 @@ Returns a propertized string with `kubed-sort-value' for sorting."
 
 (defun kubed-ext--format-ready-total (ready replicas)
   "Format READY/REPLICAS as kubel-style ready/total with color coding.
-READY and REPLICAS are strings (possibly nil).
+READY and REPLICAS are strings (possibly).
 Returns a propertized string with `kubed-sort-value' for sorting."
   (let* ((r (string-to-number (or ready "0")))
          (total (string-to-number (or replicas "0")))
@@ -746,7 +746,7 @@ Returns a propertized string with `kubed-sort-value' for sorting."
 
 (defun kubed-ext--format-deployment-count (count replicas)
   "Format deployment COUNT relative to REPLICAS with color coding.
-COUNT and REPLICAS are strings (possibly nil).
+COUNT and REPLICAS are strings (possibly).
 Returns a propertized string with `kubed-sort-value' for sorting."
   (let* ((c (string-to-number (or count "0")))
          (total (string-to-number (or replicas "0")))
@@ -759,7 +759,7 @@ Returns a propertized string with `kubed-sort-value' for sorting."
     (propertize str 'face face 'kubed-sort-value c)))
 
 ;;; ═══════════════════════════════════════════════════════════════
-;;; § 6.  Enhance Upstream Resource Columns
+;;; § 6.  Enhance Upstream Resource Columns + Deployment Hook
 ;;; ═══════════════════════════════════════════════════════════════
 
 (kubed-ext-append-columns
@@ -846,77 +846,78 @@ Returns a propertized string with `kubed-sort-value' for sorting."
   (list "Claim-name" 28 t)
   (list "Storageclass" 20 t)))
 
-;; ── Deployment: kubel-style Ready/Age display ──
+;; ── Deployment: kubel-style Ready/Age display via mode hook ──
 ;;
-;; We fetch 5 columns (ready, replicas, updated, available, timestamp)
-;; but display 4 (Ready as "x/y", Up-to-date, Available, Age).
-;; An advice on `kubed-list-entries' performs the transformation so that
-;; filtering and sorting operate on the final display values.
+;; Instead of advice (which may not fire reliably through funcall),
+;; we use a mode hook to directly override `tabulated-list-entries'
+;; and `tabulated-list-format' in deployment list buffers.
+;;
+;; The upstream kubed.el fetches 5 data columns for deployments:
+;;   vec[0]=Name  vec[1]=Ready  vec[2]=Updated  vec[3]=Available
+;;   vec[4]=Reps  vec[5]=CreationTimestamp
+;;
+;; We transform these 6-element vectors into 5-element vectors:
+;;   new[0]=Name  new[1]=Ready/Total  new[2]=Up-to-date
+;;   new[3]=Available  new[4]=Age
 
-(kubed-ext-set-columns
- "deployments"
- ;; Fetch columns (5): raw values for transformation
- (list
-  (cons "READY:.status.readyReplicas"
-        (lambda (s) (if (string= s "") "0" s)))
-  (cons "REPLICAS:.spec.replicas"
-        (lambda (s) (if (string= s "") "0" s)))
-  (cons "UPDATED:.status.updatedReplicas"
-        (lambda (s) (if (string= s "") "0" s)))
-  (cons "AVAILABLE:.status.availableReplicas"
-        (lambda (s) (if (string= s "") "0" s)))
-  '("AGE:.metadata.creationTimestamp"))
- ;; Display columns (4): after transformation merges Ready+Replicas
- (list
-  (list "Ready" 10 (kubed-ext-top-numeric-sorter 1))
-  (list "Up-to-date" 12 (kubed-ext-top-numeric-sorter 2) :right-align t)
-  (list "Available" 12 (kubed-ext-top-numeric-sorter 3) :right-align t)
-  (list "Age" 12 (kubed-ext-top-numeric-sorter 4))))
+(defun kubed-ext--deployment-entries ()
+  "Custom entries function for deployments with kubel-style formatting.
+Reads raw upstream 6-element vectors from `kubed--alist' and transforms
+them into 5-element vectors with Ready/Total, color-coded counts, and
+human-readable age.  Applies the current `kubed-list-filter'."
+  (let* ((raw-entries (alist-get 'resources
+                                 (kubed--alist kubed-list-type
+                                               kubed-list-context
+                                               kubed-list-namespace)))
+         (pred (kubed-list-interpret-filter))
+         (result nil))
+    (dolist (entry raw-entries)
+      (let* ((vec (cadr entry))
+             (new-entry
+              (if (and (vectorp vec) (>= (length vec) 6))
+                  ;; Upstream: [name, readyReplicas, updatedReplicas,
+                  ;;            availableReplicas, replicas, timestamp]
+                  (list (car entry)
+                        (vector
+                         (aref vec 0)
+                         (kubed-ext--format-ready-total
+                          (aref vec 1) (aref vec 4))
+                         (kubed-ext--format-deployment-count
+                          (aref vec 2) (aref vec 4))
+                         (kubed-ext--format-deployment-count
+                          (aref vec 3) (aref vec 4))
+                         (kubed-ext--format-age (aref vec 5))))
+                entry)))
+        (when (funcall pred new-entry)
+          (push new-entry result))))
+    (nreverse result)))
 
-(defun kubed-ext--transform-deployment-entries (orig-fn)
-  "Advice for `kubed-list-entries'- `ORIG-FN'.
-kubel-style deployment display.
-Combines Ready+Replicas into a single ready/total column, colors
-Up-to-date and Available, and converts timestamps to human-readable age.
-Filtering operates on the transformed values so column indices match."
-  (if (and (bound-and-true-p kubed-list-type)
-           (string= kubed-list-type "deployments"))
-      (let* ((raw-entries (alist-get 'resources
-                                     (kubed--alist kubed-list-type
-                                                   kubed-list-context
-                                                   kubed-list-namespace))))
-        (if (null raw-entries)
-            nil
-          (let ((pred (kubed-list-interpret-filter))
-                (result nil))
-            (dolist (entry raw-entries)
-              (let* ((vec (cadr entry))
-                     (new-entry
-                      (if (>= (length vec) 6)
-                          (list (car entry)
-                                (vector
-                                 (aref vec 0)
-                                 (kubed-ext--format-ready-total
-                                  (aref vec 1) (aref vec 2))
-                                 (kubed-ext--format-deployment-count
-                                  (aref vec 3) (aref vec 2))
-                                 (kubed-ext--format-deployment-count
-                                  (aref vec 4) (aref vec 2))
-                                 (kubed-ext--format-age (aref vec 5))))
-                        entry)))
-                (when (funcall pred new-entry)
-                  (push new-entry result))))
-            (nreverse result))))
-    (funcall orig-fn)))
+(defun kubed-ext--deployment-mode-setup ()
+  "Set up deployment list buffer with kubel-style Ready and Age columns.
+This runs as a `kubed-deployments-mode-hook' to directly override
+`tabulated-list-format' and `tabulated-list-entries'."
+  (setq-local tabulated-list-format
+              (vector
+               kubed-name-column
+               (list "Ready" 10
+                     (kubed-ext-top-numeric-sorter 1))
+               (list "Up-to-date" 12
+                     (kubed-ext-top-numeric-sorter 2)
+                     :right-align t)
+               (list "Available" 12
+                     (kubed-ext-top-numeric-sorter 3)
+                     :right-align t)
+               (list "Age" 12
+                     (kubed-ext-top-numeric-sorter 4))))
+  (setq-local tabulated-list-entries #'kubed-ext--deployment-entries)
+  (tabulated-list-init-header))
 
-(advice-add 'kubed-list-entries :around
-            #'kubed-ext--transform-deployment-entries)
+(add-hook 'kubed-deployments-mode-hook #'kubed-ext--deployment-mode-setup)
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 7.  New Built-in Resources
 ;;; ═══════════════════════════════════════════════════════════════
 
-;; Node: per-node "top" action restored from original config
 (eval '(kubed-define-resource node
            ((status ".status.conditions[-1:].status" 10
                     nil
@@ -1332,7 +1333,6 @@ Call ERRBACK on first failure."
            "-o" (concat "custom-columns=NAME:.metadata.name,"
                         "CPU:.status.allocatable.cpu,"
                         "MEM:.status.allocatable.memory"))
-     ;; success
      (lambda (results)
        (when (buffer-live-p buf)
          (with-current-buffer buf
@@ -1366,7 +1366,6 @@ Call ERRBACK on first failure."
                        entries)))
              (setq tabulated-list-entries (nreverse entries))
              (tabulated-list-print t)))))
-     ;; error
      (lambda (err)
        (when (buffer-live-p buf)
          (with-current-buffer buf
@@ -1374,6 +1373,7 @@ Call ERRBACK on first failure."
            (message "Node metrics failed: %s" err)))))))
 
 ;; ── Pod Top ──
+
 (defun kubed-ext--top-pods-fetch ()
   "Fetch pod metrics asynchronously and populate the table."
   (let ((ctx kubed-ext-top-context)
@@ -1390,7 +1390,6 @@ Call ERRBACK on first failure."
                          "MR:.spec.containers[*].resources.requests.memory,"
                          "ML:.spec.containers[*].resources.limits.memory"))
              (when ns (list "-n" ns)))
-     ;; success
      (lambda (results)
        (when (buffer-live-p buf)
          (with-current-buffer buf
@@ -1428,7 +1427,6 @@ Call ERRBACK on first failure."
                        entries)))
              (setq tabulated-list-entries (nreverse entries))
              (tabulated-list-print t)))))
-     ;; error
      (lambda (err)
        (when (buffer-live-p buf)
          (with-current-buffer buf
