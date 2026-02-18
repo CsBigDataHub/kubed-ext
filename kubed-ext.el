@@ -1760,8 +1760,6 @@ ERRBACK is called with error message on failure."
 (defun kubed-ext-list-describe-resource (click)
   "Describe Kubernetes resource at CLICK position using kubectl describe."
   (interactive (list last-nonmenu-event) kubed-list-mode)
-  (unless (and kubed-list-type (stringp kubed-list-type))
-    (user-error "Not in a Kubernetes list buffer or resource type is not set"))
   (if-let ((name (tabulated-list-get-id (mouse-set-point click))))
       (let ((buf (get-buffer-create
                   (format "*Kubed describe %s/%s@%s[%s]*"
@@ -1771,12 +1769,15 @@ ERRBACK is called with error message on failure."
         (with-current-buffer buf
           (let ((inhibit-read-only t))
             (erase-buffer)
+            ;; Build argv without nils; `call-process' args must be strings.
             (apply #'call-process kubed-kubectl-program nil t nil
-                   "describe" kubed-list-type name
-                   (append
-                    (when kubed-list-namespace (list "-n" kubed-list-namespace))
-                    (when kubed-list-context (list "--context" kubed-list-context))))
-            (goto-char (point-min)) (special-mode)))
+                   (append (list "describe" kubed-list-type name)
+                           (when kubed-list-namespace
+                             (list "-n" kubed-list-namespace))
+                           (when kubed-list-context
+                             (list "--context" kubed-list-context))))
+            (goto-char (point-min))
+            (special-mode)))
         (display-buffer buf))
     (user-error "No Kubernetes resource at point")))
 
@@ -1799,10 +1800,13 @@ ERRBACK is called with error message on failure."
     (with-current-buffer buf
       (let ((inhibit-read-only t))
         (erase-buffer)
+        ;; Build argv without nils; `call-process' args must be strings.
         (apply #'call-process kubed-kubectl-program nil t nil
-               "describe" type name
-               (append (when ns (list "-n" ns)) (when ctx (list "--context" ctx))))
-        (goto-char (point-min)) (special-mode)))
+               (append (list "describe" type name)
+                       (when ns (list "-n" ns))
+                       (when ctx (list "--context" ctx))))
+        (goto-char (point-min))
+        (special-mode)))
     (display-buffer buf)))
 
 ;;; ═══════════════════════════════════════════════════════════════
@@ -2152,42 +2156,23 @@ ORIG-FN is the advised function, ARGS its arguments."
 
 (defun kubed-ext--call-process-logger (orig-fn program &rest args)
   "Log kubectl `call-process'.
-ORIG-FN is the advised function.  PROGRAM is the executable and ARGS are passed.
-
-Be careful: `call-process' allows nil values in ARGS (e.g., DESTINATION can be
-nil).  We must not pass nil to `mapconcat' or other string functions." 
+ORIG-FN is the advised function.  PROGRAM is the executable and ARGS are passed."
   (when (and (stringp program)
              (string-suffix-p "kubectl" (file-name-sans-extension
                                          (file-name-nondirectory program))))
     (kubed-ext--log-kubectl-command
-     (mapconcat
-      #'identity
-      (cons program
-            (mapcar
-             (lambda (x) (format "%s" x))
-             ;; Skip INFILE/DESTINATION/DISPLAY; log the remaining arguments.
-             (nthcdr 3 args)))
-      " ")))
+     (mapconcat #'identity (cons program (seq-filter #'stringp (nthcdr 3 args))) " ")))
   (apply orig-fn program args))
 (advice-add 'call-process :around #'kubed-ext--call-process-logger)
 
 (defun kubed-ext--call-process-region-logger (orig-fn start end program &rest args)
   "Log kubectl `call-process-region'.
-ORIG-FN is advised. START and END are region bounds. PROGRAM and ARGS passed.
-
-Be careful: `call-process-region' allows nil values in ARGS (e.g., DESTINATION
-can be nil).  We must not pass nil to `mapconcat' or other string functions." 
+ORIG-FN is advised. START and END are region bounds. PROGRAM and ARGS passed."
   (when (and (stringp program)
              (string-suffix-p "kubectl" (file-name-sans-extension
                                          (file-name-nondirectory program))))
     (kubed-ext--log-kubectl-command
-     (mapconcat
-      #'identity
-      (cons program
-            (mapcar (lambda (x) (format "%s" x))
-                    ;; Skip INFILE/DESTINATION/DISPLAY; log the remaining args.
-                    (nthcdr 3 args)))
-      " ")))
+     (mapconcat #'identity (cons program (seq-filter #'stringp (nthcdr 3 args))) " ")))
   (apply orig-fn start end program args))
 (advice-add 'call-process-region :around #'kubed-ext--call-process-region-logger)
 
