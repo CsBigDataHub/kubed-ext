@@ -1760,8 +1760,8 @@ ERRBACK is called with error message on failure."
 (defun kubed-ext-list-describe-resource (click)
   "Describe Kubernetes resource at CLICK position using kubectl describe."
   (interactive (list last-nonmenu-event) kubed-list-mode)
-  (unless kubed-list-type
-    (user-error "Not in a Kubernetes list buffer"))
+  (unless (and kubed-list-type (stringp kubed-list-type))
+    (user-error "Not in a Kubernetes list buffer or resource type is not set"))
   (if-let ((name (tabulated-list-get-id (mouse-set-point click))))
       (let ((buf (get-buffer-create
                   (format "*Kubed describe %s/%s@%s[%s]*"
