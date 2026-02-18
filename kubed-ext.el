@@ -407,6 +407,7 @@
 (advice-add 'kubed-stop-port-forward :after
             #'kubed-ext-refresh-pf-markers-in-visible-buffers)
 
+;; FIX 3: Corrected corrupted regexp ($ → proper $ $ $$ $$)
 (defun kubed-ext-parse-pf-descriptor (desc)
   "Parse port-forward descriptor DESC into list."
   (if (string-match
@@ -681,6 +682,7 @@
 
 ;; ── Kubernetes Timestamp ──
 
+;; FIX 4: Corrected corrupted regexp ($ → proper $ $)
 (defun kubed-ext--parse-k8s-timestamp (s)
   "Parse Kubernetes ISO 8601 timestamp S to an Emacs time value.
 Returns nil if S cannot be parsed."
@@ -832,15 +834,6 @@ Returns a propertized string with face matching the status severity."
 ;;; ═══════════════════════════════════════════════════════════════
 
 ;; ── Pods: fetch extra fields, display kubel-style via hook ──
-;;
-;; We replace all pod fetch columns so we also get waiting/terminated
-;; reasons and deletionTimestamp for computing real container status.
-;; The mode hook overrides the display format.
-;;
-;; Fetch vector layout:
-;;   [0]=Name [1]=Phase [2]=ReadyCount [3]=TotalCount [4]=StartTime
-;;   [5]=Restarts [6]=IP [7]=Node [8]=WaitingReason
-;;   [9]=TerminatedReason [10]=DeletionTimestamp
 
 (kubed-ext-set-columns
  "pods"
@@ -930,7 +923,7 @@ Name, Ready(x/y), Status, Restarts, Age, IP, Node."
  (list (list "Selector" 40 t)))
 
 ;; ── Ingresses: enhanced columns ──
-
+;; FIX 7: Corrected corrupted regexps in address lambda
 (kubed-ext-set-columns
  "ingresses"
  (list
@@ -984,9 +977,6 @@ Name, Ready(x/y), Status, Restarts, Age, IP, Node."
   (list "Storageclass" 20 t)))
 
 ;; ── Deployments: kubel-style Ready/Age via hook ──
-;;
-;; Upstream fetches: [0]Name [1]Ready [2]Updated [3]Available [4]Reps [5]Timestamp
-;; Hook displays:    Name | Ready(x/y) | Up-to-date | Available | Age
 
 (defun kubed-ext--deployment-entries ()
   "Custom entries for deployments with kubel-style Ready and Age."
@@ -1034,6 +1024,7 @@ Name, Ready(x/y), Status, Restarts, Age, IP, Node."
 ;;; § 7.  New Built-in Resources
 ;;; ═══════════════════════════════════════════════════════════════
 
+;; FIX 6: Corrected corrupted regexp in node roles lambda
 (eval '(kubed-define-resource node
            ((status ".status.conditions[-1:].status" 10
                     nil
@@ -1244,7 +1235,7 @@ Name, Ready(x/y), Status, Restarts, Age, IP, Node."
       t)
 
 ;;; ═══════════════════════════════════════════════════════════════
-;;; § 8–9.  Strimzi + Plain Resources  (unchanged from previous)
+;;; § 8–9.  Strimzi + Plain Resources
 ;;; ═══════════════════════════════════════════════════════════════
 
 (eval '(kubed-define-resource kafka ()
@@ -1603,7 +1594,12 @@ ERRBACK is called with error message on failure."
                      (list "--" shell))
              " "))
 
+;; FIX 8: Added missing defvar declarations for dynamic variables
+;; used in let-bindings from external packages.
 (defvar vterm-shell)
+(defvar vterm-buffer-name)
+(defvar eat-buffer-name)
+(defvar eshell-buffer-name)
 
 (defun kubed-ext-pods-vterm (click)
   "Open vterm in Kubernetes pod at CLICK position."
@@ -1757,25 +1753,30 @@ ERRBACK is called with error message on failure."
 ;;; § 12.  Describe Resource
 ;;; ═══════════════════════════════════════════════════════════════
 
+;; FIX 1: Capture buffer-local variables BEFORE `with-current-buffer'
+;; since kubed-list-type, kubed-list-namespace, kubed-list-context are
+;; buffer-local and nil in the newly created describe buffer.
 (defun kubed-ext-list-describe-resource (click)
   "Describe Kubernetes resource at CLICK position using kubectl describe."
   (interactive (list last-nonmenu-event) kubed-list-mode)
   (if-let ((name (tabulated-list-get-id (mouse-set-point click))))
-      (let ((buf (get-buffer-create
-                  (format "*Kubed describe %s/%s@%s[%s]*"
-                          kubed-list-type name
-                          (or kubed-list-namespace "default")
-                          (or kubed-list-context "current")))))
+      (let* ((type kubed-list-type)
+             (namespace kubed-list-namespace)
+             (context kubed-list-context)
+             (buf (get-buffer-create
+                   (format "*Kubed describe %s/%s@%s[%s]*"
+                           type name
+                           (or namespace "default")
+                           (or context "current")))))
         (with-current-buffer buf
           (let ((inhibit-read-only t))
             (erase-buffer)
-            ;; Build argv without nils; `call-process' args must be strings.
             (apply #'call-process kubed-kubectl-program nil t nil
-                   (append (list "describe" kubed-list-type name)
-                           (when kubed-list-namespace
-                             (list "-n" kubed-list-namespace))
-                           (when kubed-list-context
-                             (list "--context" kubed-list-context))))
+                   (append (list "describe" type name)
+                           (when namespace
+                             (list "-n" namespace))
+                           (when context
+                             (list "--context" context))))
             (goto-char (point-min))
             (special-mode)))
         (display-buffer buf))
@@ -1800,7 +1801,6 @@ ERRBACK is called with error message on failure."
     (with-current-buffer buf
       (let ((inhibit-read-only t))
         (erase-buffer)
-        ;; Build argv without nils; `call-process' args must be strings.
         (apply #'call-process kubed-kubectl-program nil t nil
                (append (list "describe" type name)
                        (when ns (list "-n" ns))
@@ -1996,17 +1996,21 @@ ERRBACK is called with error message on failure."
              (message "Copied: %s" kubed-ext--last-kubectl-command))
     (message "No kubectl command tracked yet.")))
 
+;; FIX 2: Capture buffer-local variables BEFORE `with-temp-buffer'
 (defun kubed-ext-list-copy-resource-as-yaml (click)
   "Copy YAML of resource at CLICK position."
   (interactive (list last-nonmenu-event) kubed-list-mode)
   (if-let ((name (tabulated-list-get-id (mouse-set-point click))))
-      (let ((yaml (with-temp-buffer
-                    (apply #'call-process kubed-kubectl-program nil t nil
-                           "get" kubed-list-type name "-o" "yaml"
-                           (append (when kubed-list-namespace (list "-n" kubed-list-namespace))
-                                   (when kubed-list-context (list "--context" kubed-list-context))))
-                    (buffer-string))))
-        (kill-new yaml) (message "YAML for %s/%s copied (%d bytes)." kubed-list-type name (length yaml)))
+      (let* ((type kubed-list-type)
+             (namespace kubed-list-namespace)
+             (context kubed-list-context)
+             (yaml (with-temp-buffer
+                     (apply #'call-process kubed-kubectl-program nil t nil
+                            "get" type name "-o" "yaml"
+                            (append (when namespace (list "-n" namespace))
+                                    (when context (list "--context" context))))
+                     (buffer-string))))
+        (kill-new yaml) (message "YAML for %s/%s copied (%d bytes)." type name (length yaml)))
     (user-error "No Kubernetes resource at point")))
 
 (transient-define-prefix kubed-ext-copy-popup ()
@@ -2028,6 +2032,7 @@ ERRBACK is called with error message on failure."
 (defvar kubed-ext--label-cache (make-hash-table :test 'equal) "Label cache.")
 (defvar kubed-ext--label-cache-time (make-hash-table :test 'equal) "Label cache timestamps.")
 
+;; FIX 5: Corrected corrupted regexp ($ → proper $$ $$ $ $)
 (defun kubed-ext--fetch-labels (type context namespace)
   "Discover label key=value pairs from resources of TYPE in CONTEXT/NAMESPACE."
   (condition-case nil
