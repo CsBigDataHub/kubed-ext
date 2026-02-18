@@ -43,11 +43,12 @@
 (defsubst kubed-ext-none-p (s)
   "Return non-nil if S is nil, empty, or a kubectl placeholder value."
   (or (null s)
+      (not (stringp s))
       (string-empty-p s)
-      (string= s "")
-      (string= s "")
-      (string-match-p "\\`[ \t]*[ \t]*\'" s)
-      (string-match-p "\\`[ \t]*\'" s)))
+      (string= s "<none>")
+      (string= s "<unknown>")
+      (string= s "nil")
+      (string-match-p "\\`[ \t]*\\'" s)))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 0b.  Defcustoms: Status Faces, Output Format, Shell
@@ -1299,21 +1300,10 @@ Deletion is detected by positive timestamp match."
  "pods"
  (list
   '("PHASE:.status.phase")
-  (cons "READY:.status.containerStatuses[?(.ready==true)].name"
-        (lambda (cs)
-          (if (kubed-ext-none-p cs) "0"
-            (number-to-string (1+ (seq-count (lambda (c) (= c ?,)) cs))))))
-  (cons "TOTAL:.status.containerStatuses[*].name"
-        (lambda (cs)
-          (if (kubed-ext-none-p cs) "0"
-            (number-to-string (1+ (seq-count (lambda (c) (= c ?,)) cs))))))
+  '("READY_NAMES:.status.containerStatuses[?(@.ready==true)].name")
+  '("ALL_NAMES:.status.containerStatuses[*].name")
   '("STARTTIME:.status.startTime")
-  (cons "RESTARTS:.status.containerStatuses[*].restartCount"
-        (lambda (s)
-          (if (kubed-ext-none-p s) "0"
-            (number-to-string
-             (apply #'+ (mapcar #'string-to-number
-                                (split-string s ",")))))))
+  '("RESTARTS:.status.containerStatuses[*].restartCount")
   '("IP:.status.podIP")
   '("NODE:.spec.nodeName")
   '("WAITING:.status.containerStatuses[*].state.waiting.reason")
@@ -1321,37 +1311,48 @@ Deletion is detected by positive timestamp match."
   '("DELETION:.metadata.deletionTimestamp"))
  nil)
 
+(defun kubed-ext--count-csv-items (s)
+  "Count comma-separated items in S. Empty/none=0, single item=1."
+  (cond
+   ((kubed-ext-none-p s)             0)
+   ((string-empty-p (string-trim s)) 0)
+   (t (1+ (seq-count (lambda (c) (= c ?,)) s)))))
+
 (defun kubed-ext--pod-entries ()
   "Custom entries for pods with kubel-style status and color coding.
 Reads 11-element fetch vectors and produces 7-column display vectors:
 Name, Ready(x/y), Status, Restarts, Age, IP, Node."
-  (let* ((raw (alist-get 'resources (kubed--alist kubed-list-type
-                                                  kubed-list-context
-                                                  kubed-list-namespace)))
+  (let* ((raw  (alist-get 'resources (kubed--alist kubed-list-type
+                                                   kubed-list-context
+                                                   kubed-list-namespace)))
          (pred (kubed-list-interpret-filter))
          (result nil))
     (dolist (entry raw)
       (let* ((vec (cadr entry))
              (new-entry
               (if (and (vectorp vec) (>= (length vec) 11))
-                  (let ((restart-str (aref vec 5)))
+                  (let* ((ready-names  (aref vec 2))
+                         (all-names    (aref vec 3))
+                         (restart-raw  (aref vec 5))
+                         (ready-count  (kubed-ext--count-csv-items ready-names))
+                         (total-count  (kubed-ext--count-csv-items all-names))
+                         (restart-n    (if (kubed-ext-none-p restart-raw) 0
+                                         (apply #'+
+                                                (mapcar #'string-to-number
+                                                        (split-string
+                                                         restart-raw "," t " "))))))
                     (list (car entry)
                           (vector
                            (aref vec 0)
                            (kubed-ext--format-pod-ready
-                            (aref vec 2) (aref vec 3))
+                            (number-to-string ready-count)
+                            (number-to-string total-count))
                            (kubed-ext--compute-pod-status
-                            (aref vec 1) (aref vec 8)
-                            (aref vec 9) (aref vec 10))
-                           (kubed-ext--format-pod-restarts
-                            (string-to-number
-                             (if (kubed-ext-none-p restart-str) "0"
-                               restart-str)))
+                            (aref vec 1) (aref vec 8) (aref vec 9) (aref vec 10))
+                           (kubed-ext--format-pod-restarts restart-n)
                            (kubed-ext--format-age (aref vec 4))
-                           (let ((ip (aref vec 6)))
-                             (if (kubed-ext-none-p ip) "" ip))
-                           (let ((node (aref vec 7)))
-                             (if (kubed-ext-none-p node) "" node)))))
+                           (if (kubed-ext-none-p (aref vec 6)) "" (aref vec 6))
+                           (if (kubed-ext-none-p (aref vec 7)) "" (aref vec 7)))))
                 entry)))
         (when (funcall pred new-entry)
           (push new-entry result))))
