@@ -2248,7 +2248,10 @@ ORIG-FN is advised. START and END are region bounds. PROGRAM and ARGS passed."
           (ctx (kubed-read-context "Switch to context")))
       (when type
         (let ((fn (intern (format "kubed-list-%s" type))))
-          (when (fboundp fn) (if ns (funcall fn ctx ns) (funcall fn ctx))))))))
+          (when (fboundp fn)
+            (if (kubed-namespaced-p type ctx)
+                (funcall fn ctx (or ns (kubed--namespace ctx)))
+              (funcall fn ctx))))))))
 
 (defun kubed-ext-switch-namespace ()
   "Switch namespace and refresh current resource list."
@@ -2258,7 +2261,10 @@ ORIG-FN is advised. START and END are region bounds. PROGRAM and ARGS passed."
           (ns (kubed-read-namespace "Switch to namespace" nil nil kubed-list-context)))
       (when type
         (let ((fn (intern (format "kubed-list-%s" type))))
-          (when (fboundp fn) (funcall fn ctx ns)))))))
+          (when (fboundp fn)
+            (if (kubed-namespaced-p type ctx)
+                (funcall fn ctx ns)
+              (funcall fn ctx))))))))
 
 (defvar kubed-ext-common-resources
   '(("pods" . "Pods") ("deployments" . "Deployments") ("services" . "Services")
@@ -2282,7 +2288,10 @@ ORIG-FN is advised. START and END are region bounds. PROGRAM and ARGS passed."
            (type (alist-get sel choices nil nil #'string=)))
       (when type
         (let ((fn (intern (format "kubed-list-%s" type))))
-          (when (fboundp fn) (if ns (funcall fn ctx ns) (funcall fn ctx))))))))
+          (when (fboundp fn)
+            (if (kubed-namespaced-p type ctx)
+                (funcall fn ctx (or ns (kubed--namespace ctx)))
+              (funcall fn ctx))))))))
 
 (defun kubed-ext-jump-pods ()        "Jump to Pods."        (interactive) (kubed-list-pods kubed-list-context kubed-list-namespace))
 (defun kubed-ext-jump-deployments () "Jump to Deployments." (interactive) (kubed-list-deployments kubed-list-context kubed-list-namespace))
