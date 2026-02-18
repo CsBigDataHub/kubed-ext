@@ -4,6 +4,7 @@
 ;; Version: 0.2.0
 ;; URL: https://github.com/CsBigDataHub/kubed-ext
 ;; Keywords: tools, kubernetes
+;; Package-Requires: ((emacs "29.1") (kubed "0.5.1") (transient "0.4.0"))
 
 ;;; Commentary:
 ;; A comprehensive extension suite for Kubed, transforming Emacs into a
@@ -40,11 +41,13 @@
 ;;; ═══════════════════════════════════════════════════════════════
 
 (defsubst kubed-ext-none-p (s)
-  "Return non-nil if S is nil, empty,<none>, or ''."
+  "Return non-nil if S is nil, empty, or a kubectl placeholder value."
   (or (null s)
       (string-empty-p s)
       (string= s "")
-      (string= s "")))
+      (string= s "")
+      (string-match-p "\\`[ \t]*[ \t]*\'" s)
+      (string-match-p "\\`[ \t]*\'" s)))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 0b.  Defcustoms: Status Faces, Output Format, Shell
@@ -1066,11 +1069,17 @@ ORIG-FN is the original function, ARGS its arguments."
 (defun kubed-ext--parse-k8s-timestamp (s)
   "Parse Kubernetes ISO 8601 timestamp S to an Emacs time value.
 Returns nil if S cannot be parsed."
-  (condition-case nil
-      (when (string-match
-             (concat "$[0-9]\\{4\\}$-$[0-9]\\{2\\}$-$[0-9]\\{2\\}$"
-                     "T$[0-9]\\{2\\}$:$[0-9]\\{2\\}$:$[0-9]\\{2\\}$Z?")
-             s)
+  (when (and (stringp s)
+             (string-match
+              (concat "$[0-9]\\{4\\}$"
+                      "-$[0-9]\\{2\\}$"
+                      "-$[0-9]\\{2\\}$"
+                      "T$[0-9]\\{2\\}$"
+                      ":$[0-9]\\{2\\}$"
+                      ":$[0-9]\\{2\\}$"
+                      "Z?")
+              s))
+    (condition-case nil
         (encode-time
          (string-to-number (match-string 6 s))
          (string-to-number (match-string 5 s))
@@ -1078,8 +1087,8 @@ Returns nil if S cannot be parsed."
          (string-to-number (match-string 3 s))
          (string-to-number (match-string 2 s))
          (string-to-number (match-string 1 s))
-         0))
-    (error nil)))
+         0)
+      (error nil))))
 
 (defun kubed-ext--format-age (timestamp)
   "Convert TIMESTAMP to human-readable age matching kubectl HumanDuration."
@@ -1123,12 +1132,16 @@ Returns nil if S cannot be parsed."
 
 (defun kubed-ext--compute-pod-status (phase waiting terminated deletion)
   "Compute kubel-style pod status from PHASE, WAITING, TERMINATED, DELETION.
-Returns a propertized string with face from `kubed-ext-status-faces'."
+Returns a propertized string with face from `kubed-ext-status-faces'.
+Deletion is detected by positive timestamp match, not absence of ."
   (let* ((waiting-reason (unless (kubed-ext-none-p waiting)
                            (car (split-string waiting ","))))
          (terminated-reason (unless (kubed-ext-none-p terminated)
                               (car (split-string terminated ","))))
-         (deleting (not (kubed-ext-none-p deletion)))
+         (deleting (and (stringp deletion)
+                        (string-match-p
+                         "\\`[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}T"
+                         deletion)))
          (status (cond
                   (deleting "Terminating")
                   (waiting-reason waiting-reason)
