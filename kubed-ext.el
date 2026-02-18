@@ -1,21 +1,13 @@
 ;;; kubed-ext.el --- Extensions for Kubed with Async Metrics -*- lexical-binding: t; -*-
 
 ;; Author: Chetan Koneru
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; URL: https://github.com/CsBigDataHub/kubed-ext
 ;; Keywords: tools, kubernetes
 
 ;;; Commentary:
 ;; A comprehensive extension suite for Kubed, transforming Emacs into a
 ;; production-grade Kubernetes dashboard.
-;;
-;; Features:
-;; - True Async Metrics (Top) using futur.el (Non-blocking)
-;; - Advanced Port Forwarding with history and management buffer
-;; - Strimzi Kafka support
-;; - CRD Auto-discovery
-;; - Server-side Label Selectors
-;; - Optimized Terminal integration (vterm/eat/eshell)
 
 ;;; Code:
 
@@ -42,6 +34,84 @@
 (add-to-list 'display-buffer-alist
              '("\\`\\*kubed-top-"
                (display-buffer-same-window)))
+
+;;; ═══════════════════════════════════════════════════════════════
+;;; § 0a.  Utility Functions
+;;; ═══════════════════════════════════════════════════════════════
+
+(defsubst kubed-ext-none-p (s)
+  "Return non-nil if S is nil, empty,<none>, or ''."
+  (or (null s)
+      (string-empty-p s)
+      (string= s "")
+      (string= s "")))
+
+;;; ═══════════════════════════════════════════════════════════════
+;;; § 0b.  Defcustoms: Status Faces, Output Format, Shell
+;;; ═══════════════════════════════════════════════════════════════
+
+(defcustom kubed-ext-status-faces
+  '(("Running"                      . success)
+    ("Succeeded"                    . shadow)
+    ("Completed"                    . (:foreground "yellow"))
+    ("Pending"                      . warning)
+    ("ContainerCreating"            . warning)
+    ("PodInitializing"              . warning)
+    ("Unknown"                      . warning)
+    ("Terminating"                  . (:foreground "blue"))
+    ("Failed"                       . error)
+    ("Error"                        . error)
+    ("OOMKilled"                    . error)
+    ("CrashLoopBackOff"             . error)
+    ("ImagePullBackOff"             . error)
+    ("ErrImagePull"                 . error)
+    ("CreateContainerConfigError"   . error)
+    ("InvalidImageName"             . error)
+    ("Evicted"                      . error)
+    ("RunContainerError"            . error)
+    ("StartError"                   . error)
+    ("Ready"                        . success)
+    ("NotReady"                     . error)
+    ("Active"                       . success)
+    ("Bound"                        . success)
+    ("Released"                     . shadow)
+    ("Healthy"                      . success))
+  "Association list mapping pod/resource status strings to faces.
+Customize this to change colors for different Kubernetes statuses."
+  :type '(alist :key-type string :value-type (choice face sexp))
+  :group 'kubed-ext)
+
+(defcustom kubed-ext-output-format "yaml"
+  "Default output format for resource display buffers (yaml or json)."
+  :type '(choice (const "yaml") (const "json"))
+  :group 'kubed-ext)
+
+(defcustom kubed-ext-pod-shell "/bin/sh"
+  "Shell to run when opening a terminal in a Kubernetes pod."
+  :type 'string
+  :group 'kubed-ext)
+
+;;; ═══════════════════════════════════════════════════════════════
+;;; § 0c.  Buffer-Local Variables
+;;; ═══════════════════════════════════════════════════════════════
+
+(defvar-local kubed-ext-resource-filter ""
+  "Substring filter for highlighting matching resources in list buffers.")
+
+(defvar-local kubed-ext--header-error nil
+  "Current error message to display, or nil if no error.")
+
+(defvar-local kubed-ext--error-overlay nil
+  "Overlay used to display error message at top of buffer.")
+
+(defvar-local kubed-ext-list-label-selector nil
+  "Active label selector for server-side kubectl filtering.")
+
+;; External package variable declarations (suppress byte-compiler warnings).
+(defvar vterm-shell)
+(defvar vterm-buffer-name)
+(defvar eat-buffer-name)
+(defvar eshell-buffer-name)
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 1.  CRD Auto-Column Discovery
@@ -135,7 +205,7 @@
   (message "CRD column cache cleared."))
 
 ;;; ═══════════════════════════════════════════════════════════════
-;;; § 2.  Port-Forward with Auto-Complete (k9s Shift-F style)
+;;; § 2.  Port-Forward with Auto-Complete
 ;;; ═══════════════════════════════════════════════════════════════
 
 (defconst kubed-ext--dq (string 34)
@@ -259,7 +329,7 @@
   (let ((res-spec (pcase type
                     ((or "pod" "pods") name)
                     ((or "service" "services") (concat "svc/" name))
-                    (_ (concat (replace-regexp-in-string "s'" "" type)
+                    (_ (concat (replace-regexp-in-string "s\'" "" type)
                                "/" name))))
         (desc (format "%s/%s %d:%d in %s[%s]"
                       type name local-port remote-port
@@ -407,9 +477,9 @@
 (advice-add 'kubed-stop-port-forward :after
             #'kubed-ext-refresh-pf-markers-in-visible-buffers)
 
-;; FIX 3: Corrected corrupted regexp ($ → proper $ $ $$ $$)
 (defun kubed-ext-parse-pf-descriptor (desc)
-  "Parse port-forward descriptor DESC into list."
+  "Parse port-forward descriptor DESC into list.
+DESC format: type/name local:remote in namespace[context]."
   (if (string-match
        "$.+?$ $[0-9]+:[0-9]+$ in $.+?$$$$.+?$$$" desc)
       (list (match-string 1 desc) (match-string 2 desc)
@@ -482,6 +552,317 @@
       (kubed-ext-port-forwards-mode)
       (tabulated-list-print t))
     (switch-to-buffer buf)))
+
+;;; ═══════════════════════════════════════════════════════════════
+;;; § 3a.  Error Overlay Header
+;;; ═══════════════════════════════════════════════════════════════
+
+(defun kubed-ext--set-header-error (msg)
+  "Set error MSG as an overlay at the top of the current buffer."
+  (kubed-ext--clear-header-error)
+  (when (and msg (not (string-empty-p (string-trim msg))))
+    (setq kubed-ext--header-error (string-trim msg))
+    (when (> (buffer-size) 0)
+      (let ((ov (make-overlay (point-min) (point-min))))
+        (overlay-put ov 'before-string
+                     (propertize
+                      (format "⚠ %s  [Type `$' for process buffer]\n"
+                              kubed-ext--header-error)
+                      'face 'error))
+        (overlay-put ov 'kubed-ext-error t)
+        (overlay-put ov 'priority 100)
+        (setq kubed-ext--error-overlay ov)))))
+
+(defun kubed-ext--clear-header-error ()
+  "Clear any error overlay from the current buffer."
+  (when kubed-ext--error-overlay
+    (delete-overlay kubed-ext--error-overlay)
+    (setq kubed-ext--error-overlay nil))
+  (setq kubed-ext--header-error nil))
+
+(defun kubed-ext--reapply-overlays (&rest _)
+  "Re-apply error overlay and filter highlight after buffer revert."
+  (when (derived-mode-p 'kubed-list-mode)
+    (when kubed-ext--header-error
+      (let ((msg kubed-ext--header-error))
+        (setq kubed-ext--error-overlay nil)
+        (kubed-ext--set-header-error msg)))
+    (kubed-ext--apply-filter-highlights)))
+
+(advice-add 'kubed-list-revert :after #'kubed-ext--reapply-overlays)
+
+(defun kubed-ext--update-error-advice (orig-fn type context &optional namespace)
+  "Around advice for `kubed-update' to capture errors as header overlays.
+ORIG-FN is the original function, TYPE CONTEXT NAMESPACE are its args."
+  (funcall orig-fn type context namespace)
+  ;; Wrap the sentinel of the process that was just created.
+  (when-let ((proc (alist-get 'process
+                              (kubed--alist type context namespace))))
+    (when (process-live-p proc)
+      (let ((orig-sentinel (process-sentinel proc))
+            (err-buf-name (format " *kubed-get-%s-stderr*" type)))
+        (set-process-sentinel
+         proc
+         (lambda (p status)
+           (funcall orig-sentinel p status)
+           (dolist (buf (buffer-list))
+             (when (buffer-live-p buf)
+               (with-current-buffer buf
+                 (when (and (derived-mode-p 'kubed-list-mode)
+                            (equal kubed-list-type type)
+                            (equal kubed-list-context context)
+                            (equal kubed-list-namespace namespace))
+                   (if (string= status "exited abnormally with code 1\n")
+                       (let ((err-buf (get-buffer err-buf-name)))
+                         (kubed-ext--set-header-error
+                          (if (and err-buf (buffer-live-p err-buf))
+                              (with-current-buffer err-buf
+                                (string-trim (buffer-string)))
+                            "kubectl command failed")))
+                     (kubed-ext--clear-header-error))))))))))))
+
+(advice-add 'kubed-update :around #'kubed-ext--update-error-advice)
+
+;;; ═══════════════════════════════════════════════════════════════
+;;; § 3b.  Mark / Unmark System (kubel-style)
+;;; ═══════════════════════════════════════════════════════════════
+
+(defun kubed-ext-marked-items ()
+  "Return list of resource IDs marked with `*' in current buffer."
+  (let (items)
+    (save-excursion
+      (goto-char (point-min))
+      (while (not (eobp))
+        (when (eq (char-after) ?*)
+          (when-let ((id (tabulated-list-get-id)))
+            (push id items)))
+        (forward-line)))
+    (nreverse items)))
+
+(defun kubed-ext-mark-item ()
+  "Mark the resource at point with `*'."
+  (interactive nil kubed-list-mode)
+  (tabulated-list-put-tag
+   (propertize "*" 'face 'dired-marked 'help-echo "Selected") t))
+
+(defun kubed-ext-unmark-item ()
+  "Unmark the resource at point."
+  (interactive nil kubed-list-mode)
+  (tabulated-list-put-tag " " t))
+
+(defun kubed-ext-mark-all ()
+  "Mark all visible resources in the current buffer."
+  (interactive nil kubed-list-mode)
+  (save-excursion
+    (goto-char (point-min))
+    (while (not (eobp))
+      (when (tabulated-list-get-id)
+        (tabulated-list-put-tag
+         (propertize "*" 'face 'dired-marked)))
+      (forward-line)))
+  (message "Marked all items."))
+
+(defun kubed-ext-unmark-all ()
+  "Unmark all resources in the current buffer."
+  (interactive nil kubed-list-mode)
+  (save-excursion
+    (goto-char (point-min))
+    (while (not (eobp))
+      (when (memq (char-after) '(?* ?D))
+        (tabulated-list-put-tag " "))
+      (forward-line)))
+  (message "Unmarked all items."))
+
+;;; ═══════════════════════════════════════════════════════════════
+;;; § 3c.  Substring Filter with Highlight (kubel-style)
+;;; ═══════════════════════════════════════════════════════════════
+
+(defun kubed-ext--apply-filter-highlights ()
+  "Apply filter highlighting to current buffer.
+Matching rows stay normal; non-matching rows get `shadow' face."
+  (when (derived-mode-p 'kubed-list-mode)
+    (remove-overlays (point-min) (point-max) 'kubed-ext-filter t)
+    (when (and (bound-and-true-p kubed-ext-resource-filter)
+               (not (string-empty-p kubed-ext-resource-filter)))
+      (save-excursion
+        (goto-char (point-min))
+        (while (not (eobp))
+          (when-let ((entry (tabulated-list-get-entry)))
+            (let ((line-text (mapconcat #'identity
+                                        (append entry nil) " ")))
+              (unless (string-match-p kubed-ext-resource-filter line-text)
+                (let ((ov (make-overlay (line-beginning-position)
+                                        (line-end-position))))
+                  (overlay-put ov 'kubed-ext-filter t)
+                  (overlay-put ov 'face 'shadow)))))
+          (forward-line))))))
+
+(defun kubed-ext-set-filter (filter)
+  "Set substring FILTER for highlighting resources.
+Empty string clears the filter."
+  (interactive
+   (list (read-string (format-prompt "Filter" "clear")
+                      kubed-ext-resource-filter))
+   kubed-list-mode)
+  (setq-local kubed-ext-resource-filter (or filter ""))
+  (kubed-ext--apply-filter-highlights)
+  (force-mode-line-update)
+  (if (string-empty-p kubed-ext-resource-filter)
+      (message "Filter cleared.")
+    (message "Filter: %s" kubed-ext-resource-filter)))
+
+(defun kubed-ext-jump-to-next-highlight ()
+  "Jump to the next resource matching `kubed-ext-resource-filter'."
+  (interactive nil kubed-list-mode)
+  (unless (and kubed-ext-resource-filter
+               (not (string-empty-p kubed-ext-resource-filter)))
+    (user-error "No filter set (use `f' to set one)"))
+  (let ((found nil) (start (point)))
+    (end-of-line)
+    (while (and (not found) (not (eobp)))
+      (forward-line)
+      (when-let ((entry (tabulated-list-get-entry)))
+        (let ((text (mapconcat #'identity (append entry nil) " ")))
+          (when (string-match-p kubed-ext-resource-filter text)
+            (setq found t)))))
+    (unless found
+      ;; Wrap around from top.
+      (goto-char (point-min))
+      (while (and (not found) (< (point) start))
+        (when-let ((entry (tabulated-list-get-entry)))
+          (let ((text (mapconcat #'identity (append entry nil) " ")))
+            (when (string-match-p kubed-ext-resource-filter text)
+              (setq found t))))
+        (unless found (forward-line))))
+    (if found
+        (beginning-of-line)
+      (goto-char start)
+      (message "No match for `%s'" kubed-ext-resource-filter))))
+
+(defun kubed-ext-jump-to-previous-highlight ()
+  "Jump to the previous resource matching `kubed-ext-resource-filter'."
+  (interactive nil kubed-list-mode)
+  (unless (and kubed-ext-resource-filter
+               (not (string-empty-p kubed-ext-resource-filter)))
+    (user-error "No filter set (use `f' to set one)"))
+  (let ((found nil) (start (point)))
+    (beginning-of-line)
+    (while (and (not found) (not (bobp)))
+      (forward-line -1)
+      (when-let ((entry (tabulated-list-get-entry)))
+        (let ((text (mapconcat #'identity (append entry nil) " ")))
+          (when (string-match-p kubed-ext-resource-filter text)
+            (setq found t)))))
+    (unless found
+      ;; Wrap around from bottom.
+      (goto-char (point-max))
+      (while (and (not found) (> (point) start))
+        (forward-line -1)
+        (when-let ((entry (tabulated-list-get-entry)))
+          (let ((text (mapconcat #'identity (append entry nil) " ")))
+            (when (string-match-p kubed-ext-resource-filter text)
+              (setq found t))))))
+    (if found
+        (beginning-of-line)
+      (goto-char start)
+      (message "No match for `%s'" kubed-ext-resource-filter))))
+
+;;; ═══════════════════════════════════════════════════════════════
+;;; § 3d.  Wide View + Output Format Toggle
+;;; ═══════════════════════════════════════════════════════════════
+
+(defun kubed-ext-list-wide ()
+  "Display current resource list in kubectl wide format in a new buffer."
+  (interactive nil kubed-list-mode)
+  (let* ((type kubed-list-type)
+         (ctx kubed-list-context)
+         (ns kubed-list-namespace)
+         (buf (get-buffer-create
+               (format "*Kubed wide %s@%s[%s]*"
+                       type (or ns "cluster") (or ctx "current")))))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (apply #'call-process kubed-kubectl-program nil t nil
+               "get" type "-o" "wide"
+               (append (when ns (list "-n" ns))
+                       (when ctx (list "--context" ctx))))
+        (goto-char (point-min))
+        (special-mode)))
+    (display-buffer buf)))
+
+(defun kubed-ext-toggle-output-format ()
+  "Toggle resource display format between YAML and JSON and revert."
+  (interactive)
+  (setq kubed-ext-output-format
+        (if (string= kubed-ext-output-format "yaml") "json" "yaml"))
+  (when (bound-and-true-p kubed-display-resource-mode)
+    (revert-buffer))
+  (message "Output format: %s" kubed-ext-output-format))
+
+(defun kubed-ext-set-output-format ()
+  "Prompt for and set the output format for resource display."
+  (interactive)
+  (setq kubed-ext-output-format
+        (completing-read "Output format: " '("yaml" "json") nil t
+                         nil nil kubed-ext-output-format))
+  (when (bound-and-true-p kubed-display-resource-mode)
+    (revert-buffer))
+  (message "Output format set to %s." kubed-ext-output-format))
+
+(defun kubed-ext--display-revert-format (orig-fn &rest args)
+  "Around advice for `kubed-display-resource-revert' for configurable format.
+ORIG-FN is the original function, ARGS its arguments."
+  (if (string= kubed-ext-output-format "yaml")
+      (apply orig-fn args)
+    (seq-let (type name context namespace)
+        kubed-display-resource-info
+      (let ((inhibit-read-only t)
+            (target (current-buffer)))
+        (buffer-disable-undo)
+        (with-temp-buffer
+          (unless (zerop
+                   (apply #'call-process
+                          kubed-kubectl-program nil t nil "get"
+                          type (concat "--output=" kubed-ext-output-format)
+                          name
+                          (append (when namespace (list "-n" namespace))
+                                  (when context (list "--context" context)))))
+            (error "Failed to display Kubernetes resource `%s'" name))
+          (let ((source (current-buffer)))
+            (with-current-buffer target
+              (replace-buffer-contents source)
+              (set-buffer-modified-p nil)
+              (buffer-enable-undo))))))))
+
+(advice-add 'kubed-display-resource-revert :around
+            #'kubed-ext--display-revert-format)
+
+;;; ═══════════════════════════════════════════════════════════════
+;;; § 3e.  Batch Operations on Marked Items
+;;; ═══════════════════════════════════════════════════════════════
+
+(defun kubed-ext-delete-marked ()
+  "Delete all resources marked with `*'."
+  (interactive nil kubed-list-mode)
+  (let ((items (kubed-ext-marked-items)))
+    (unless items
+      (user-error "No resources marked with `*'"))
+    (when (y-or-n-p (format "Delete %d marked %s?"
+                            (length items) kubed-list-type))
+      (kubed-delete-resources kubed-list-type items
+                              kubed-list-context kubed-list-namespace)
+      (kubed-list-update t))))
+
+(defun kubed-ext-logs-marked ()
+  "Show logs for all pods marked with `*'."
+  (interactive nil kubed-list-mode)
+  (let ((items (kubed-ext-marked-items)))
+    (unless items
+      (user-error "No resources marked with `*'"))
+    (dolist (pod items)
+      (kubed-logs kubed-list-type pod kubed-list-context kubed-list-namespace
+                  t t nil nil nil nil nil))))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 4.  Strimzi Operation Helpers
@@ -617,7 +998,7 @@
 (defun kubed-ext-parse-cpu (s)
   "Parse Kubernetes CPU quantity S to millicores (number)."
   (cond
-   ((or (null s) (string-empty-p s) (string= s "<none>")) 0)
+   ((kubed-ext-none-p s) 0)
    ((string-suffix-p "m" s)  (string-to-number s))
    ((string-suffix-p "n" s)  (/ (string-to-number s) 1000000.0))
    ((string-suffix-p "u" s)  (/ (string-to-number s) 1000.0))
@@ -626,7 +1007,7 @@
 (defun kubed-ext-parse-mem (s)
   "Parse Kubernetes memory quantity S to MiB (number)."
   (cond
-   ((or (null s) (string-empty-p s) (string= s "")) 0)
+   ((kubed-ext-none-p s) 0)
    ((string-suffix-p "Ti" s) (* 1048576.0 (string-to-number s)))
    ((string-suffix-p "Gi" s) (* 1024.0    (string-to-number s)))
    ((string-suffix-p "Mi" s) (string-to-number s))
@@ -635,13 +1016,13 @@
 
 (defun kubed-ext-sum-cpu (s)
   "Sum comma-separated CPU values in S."
-  (if (or (null s) (string-empty-p s)) 0
+  (if (kubed-ext-none-p s) 0
     (apply #'+ (mapcar #'kubed-ext-parse-cpu
                        (split-string s "," t "[ \t]")))))
 
 (defun kubed-ext-sum-mem (s)
   "Sum comma-separated memory values in S."
-  (if (or (null s) (string-empty-p s)) 0
+  (if (kubed-ext-none-p s) 0
     (apply #'+ (mapcar #'kubed-ext-parse-mem
                        (split-string s "," t "[ \t]")))))
 
@@ -674,7 +1055,7 @@
                   'kubed-sort-value pct))))
 
 (defun kubed-ext-top-numeric-sorter (col-idx)
-  "Return a sort predicate comparing column COL-IDX by kubed-sort-value."
+  "Return a sort predicate comparing column COL-IDX by `kubed-sort-value'."
   (lambda (a b)
     (let ((va (get-text-property 0 'kubed-sort-value (aref (cadr a) col-idx)))
           (vb (get-text-property 0 'kubed-sort-value (aref (cadr b) col-idx))))
@@ -682,7 +1063,6 @@
 
 ;; ── Kubernetes Timestamp ──
 
-;; FIX 4: Corrected corrupted regexp ($ → proper $ $)
 (defun kubed-ext--parse-k8s-timestamp (s)
   "Parse Kubernetes ISO 8601 timestamp S to an Emacs time value.
 Returns nil if S cannot be parsed."
@@ -703,13 +1083,12 @@ Returns nil if S cannot be parsed."
 
 (defun kubed-ext--format-age (timestamp)
   "Convert TIMESTAMP to human-readable age matching kubectl HumanDuration."
-  (if (or (null timestamp) (string-empty-p timestamp)
-          (string= timestamp ""))
+  (if (kubed-ext-none-p timestamp)
       (propertize "n/a" 'face 'shadow 'kubed-sort-value 0)
     (let ((parsed (kubed-ext--parse-k8s-timestamp timestamp)))
       (if (null parsed)
           (propertize timestamp 'kubed-sort-value 0)
-        (let* ((secs (floor (float-time (time-subtract (current-time) parsed))))
+        (let* ((secs (floor (float-time (time-subtract nil parsed))))
                (total-minutes (/ secs 60))
                (hours (/ secs 3600))
                (days (/ secs 86400))
@@ -744,40 +1123,18 @@ Returns nil if S cannot be parsed."
 
 (defun kubed-ext--compute-pod-status (phase waiting terminated deletion)
   "Compute kubel-style pod status from PHASE, WAITING, TERMINATED, DELETION.
-Returns a propertized string with face matching the status severity."
-  (let* ((none-p (lambda (s)
-                   (or (null s) (string-empty-p s) (string= s ""))))
-         (waiting-reason (unless (funcall none-p waiting)
+Returns a propertized string with face from `kubed-ext-status-faces'."
+  (let* ((waiting-reason (unless (kubed-ext-none-p waiting)
                            (car (split-string waiting ","))))
-         (terminated-reason (unless (funcall none-p terminated)
+         (terminated-reason (unless (kubed-ext-none-p terminated)
                               (car (split-string terminated ","))))
-         (deleting (not (funcall none-p deletion)))
+         (deleting (not (kubed-ext-none-p deletion)))
          (status (cond
                   (deleting "Terminating")
                   (waiting-reason waiting-reason)
                   (terminated-reason terminated-reason)
                   (t (or phase "Unknown"))))
-         (face (pcase status
-                 ("Running"                      'success)
-                 ("Succeeded"                    'shadow)
-                 ("Completed"                    '(:foreground "yellow"))
-                 ("Pending"                      'warning)
-                 ("ContainerCreating"            'warning)
-                 ("PodInitializing"              'warning)
-                 ("Unknown"                      'warning)
-                 ("Terminating"                  '(:foreground "blue"))
-                 ("Failed"                       'error)
-                 ("Error"                        'error)
-                 ("OOMKilled"                    'error)
-                 ("CrashLoopBackOff"             'error)
-                 ("ImagePullBackOff"             'error)
-                 ("ErrImagePull"                 'error)
-                 ("CreateContainerConfigError"   'error)
-                 ("InvalidImageName"             'error)
-                 ("Evicted"                      'error)
-                 ("RunContainerError"            'error)
-                 ("StartError"                   'error)
-                 (_                              nil))))
+         (face (cdr (assoc status kubed-ext-status-faces))))
     (if face (propertize status 'face face) status)))
 
 (defun kubed-ext--format-pod-ready (ready-count total-count)
@@ -806,7 +1163,7 @@ Returns a propertized string with face matching the status severity."
 ;; ── Deployment Formatting ──
 
 (defun kubed-ext--format-ready-total (ready replicas)
-  "Format READY/REPLICAS as kubel-style ready/total with color coding."
+  "Format READY/REPLICAS as ready/total with color coding."
   (let* ((r (string-to-number (or ready "0")))
          (tot (string-to-number (or replicas "0")))
          (str (format "%d/%d" r tot))
@@ -841,16 +1198,16 @@ Returns a propertized string with face matching the status severity."
   '("PHASE:.status.phase")
   (cons "READY:.status.containerStatuses[?(.ready==true)].name"
         (lambda (cs)
-          (if (string= cs "") "0"
+          (if (kubed-ext-none-p cs) "0"
             (number-to-string (1+ (seq-count (lambda (c) (= c ?,)) cs))))))
   (cons "TOTAL:.status.containerStatuses[*].name"
         (lambda (cs)
-          (if (string= cs "") "0"
+          (if (kubed-ext-none-p cs) "0"
             (number-to-string (1+ (seq-count (lambda (c) (= c ?,)) cs))))))
   '("STARTTIME:.status.startTime")
   (cons "RESTARTS:.status.containerStatuses[*].restartCount"
         (lambda (s)
-          (if (string-empty-p s) "0"
+          (if (kubed-ext-none-p s) "0"
             (number-to-string
              (apply #'+ (mapcar #'string-to-number
                                 (split-string s ",")))))))
@@ -874,19 +1231,24 @@ Name, Ready(x/y), Status, Restarts, Age, IP, Node."
       (let* ((vec (cadr entry))
              (new-entry
               (if (and (vectorp vec) (>= (length vec) 11))
-                  (list (car entry)
-                        (vector
-                         (aref vec 0)
-                         (kubed-ext--format-pod-ready
-                          (aref vec 2) (aref vec 3))
-                         (kubed-ext--compute-pod-status
-                          (aref vec 1) (aref vec 8)
-                          (aref vec 9) (aref vec 10))
-                         (kubed-ext--format-pod-restarts
-                          (string-to-number (or (aref vec 5) "0")))
-                         (kubed-ext--format-age (aref vec 4))
-                         (or (aref vec 6) "")
-                         (or (aref vec 7) "")))
+                  (let ((restart-str (aref vec 5)))
+                    (list (car entry)
+                          (vector
+                           (aref vec 0)
+                           (kubed-ext--format-pod-ready
+                            (aref vec 2) (aref vec 3))
+                           (kubed-ext--compute-pod-status
+                            (aref vec 1) (aref vec 8)
+                            (aref vec 9) (aref vec 10))
+                           (kubed-ext--format-pod-restarts
+                            (string-to-number
+                             (if (kubed-ext-none-p restart-str) "0"
+                               restart-str)))
+                           (kubed-ext--format-age (aref vec 4))
+                           (let ((ip (aref vec 6)))
+                             (if (kubed-ext-none-p ip) "" ip))
+                           (let ((node (aref vec 7)))
+                             (if (kubed-ext-none-p node) "" node)))))
                 entry)))
         (when (funcall pred new-entry)
           (push new-entry result))))
@@ -917,13 +1279,13 @@ Name, Ready(x/y), Status, Restarts, Age, IP, Node."
   (cons "SELECTOR:.spec.selector"
         (lambda (s)
           (cond
-           ((string-empty-p s) "")
+           ((kubed-ext-none-p s) "")
            ((string-prefix-p "map[" s) (substring s 4 -1))
            (t s)))))
  (list (list "Selector" 40 t)))
 
 ;; ── Ingresses: enhanced columns ──
-;; FIX 7: Corrected corrupted regexps in address lambda
+
 (kubed-ext-set-columns
  "ingresses"
  (list
@@ -932,13 +1294,13 @@ Name, Ready(x/y), Status, Restarts, Age, IP, Node."
   (cons "ADDRESS:.status.loadBalancer.ingress[0]"
         (lambda (s)
           (cond
-           ((string-empty-p s) "")
+           ((kubed-ext-none-p s) "")
            ((string-match "ip:$[^] :]+$" s) (match-string 1 s))
            ((string-match "hostname:$[^] :]+$" s) (match-string 1 s))
            (t s))))
   (cons "PORTS:.spec.tls[0].hosts"
         (lambda (s)
-          (if (string-empty-p s) "80" "80, 443")))
+          (if (kubed-ext-none-p s) "80" "80, 443")))
   '("AGE:.metadata.creationTimestamp"))
  (list
   (list "Class" 20 t)
@@ -957,13 +1319,8 @@ Name, Ready(x/y), Status, Restarts, Age, IP, Node."
   '("RECLAIM:.spec.persistentVolumeReclaimPolicy")
   (cons "STATUS:.status.phase"
         (lambda (ph)
-          (propertize ph 'face
-                      (pcase ph
-                        ("Bound"     'success)
-                        ("Available" 'warning)
-                        ("Released"  'shadow)
-                        ("Failed"    'error)
-                        (_           'default)))))
+          (let ((face (cdr (assoc ph kubed-ext-status-faces))))
+            (if face (propertize ph 'face face) ph))))
   '("CLAIM-NS:.spec.claimRef.namespace")
   '("CLAIM-NAME:.spec.claimRef.name")
   '("STORAGECLASS:.spec.storageClassName"))
@@ -993,11 +1350,20 @@ Name, Ready(x/y), Status, Restarts, Age, IP, Node."
                         (vector
                          (aref vec 0)
                          (kubed-ext--format-ready-total
-                          (aref vec 1) (aref vec 4))
+                          (let ((v (aref vec 1)))
+                            (if (kubed-ext-none-p v) "0" v))
+                          (let ((v (aref vec 4)))
+                            (if (kubed-ext-none-p v) "0" v)))
                          (kubed-ext--format-deployment-count
-                          (aref vec 2) (aref vec 4))
+                          (let ((v (aref vec 2)))
+                            (if (kubed-ext-none-p v) "0" v))
+                          (let ((v (aref vec 4)))
+                            (if (kubed-ext-none-p v) "0" v)))
                          (kubed-ext--format-deployment-count
-                          (aref vec 3) (aref vec 4))
+                          (let ((v (aref vec 3)))
+                            (if (kubed-ext-none-p v) "0" v))
+                          (let ((v (aref vec 4)))
+                            (if (kubed-ext-none-p v) "0" v)))
                          (kubed-ext--format-age (aref vec 5))))
                 entry)))
         (when (funcall pred new-entry)
@@ -1024,7 +1390,6 @@ Name, Ready(x/y), Status, Restarts, Age, IP, Node."
 ;;; § 7.  New Built-in Resources
 ;;; ═══════════════════════════════════════════════════════════════
 
-;; FIX 6: Corrected corrupted regexp in node roles lambda
 (eval '(kubed-define-resource node
            ((status ".status.conditions[-1:].status" 10
                     nil
@@ -1048,7 +1413,7 @@ Name, Ready(x/y), Status, Restarts, Age, IP, Node."
                     (lambda (l r)
                       (< (string-to-number l) (string-to-number r)))
                     (lambda (s)
-                      (if (string-empty-p s) "0"
+                      (if (or (string-empty-p s) (string= s "")) "0"
                         (number-to-string
                          (1+ (seq-count (lambda (c) (= c ?,)) s)))))
                     :right-align t)
@@ -1151,7 +1516,8 @@ Name, Ready(x/y), Status, Restarts, Age, IP, Node."
            ((pod-selector ".spec.podSelector.matchLabels" 50 nil
                           (lambda (s)
                             (cond
-                             ((string-empty-p s) "(all pods)")
+                             ((or (string-empty-p s) (string= s ""))
+                              "(all pods)")
                              ((string-prefix-p "map[" s) (substring s 4 -1))
                              (t s))))
             (policy-types ".spec.policyTypes[*]" 18)
@@ -1324,7 +1690,8 @@ Name, Ready(x/y), Status, Restarts, Age, IP, Node."
 
 (defun kubed-ext--async-kubectl (args callback &optional errback)
   "Run kubectl with ARGS asynchronously.
-Call CALLBACK with output on success, ERRBACK with error on failure."
+Call CALLBACK with output string on success.
+Call ERRBACK with error string on failure."
   (let* ((output-buf (generate-new-buffer " *kubed-ext-async*"))
          (default-directory temporary-file-directory))
     (make-process
@@ -1348,7 +1715,8 @@ Call CALLBACK with output on success, ERRBACK with error on failure."
 
 (defun kubed-ext--async-kubectl-2 (args1 args2 callback &optional errback)
   "Run two kubectl commands concurrently.
-ARGS1 and ARGS2 are arg lists. CALLBACK is called with (out1 out2) on success.
+ARGS1 and ARGS2 are arg lists.
+CALLBACK is called with (list out1 out2) on success.
 ERRBACK is called with error message on failure."
   (let ((results (cons nil nil))
         (count 0)
@@ -1500,7 +1868,8 @@ ERRBACK is called with error message on failure."
                 (list "MEM"   8 (kubed-ext-top-numeric-sorter 4) :right-align t)
                 (list "MEM/A" 8 (kubed-ext-top-numeric-sorter 5) :right-align t)
                 (list "%MEM"  6 (kubed-ext-top-numeric-sorter 6) :right-align t))
-        tabulated-list-padding 2 tabulated-list-entries nil)
+        tabulated-list-padding 2
+        tabulated-list-entries nil)
   (tabulated-list-init-header))
 
 (define-derived-mode kubed-ext-top-pods-mode tabulated-list-mode
@@ -1517,7 +1886,8 @@ ERRBACK is called with error message on failure."
                 (list "MEM/L"   8 (kubed-ext-top-numeric-sorter 8)  :right-align t)
                 (list "%MEM/R"  7 (kubed-ext-top-numeric-sorter 9)  :right-align t)
                 (list "%MEM/L"  7 (kubed-ext-top-numeric-sorter 10) :right-align t))
-        tabulated-list-padding 2 tabulated-list-entries nil)
+        tabulated-list-padding 2
+        tabulated-list-entries nil)
   (tabulated-list-init-header))
 
 (keymap-set kubed-ext-top-nodes-mode-map "g" #'kubed-ext-top-refresh)
@@ -1526,7 +1896,7 @@ ERRBACK is called with error message on failure."
 (keymap-set kubed-ext-top-pods-mode-map  "q" #'quit-window)
 
 (defun kubed-ext-top-nodes (&optional context)
-  "Display k9s-style node resource usage in CONTEXT."
+  "Display node resource usage in CONTEXT."
   (interactive
    (list (if current-prefix-arg
              (kubed-read-context "Context" (kubed-local-context))
@@ -1540,7 +1910,7 @@ ERRBACK is called with error message on failure."
     (display-buffer buf)))
 
 (defun kubed-ext-top-pods (&optional context namespace)
-  "Display k9s-style pod resource usage in CONTEXT and NAMESPACE."
+  "Display pod resource usage in CONTEXT and NAMESPACE."
   (interactive
    (let* ((c (kubed-local-context))
           (c (if (equal current-prefix-arg '(16))
@@ -1561,10 +1931,6 @@ ERRBACK is called with error message on failure."
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 11.  Terminal Support (vterm, eat, eshell, ansi-term)
 ;;; ═══════════════════════════════════════════════════════════════
-
-(defcustom kubed-ext-pod-shell "/bin/sh"
-  "Shell to run when opening a terminal in a Kubernetes pod."
-  :type 'string :group 'kubed-ext)
 
 (defvar kubed-ext--tramp-optimized nil
   "Non-nil when TRAMP has already been optimized for kubed.")
@@ -1593,13 +1959,6 @@ ERRBACK is called with error message on failure."
                      (when context   (list "--context" context))
                      (list "--" shell))
              " "))
-
-;; FIX 8: Added missing defvar declarations for dynamic variables
-;; used in let-bindings from external packages.
-(defvar vterm-shell)
-(defvar vterm-buffer-name)
-(defvar eat-buffer-name)
-(defvar eshell-buffer-name)
 
 (defun kubed-ext-pods-vterm (click)
   "Open vterm in Kubernetes pod at CLICK position."
@@ -1725,7 +2084,8 @@ ERRBACK is called with error message on failure."
                                (kubed-display-resource-short-description
                                 "pods" pod kubed-list-context kubed-list-namespace))))
         (with-current-buffer (ansi-term "/bin/bash" buf-name)
-          (process-send-string (current-buffer) (concat cmd "\n"))))
+          (process-send-string (get-buffer-process (current-buffer))
+                               (concat cmd "\n"))))
     (user-error "No Kubernetes pod at point")))
 
 (defun kubed-ext-pods-shell-command (click)
@@ -1753,9 +2113,6 @@ ERRBACK is called with error message on failure."
 ;;; § 12.  Describe Resource
 ;;; ═══════════════════════════════════════════════════════════════
 
-;; FIX 1: Capture buffer-local variables BEFORE `with-current-buffer'
-;; since kubed-list-type, kubed-list-namespace, kubed-list-context are
-;; buffer-local and nil in the newly created describe buffer.
 (defun kubed-ext-list-describe-resource (click)
   "Describe Kubernetes resource at CLICK position using kubectl describe."
   (interactive (list last-nonmenu-event) kubed-list-mode)
@@ -1773,10 +2130,8 @@ ERRBACK is called with error message on failure."
             (erase-buffer)
             (apply #'call-process kubed-kubectl-program nil t nil
                    (append (list "describe" type name)
-                           (when namespace
-                             (list "-n" namespace))
-                           (when context
-                             (list "--context" context))))
+                           (when namespace (list "-n" namespace))
+                           (when context (list "--context" context))))
             (goto-char (point-min))
             (special-mode)))
         (display-buffer buf))
@@ -1794,7 +2149,9 @@ ERRBACK is called with error message on failure."
           (name (kubed-read-resource-name type "Describe" nil nil c ns)))
      (list type name c ns)))
   (let* ((ctx (or context (kubed-local-context)))
-         (ns (or namespace (when (kubed-namespaced-p type ctx) (kubed--namespace ctx))))
+         (ns (or namespace
+                 (when (kubed-namespaced-p type ctx)
+                   (kubed--namespace ctx))))
          (buf (get-buffer-create
                (format "*Kubed describe %s/%s@%s[%s]*"
                        type name (or ns "cluster") ctx))))
@@ -1810,6 +2167,87 @@ ERRBACK is called with error message on failure."
     (display-buffer buf)))
 
 ;;; ═══════════════════════════════════════════════════════════════
+;;; § 12a.  initContainer Logs
+;;; ═══════════════════════════════════════════════════════════════
+
+(defun kubed-ext-pod-init-containers (pod &optional context namespace)
+  "CONTEXT Return list of init container names in POD, or nil if none."
+  (condition-case nil
+      (let ((output (car (apply #'process-lines
+                                kubed-kubectl-program "get" "pod" pod
+                                "-o" "jsonpath={.spec.initContainers[*].name}"
+                                (append
+                                 (when namespace (list "--namespace" namespace))
+                                 (when context (list "--context" context)))))))
+        (when (and output
+                   (not (kubed-ext-none-p output)))
+          (split-string output " " t)))
+    (error nil)))
+
+(defun kubed-ext-logs-init-container (&optional context namespace)
+  "Show logs for an init container of a pod in CONTEXT/NAMESPACE."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg)))
+     (list c n)))
+  (let* ((ctx (or context (kubed-local-context)))
+         (ns (or namespace (kubed--namespace ctx)))
+         (pod (kubed-read-pod "Pod" nil nil ctx ns))
+         (init-containers (kubed-ext-pod-init-containers pod ctx ns)))
+    (unless init-containers
+      (user-error "Pod `%s' has no init containers" pod))
+    (let ((container (if (= (length init-containers) 1)
+                         (car init-containers)
+                       (completing-read "Init container: "
+                                        init-containers nil t))))
+      (kubed-logs "pods" pod ctx ns container nil nil nil nil nil nil))))
+
+(defun kubed-ext-pods-logs-init-container (click)
+  "Show init container logs for pod at CLICK position."
+  (interactive (list last-nonmenu-event) kubed-pods-mode)
+  (if-let ((pod (tabulated-list-get-id (mouse-set-point click))))
+      (let ((init-containers (kubed-ext-pod-init-containers
+                              pod kubed-list-context kubed-list-namespace)))
+        (unless init-containers
+          (user-error "Pod `%s' has no init containers" pod))
+        (let ((container (if (= (length init-containers) 1)
+                             (car init-containers)
+                           (completing-read "Init container: "
+                                            init-containers nil t))))
+          (kubed-logs "pods" pod kubed-list-context kubed-list-namespace
+                      container nil nil nil nil nil nil)))
+    (user-error "No Kubernetes pod at point")))
+
+;;; ═══════════════════════════════════════════════════════════════
+;;; § 12b.  Logs by Label Selector
+;;; ═══════════════════════════════════════════════════════════════
+
+(defun kubed-ext-logs-by-label (&optional context namespace)
+  "Show logs for pods matching a label selector in CONTEXT/NAMESPACE."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg)))
+     (list c n)))
+  (let* ((ctx (or context (kubed-local-context)))
+         (ns (or namespace (kubed--namespace ctx)))
+         (labels (kubed-ext-discover-labels "pods" ctx ns))
+         (label (completing-read "Label selector: " labels nil nil
+                                 nil 'kubed-ext-label-selector-history))
+         (tail (read-number "Tail lines: " 100))
+         (buf (generate-new-buffer
+               (format "*kubed-logs -l %s@%s[%s]*" label ns ctx))))
+    (with-current-buffer buf (run-hooks 'kubed-logs-setup-hook))
+    (start-process "*kubed-logs-by-label*" buf
+                   kubed-kubectl-program "logs" "-l" label
+                   "--tail" (number-to-string tail)
+                   "-n" ns "--context" ctx)
+    (display-buffer buf)))
+
+;;; ═══════════════════════════════════════════════════════════════
 ;;; § 13.  Rollout Management
 ;;; ═══════════════════════════════════════════════════════════════
 
@@ -1822,69 +2260,90 @@ ERRBACK is called with error message on failure."
   "Show rollout history for TYPE/NAME in CONTEXT/NAMESPACE."
   (interactive
    (let* ((c (kubed-local-context))
-          (c (if (equal current-prefix-arg '(16)) (kubed-read-context "Context" c) c))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
           (n (kubed--namespace c current-prefix-arg))
           (type (completing-read "Resource type: "
                                  '("deployment" "statefulset" "daemonset") nil t))
-          (name (kubed-read-resource-name (concat type "s") "Rollout history for" nil nil c n)))
+          (name (kubed-read-resource-name
+                 (concat type "s") "Rollout history for" nil nil c n)))
      (list type name c n)))
   (let* ((ctx (or context (kubed-local-context)))
          (ns (or namespace (kubed--namespace ctx)))
          (typename (format "%s/%s" type name))
-         (buf (get-buffer-create (format "*kubed rollout %s@%s[%s]*" typename (or ns "default") ctx))))
+         (buf (get-buffer-create
+               (format "*kubed rollout %s@%s[%s]*"
+                       typename (or ns "default") ctx))))
     (with-current-buffer buf
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (insert (propertize (format "Rollout History: %s\n" typename) 'face 'bold))
+        (insert (propertize (format "Rollout History: %s\n" typename)
+                            'face 'bold))
         (insert (format "Namespace: %s  Context: %s\n" (or ns "default") ctx))
         (insert (make-string 60 ?─) "\n\n")
         (apply #'call-process kubed-kubectl-program nil t nil
                "rollout" "history" typename
-               (append (when ns (list "-n" ns)) (when ctx (list "--context" ctx))))
+               (append (when ns (list "-n" ns))
+                       (when ctx (list "--context" ctx))))
         (insert "\n" (make-string 60 ?─) "\n")
-        (insert (propertize "\nKeys: r = view revision  u = undo  g = refresh  q = quit\n" 'face 'shadow))
+        (insert (propertize
+                 "\nKeys: r = view revision  u = undo  g = refresh  q = quit\n"
+                 'face 'shadow))
         (goto-char (point-min))
-        (setq-local kubed-ext-rollout-type type kubed-ext-rollout-name name
-                    kubed-ext-rollout-context ctx kubed-ext-rollout-namespace ns)
+        (setq-local kubed-ext-rollout-type type
+                    kubed-ext-rollout-name name
+                    kubed-ext-rollout-context ctx
+                    kubed-ext-rollout-namespace ns)
         (kubed-ext-rollout-history-mode)))
     (display-buffer buf)))
 
 (defun kubed-ext-rollout-show-revision ()
   "Show a specific revision from the rollout history buffer."
   (interactive nil kubed-ext-rollout-history-mode)
-  (let* ((typename (format "%s/%s" kubed-ext-rollout-type kubed-ext-rollout-name))
-         (ctx kubed-ext-rollout-context) (ns kubed-ext-rollout-namespace)
+  (let* ((typename (format "%s/%s" kubed-ext-rollout-type
+                           kubed-ext-rollout-name))
+         (ctx kubed-ext-rollout-context)
+         (ns kubed-ext-rollout-namespace)
          (rev (read-number "Revision: "))
-         (buf (get-buffer-create (format "*kubed rollout %s rev %d*" typename rev))))
+         (buf (get-buffer-create
+               (format "*kubed rollout %s rev %d*" typename rev))))
     (with-current-buffer buf
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (insert (propertize (format "Revision %d: %s\n" rev typename) 'face 'bold))
+        (insert (propertize (format "Revision %d: %s\n" rev typename)
+                            'face 'bold))
         (insert (make-string 60 ?─) "\n\n")
         (apply #'call-process kubed-kubectl-program nil t nil
                "rollout" "history" typename (format "--revision=%d" rev)
-               (append (when ns (list "-n" ns)) (when ctx (list "--context" ctx))))
-        (goto-char (point-min)) (special-mode)))
+               (append (when ns (list "-n" ns))
+                       (when ctx (list "--context" ctx))))
+        (goto-char (point-min))
+        (special-mode)))
     (display-buffer buf)))
-
 (defun kubed-ext-rollout-undo (type name &optional revision context namespace)
   "Undo rollout of TYPE/NAME to REVISION in CONTEXT/NAMESPACE."
   (interactive
    (let* ((c (kubed-local-context))
-          (c (if (equal current-prefix-arg '(16)) (kubed-read-context "Context" c) c))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
           (n (kubed--namespace c current-prefix-arg))
           (type (completing-read "Resource type: "
                                  '("deployment" "statefulset" "daemonset") nil t))
-          (name (kubed-read-resource-name (concat type "s") "Undo rollout for" nil nil c n))
-          (rev (when (y-or-n-p "Specify target revision? ") (read-number "To revision: "))))
+          (name (kubed-read-resource-name
+                 (concat type "s") "Undo rollout for" nil nil c n))
+          (rev (when (y-or-n-p "Specify target revision? ")
+                 (read-number "To revision: "))))
      (list type name rev c n)))
   (let* ((ctx (or context (kubed-local-context)))
          (ns (or namespace (kubed--namespace ctx)))
          (typename (format "%s/%s" type name)))
     (unless (zerop (apply #'call-process kubed-kubectl-program nil nil nil
                           "rollout" "undo" typename
-                          (append (when revision (list (format "--to-revision=%d" revision)))
-                                  (when ns (list "-n" ns)) (when ctx (list "--context" ctx)))))
+                          (append
+                           (when revision
+                             (list (format "--to-revision=%d" revision)))
+                           (when ns (list "-n" ns))
+                           (when ctx (list "--context" ctx)))))
       (user-error "Failed to undo rollout for %s" typename))
     (message "Rolled back %s%s." typename
              (if revision (format " to revision %d" revision) ""))))
@@ -1892,40 +2351,53 @@ ERRBACK is called with error message on failure."
 (defun kubed-ext-rollout-undo-from-history ()
   "Undo rollout from history buffer."
   (interactive nil kubed-ext-rollout-history-mode)
-  (let* ((typename (format "%s/%s" kubed-ext-rollout-type kubed-ext-rollout-name))
-         (rev (when (y-or-n-p "Specify revision? ") (read-number "To revision: "))))
+  (let* ((typename (format "%s/%s" kubed-ext-rollout-type
+                           kubed-ext-rollout-name))
+         (rev (when (y-or-n-p "Specify revision? ")
+                (read-number "To revision: "))))
     (when (y-or-n-p (format "Undo rollout for %s%s? "
-                            typename (if rev (format " to rev %d" rev) "")))
+                            typename
+                            (if rev (format " to rev %d" rev) "")))
       (kubed-ext-rollout-undo kubed-ext-rollout-type kubed-ext-rollout-name
-                              rev kubed-ext-rollout-context kubed-ext-rollout-namespace))))
+                              rev kubed-ext-rollout-context
+                              kubed-ext-rollout-namespace))))
 
 (defun kubed-ext-rollout-refresh ()
   "Refresh rollout history buffer."
   (interactive nil kubed-ext-rollout-history-mode)
   (kubed-ext-rollout-history kubed-ext-rollout-type kubed-ext-rollout-name
-                             kubed-ext-rollout-context kubed-ext-rollout-namespace))
+                             kubed-ext-rollout-context
+                             kubed-ext-rollout-namespace))
 
 (define-derived-mode kubed-ext-rollout-history-mode special-mode "Kubed Rollout"
-  "Mode for viewing Kubernetes rollout history." :interactive nil)
-(keymap-set kubed-ext-rollout-history-mode-map "r" #'kubed-ext-rollout-show-revision)
-(keymap-set kubed-ext-rollout-history-mode-map "u" #'kubed-ext-rollout-undo-from-history)
-(keymap-set kubed-ext-rollout-history-mode-map "g" #'kubed-ext-rollout-refresh)
+  "Mode for viewing Kubernetes rollout history."
+  :interactive nil)
+
+(keymap-set kubed-ext-rollout-history-mode-map "r"
+            #'kubed-ext-rollout-show-revision)
+(keymap-set kubed-ext-rollout-history-mode-map "u"
+            #'kubed-ext-rollout-undo-from-history)
+(keymap-set kubed-ext-rollout-history-mode-map "g"
+            #'kubed-ext-rollout-refresh)
 (keymap-set kubed-ext-rollout-history-mode-map "q" #'quit-window)
 
 (defun kubed-ext-deployments-rollout-history (click)
   "Show rollout history for deployment at CLICK position."
   (interactive (list last-nonmenu-event) kubed-deployments-mode)
   (if-let ((dep (tabulated-list-get-id (mouse-set-point click))))
-      (kubed-ext-rollout-history "deployment" dep kubed-list-context kubed-list-namespace)
+      (kubed-ext-rollout-history "deployment" dep
+                                 kubed-list-context kubed-list-namespace)
     (user-error "No Kubernetes deployment at point")))
 
 (defun kubed-ext-deployments-rollout-undo (click)
   "Undo rollout for deployment at CLICK position."
   (interactive (list last-nonmenu-event) kubed-deployments-mode)
   (if-let ((dep (tabulated-list-get-id (mouse-set-point click))))
-      (let ((rev (when (y-or-n-p "Specify target revision? ") (read-number "To revision: "))))
+      (let ((rev (when (y-or-n-p "Specify target revision? ")
+                   (read-number "To revision: "))))
         (when (y-or-n-p (format "Undo rollout for %s?" dep))
-          (kubed-ext-rollout-undo "deployment" dep rev kubed-list-context kubed-list-namespace)
+          (kubed-ext-rollout-undo "deployment" dep rev
+                                  kubed-list-context kubed-list-namespace)
           (kubed-list-update t)))
     (user-error "No Kubernetes deployment at point")))
 
@@ -1937,7 +2409,8 @@ ERRBACK is called with error message on failure."
   "Force rolling update of DEPLOYMENT in CONTEXT/NAMESPACE."
   (interactive
    (let* ((c (kubed-local-context))
-          (c (if (equal current-prefix-arg '(16)) (kubed-read-context "Context" c) c))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
           (n (kubed--namespace c current-prefix-arg)))
      (list (kubed-read-deployment "Jab (bounce) deployment" nil nil c n) c n)))
   (let* ((ctx (or context (kubed-local-context)))
@@ -1948,7 +2421,8 @@ ERRBACK is called with error message on failure."
                         ":{" q "labels" q ":{" q "date" q ":" q ts q "}}}}}")))
     (unless (zerop (apply #'call-process kubed-kubectl-program nil nil nil
                           "patch" "deployment" deployment "-p" patch
-                          (append (when ns (list "-n" ns)) (when ctx (list "--context" ctx)))))
+                          (append (when ns (list "-n" ns))
+                                  (when ctx (list "--context" ctx)))))
       (user-error "Failed to jab deployment %s" deployment))
     (message "Jabbed deployment %s (timestamp %s)." deployment ts)))
 
@@ -1956,7 +2430,8 @@ ERRBACK is called with error message on failure."
   "Jab deployment at CLICK position to force a rolling update."
   (interactive (list last-nonmenu-event) kubed-deployments-mode)
   (if-let ((dep (tabulated-list-get-id (mouse-set-point click))))
-      (progn (kubed-ext-jab-deployment dep kubed-list-context kubed-list-namespace)
+      (progn (kubed-ext-jab-deployment dep kubed-list-context
+                                       kubed-list-namespace)
              (kubed-list-update t))
     (user-error "No Kubernetes deployment at point")))
 
@@ -1968,25 +2443,35 @@ ERRBACK is called with error message on failure."
   "Last kubectl command tracked by kubed-ext.")
 
 (defun kubed-ext-list-copy-log-command (click)
-  "Copy `kubectl logs -f` command for resource at CLICK position."
+  "Copy `kubectl logs -f' command for resource at CLICK position."
   (interactive (list last-nonmenu-event) kubed-list-mode)
   (if-let ((name (tabulated-list-get-id (mouse-set-point click))))
       (let ((cmd (format "%s logs -f --tail=100 %s%s%s"
                          kubed-kubectl-program
-                         (if (string= kubed-list-type "pods") "" (concat kubed-list-type "/"))
+                         (if (string= kubed-list-type "pods")
+                             ""
+                           (concat kubed-list-type "/"))
                          name
-                         (concat (when kubed-list-namespace (format " -n %s" kubed-list-namespace))
-                                 (when kubed-list-context (format " --context %s" kubed-list-context))))))
-        (kill-new cmd) (message "Copied: %s" cmd))
+                         (concat
+                          (when kubed-list-namespace
+                            (format " -n %s" kubed-list-namespace))
+                          (when kubed-list-context
+                            (format " --context %s" kubed-list-context))))))
+        (kill-new cmd)
+        (message "Copied: %s" cmd))
     (user-error "No Kubernetes resource at point")))
 
 (defun kubed-ext-list-copy-kubectl-prefix ()
   "Copy the current kubectl command prefix."
   (interactive nil kubed-list-mode)
-  (let ((prefix (format "%s%s%s" kubed-kubectl-program
-                        (if kubed-list-namespace (format " -n %s" kubed-list-namespace) "")
-                        (if kubed-list-context (format " --context %s" kubed-list-context) ""))))
-    (kill-new prefix) (message "Copied: %s" prefix)))
+  (let ((prefix (format "%s%s%s"
+                        kubed-kubectl-program
+                        (if kubed-list-namespace
+                            (format " -n %s" kubed-list-namespace) "")
+                        (if kubed-list-context
+                            (format " --context %s" kubed-list-context) ""))))
+    (kill-new prefix)
+    (message "Copied: %s" prefix)))
 
 (defun kubed-ext-list-copy-last-command ()
   "Copy the last tracked kubectl command."
@@ -1996,7 +2481,6 @@ ERRBACK is called with error message on failure."
              (message "Copied: %s" kubed-ext--last-kubectl-command))
     (message "No kubectl command tracked yet.")))
 
-;; FIX 2: Capture buffer-local variables BEFORE `with-temp-buffer'
 (defun kubed-ext-list-copy-resource-as-yaml (click)
   "Copy YAML of resource at CLICK position."
   (interactive (list last-nonmenu-event) kubed-list-mode)
@@ -2007,10 +2491,12 @@ ERRBACK is called with error message on failure."
              (yaml (with-temp-buffer
                      (apply #'call-process kubed-kubectl-program nil t nil
                             "get" type name "-o" "yaml"
-                            (append (when namespace (list "-n" namespace))
-                                    (when context (list "--context" context))))
+                            (append
+                             (when namespace (list "-n" namespace))
+                             (when context (list "--context" context))))
                      (buffer-string))))
-        (kill-new yaml) (message "YAML for %s/%s copied (%d bytes)." type name (length yaml)))
+        (kill-new yaml)
+        (message "YAML for %s/%s copied (%d bytes)." type name (length yaml)))
     (user-error "No Kubernetes resource at point")))
 
 (transient-define-prefix kubed-ext-copy-popup ()
@@ -2026,13 +2512,15 @@ ERRBACK is called with error message on failure."
 ;;; § 16.  Label Selector
 ;;; ═══════════════════════════════════════════════════════════════
 
-(defvar-local kubed-ext-list-label-selector nil
-  "Active label selector for server-side kubectl filtering.")
-(defvar kubed-ext-label-selector-history nil "History list for label selectors.")
-(defvar kubed-ext--label-cache (make-hash-table :test 'equal) "Label cache.")
-(defvar kubed-ext--label-cache-time (make-hash-table :test 'equal) "Label cache timestamps.")
+(defvar kubed-ext-label-selector-history nil
+  "History list for label selectors.")
 
-;; FIX 5: Corrected corrupted regexp ($ → proper $$ $$ $ $)
+(defvar kubed-ext--label-cache (make-hash-table :test 'equal)
+  "Label cache.")
+
+(defvar kubed-ext--label-cache-time (make-hash-table :test 'equal)
+  "Label cache timestamps.")
+
 (defun kubed-ext--fetch-labels (type context namespace)
   "Discover label key=value pairs from resources of TYPE in CONTEXT/NAMESPACE."
   (condition-case nil
@@ -2040,14 +2528,16 @@ ERRBACK is called with error message on failure."
                       (apply #'call-process kubed-kubectl-program nil '(t nil) nil
                              "get" (or type "pods") "--no-headers"
                              "-o" "custom-columns=LABELS:.metadata.labels"
-                             (append (when namespace (list "-n" namespace))
-                                     (when context (list "--context" context))))
+                             (append
+                              (when namespace (list "-n" namespace))
+                              (when context (list "--context" context))))
                       (buffer-string))))
         (delete-dups
          (mapcan (lambda (line)
                    (let ((trimmed (string-trim line)))
                      (when (string-match "^map$$$.+$$$" trimmed)
-                       (mapcar (lambda (pair) (replace-regexp-in-string ":" "=" pair))
+                       (mapcar (lambda (pair)
+                                 (replace-regexp-in-string ":" "=" pair))
                                (split-string (match-string 1 trimmed) " ")))))
                  (split-string output "\n" t))))
     (error nil)))
@@ -2057,7 +2547,8 @@ ERRBACK is called with error message on failure."
   (let* ((key (list (or type "pods") (or context "") (or namespace "")))
          (cached (gethash key kubed-ext--label-cache))
          (cache-time (gethash key kubed-ext--label-cache-time 0)))
-    (if (and cached (< (- (float-time) cache-time) 60)) cached
+    (if (and cached (< (- (float-time) cache-time) 60))
+        cached
       (let ((labels (kubed-ext--fetch-labels type context namespace)))
         (puthash key labels kubed-ext--label-cache)
         (puthash key (float-time) kubed-ext--label-cache-time)
@@ -2069,21 +2560,25 @@ ERRBACK is called with error message on failure."
     (dolist (buf (buffer-list))
       (when (buffer-live-p buf)
         (with-current-buffer buf
-          (when (and (derived-mode-p 'kubed-list-mode) kubed-ext-list-label-selector
-                     (equal kubed-list-type type) (equal kubed-list-context context)
+          (when (and (derived-mode-p 'kubed-list-mode)
+                     kubed-ext-list-label-selector
+                     (equal kubed-list-type type)
+                     (equal kubed-list-context context)
                      (equal kubed-list-namespace namespace))
             (throw 'found kubed-ext-list-label-selector)))))))
 
 (defun kubed-ext-update-with-selector (orig-fn type context &optional namespace)
   "Advice for ORIG-FN: inject --selector for TYPE/CONTEXT/NAMESPACE."
   (let ((sel (kubed-ext--find-active-selector type context namespace)))
-    (if (null sel) (funcall orig-fn type context namespace)
+    (if (null sel)
+        (funcall orig-fn type context namespace)
       (cl-letf* ((real-mp (symbol-function 'make-process))
                  ((symbol-function 'make-process)
                   (lambda (&rest args)
                     (let ((cmd (plist-get args :command)))
                       (when (and cmd (member "get" cmd))
-                        (plist-put args :command (append cmd (list "--selector" sel)))))
+                        (plist-put args :command
+                                   (append cmd (list "--selector" sel)))))
                     (apply real-mp args))))
         (funcall orig-fn type context namespace)))))
 
@@ -2094,8 +2589,9 @@ ERRBACK is called with error message on failure."
   (interactive
    (list (completing-read
           (format-prompt "Label selector" "clear")
-          (append '("") (kubed-ext-discover-labels
-                         kubed-list-type kubed-list-context kubed-list-namespace)
+          (append '("")
+                  (kubed-ext-discover-labels
+                   kubed-list-type kubed-list-context kubed-list-namespace)
                   kubed-ext-label-selector-history)
           nil nil nil 'kubed-ext-label-selector-history))
    kubed-list-mode)
@@ -2105,17 +2601,26 @@ ERRBACK is called with error message on failure."
 
 (setq kubed-list-mode-line-format
       '(:eval
-        (if (process-live-p (alist-get 'process (kubed--alist kubed-list-type
-                                                              kubed-list-context
-                                                              kubed-list-namespace)))
+        (if (process-live-p
+             (alist-get 'process (kubed--alist kubed-list-type
+                                               kubed-list-context
+                                               kubed-list-namespace)))
             (propertize " [...]" 'help-echo "Updating...")
           (concat
            (when kubed-list-filter
-             (propertize (concat " [" (mapconcat #'prin1-to-string kubed-list-filter " ") "]")
-                         'help-echo "Current filter"))
+             (propertize
+              (concat " [" (mapconcat #'prin1-to-string
+                                      kubed-list-filter " ") "]")
+              'help-echo "Current filter"))
            (when kubed-ext-list-label-selector
-             (propertize (concat " {" kubed-ext-list-label-selector "}")
-                         'help-echo "Label selector" 'face 'warning))))))
+             (propertize
+              (concat " {" kubed-ext-list-label-selector "}")
+              'help-echo "Label selector" 'face 'warning))
+           (when (and (bound-and-true-p kubed-ext-resource-filter)
+                      (not (string-empty-p kubed-ext-resource-filter)))
+             (propertize
+              (concat " /" kubed-ext-resource-filter "/")
+              'help-echo "Substring filter" 'face 'italic))))))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 17.  Buffer Switching + Command Log
@@ -2127,9 +2632,11 @@ ERRBACK is called with error message on failure."
   (let (bufs)
     (dolist (buf (buffer-list))
       (when (with-current-buffer buf (derived-mode-p 'kubed-list-mode))
-        (push (cons (format "%-14s  %s" (buffer-local-value 'kubed-list-type buf)
+        (push (cons (format "%-14s  %s"
+                            (buffer-local-value 'kubed-list-type buf)
                             (buffer-name buf))
-                    buf) bufs)))
+                    buf)
+              bufs)))
     (if bufs
         (let* ((sel (completing-read "Switch to kubed buffer: " bufs nil t))
                (buf (alist-get sel bufs nil nil #'string=)))
@@ -2143,9 +2650,11 @@ ERRBACK is called with error message on failure."
     (with-current-buffer buf
       (let ((inhibit-read-only t))
         (goto-char (point-max))
-        (insert (format "[%s] %s\n" (format-time-string "%H:%M:%S") cmd-str))
+        (insert (format "[%s] %s\n"
+                        (format-time-string "%H:%M:%S") cmd-str))
         (when (> (line-number-at-pos) 500)
-          (goto-char (point-min)) (forward-line 100)
+          (goto-char (point-min))
+          (forward-line 100)
           (delete-region (point-min) (point)))))))
 
 (defun kubed-ext--make-process-logger (orig-fn &rest args)
@@ -2153,98 +2662,143 @@ ERRBACK is called with error message on failure."
 ORIG-FN is the advised function, ARGS its arguments."
   (when-let* ((cmd (plist-get args :command))
               ((stringp (car cmd)))
-              ((string-suffix-p "kubectl" (file-name-sans-extension
-                                           (file-name-nondirectory (car cmd))))))
+              ((string-suffix-p
+                "kubectl"
+                (file-name-sans-extension
+                 (file-name-nondirectory (car cmd))))))
     (kubed-ext--log-kubectl-command (mapconcat #'identity cmd " ")))
   (apply orig-fn args))
+
 (advice-add 'make-process :around #'kubed-ext--make-process-logger)
 
 (defun kubed-ext--call-process-logger (orig-fn program &rest args)
   "Log kubectl `call-process'.
-ORIG-FN is the advised function.  PROGRAM is the executable and ARGS are passed."
+ORIG-FN is the advised function.  PROGRAM and ARGS are passed through."
   (when (and (stringp program)
-             (string-suffix-p "kubectl" (file-name-sans-extension
-                                         (file-name-nondirectory program))))
+             (string-suffix-p
+              "kubectl"
+              (file-name-sans-extension
+               (file-name-nondirectory program))))
     (kubed-ext--log-kubectl-command
-     (mapconcat #'identity (cons program (seq-filter #'stringp (nthcdr 3 args))) " ")))
+     (mapconcat #'identity
+                (cons program (seq-filter #'stringp (nthcdr 3 args)))
+                " ")))
   (apply orig-fn program args))
+
 (advice-add 'call-process :around #'kubed-ext--call-process-logger)
 
-(defun kubed-ext--call-process-region-logger (orig-fn start end program &rest args)
+(defun kubed-ext--call-process-region-logger
+    (orig-fn start end program &rest args)
   "Log kubectl `call-process-region'.
-ORIG-FN is advised. START and END are region bounds. PROGRAM and ARGS passed."
+ORIG-FN is advised.  START END PROGRAM ARGS are passed through."
   (when (and (stringp program)
-             (string-suffix-p "kubectl" (file-name-sans-extension
-                                         (file-name-nondirectory program))))
+             (string-suffix-p
+              "kubectl"
+              (file-name-sans-extension
+               (file-name-nondirectory program))))
     (kubed-ext--log-kubectl-command
-     (mapconcat #'identity (cons program (seq-filter #'stringp (nthcdr 3 args))) " ")))
+     (mapconcat #'identity
+                (cons program (seq-filter #'stringp (nthcdr 3 args)))
+                " ")))
   (apply orig-fn start end program args))
-(advice-add 'call-process-region :around #'kubed-ext--call-process-region-logger)
+
+(advice-add 'call-process-region :around
+            #'kubed-ext--call-process-region-logger)
 
 (defun kubed-ext-show-command-log ()
   "Show the kubed command log buffer."
   (interactive)
   (let ((buf (get-buffer-create "*kubed-command-log*")))
-    (with-current-buffer buf (unless (derived-mode-p 'special-mode) (special-mode)))
+    (with-current-buffer buf
+      (unless (derived-mode-p 'special-mode) (special-mode)))
     (display-buffer buf)))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 18.  Keybindings
 ;;; ═══════════════════════════════════════════════════════════════
 
+;; Pod-specific keys
 (keymap-set kubed-pods-mode-map   "T" #'kubed-ext-top-pods)
 (keymap-set kubed-pods-mode-map   "M" #'kubed-ext-top-pods)
 (keymap-set kubed-pods-mode-map   "v" #'kubed-ext-pods-vterm)
 (keymap-set kubed-pods-mode-map   "t" #'kubed-ext-pods-eat)
+(keymap-set kubed-pods-mode-map   "i" #'kubed-ext-pods-logs-init-container)
 (keymap-set kubed-pod-prefix-map  "T" #'kubed-ext-top-pods)
 (keymap-set kubed-pod-prefix-map  "v" #'kubed-ext-vterm-pod)
 (keymap-set kubed-pod-prefix-map  "t" #'kubed-ext-eat-pod)
 (keymap-set kubed-pod-prefix-map  "S" #'kubed-ext-eshell-pod)
+(keymap-set kubed-pod-prefix-map  "i" #'kubed-ext-logs-init-container)
+
+;; Node-specific keys
 (keymap-set kubed-nodes-mode-map  "M" #'kubed-ext-top-nodes)
 (keymap-set kubed-node-prefix-map "T" #'kubed-ext-top-nodes)
+
+;; Service-specific keys
 (keymap-set kubed-services-mode-map  "F" #'kubed-ext-services-forward-port)
 (keymap-set kubed-service-prefix-map "F" #'kubed-ext-forward-port-to-service)
-(keymap-set kubed-deployments-mode-map  "F" #'kubed-ext-deployments-forward-port)
-(keymap-set kubed-deployments-mode-map  "r" #'kubed-ext-deployments-rollout-history)
+
+;; Deployment-specific keys
+(keymap-set kubed-deployments-mode-map  "F"
+            #'kubed-ext-deployments-forward-port)
+(keymap-set kubed-deployments-mode-map  "r"
+            #'kubed-ext-deployments-rollout-history)
 (keymap-set kubed-deployments-mode-map  "j" #'kubed-ext-deployments-jab)
-(keymap-set kubed-deployments-mode-map  "U" #'kubed-ext-deployments-rollout-undo)
-(keymap-set kubed-deployment-prefix-map "F" #'kubed-ext-forward-port-to-deployment)
+(keymap-set kubed-deployments-mode-map  "U"
+            #'kubed-ext-deployments-rollout-undo)
+(keymap-set kubed-deployment-prefix-map "F"
+            #'kubed-ext-forward-port-to-deployment)
 (keymap-set kubed-deployment-prefix-map "r" #'kubed-ext-rollout-history)
 (keymap-set kubed-deployment-prefix-map "j" #'kubed-ext-jab-deployment)
 (keymap-set kubed-deployment-prefix-map "U" #'kubed-ext-rollout-undo)
+
+;; Generic list-mode keys
 (keymap-set kubed-list-mode-map "d" #'kubed-ext-list-describe-resource)
 (keymap-set kubed-list-mode-map "S" #'kubed-ext-list-set-label-selector)
 (keymap-set kubed-list-mode-map "c" #'kubed-ext-copy-popup)
 (keymap-set kubed-list-mode-map "b" #'kubed-ext-switch-buffer)
+(keymap-set kubed-list-mode-map "f" #'kubed-ext-set-filter)
+(keymap-set kubed-list-mode-map "W" #'kubed-ext-list-wide)
+(keymap-set kubed-list-mode-map "m" #'kubed-ext-mark-item)
+(keymap-set kubed-list-mode-map "U" #'kubed-ext-unmark-all)
+(keymap-set kubed-list-mode-map "M-m" #'kubed-ext-mark-all)
+(keymap-set kubed-list-mode-map "M-u" #'kubed-ext-unmark-all)
+(keymap-set kubed-list-mode-map "M-n" #'kubed-ext-jump-to-next-highlight)
+(keymap-set kubed-list-mode-map "M-p" #'kubed-ext-jump-to-previous-highlight)
+(keymap-set kubed-list-mode-map "X" #'kubed-ext-delete-marked)
+
+;; Prefix map keys
 (keymap-set kubed-prefix-map "F" #'kubed-ext-list-port-forwards)
 (keymap-set kubed-prefix-map "b" #'kubed-ext-switch-buffer)
 (keymap-set kubed-prefix-map "#" #'kubed-ext-show-command-log)
 (keymap-set kubed-prefix-map "d" #'kubed-ext-describe-resource)
+(keymap-set kubed-prefix-map "L" #'kubed-ext-logs-by-label)
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 19.  Transient Navigation + Resource Actions
 ;;; ═══════════════════════════════════════════════════════════════
 
 (defvar kubed-ext-extra-transient-suffixes
-  '(("pods"        . [("T" "Top (metrics)"  kubed-ext-top-pods)
-                      ("v" "Vterm"          kubed-ext-pods-vterm)
-                      ("t" "Eat terminal"   kubed-ext-pods-eat)
-                      ("E" "Eshell"         kubed-ext-pods-eshell)
-                      ("A" "Ansi-term"      kubed-ext-pods-ansi-term)
-                      ("&" "Shell command"  kubed-ext-pods-shell-command)])
+  '(("pods"        . [("T" "Top (metrics)"     kubed-ext-top-pods)
+                      ("v" "Vterm"              kubed-ext-pods-vterm)
+                      ("t" "Eat terminal"       kubed-ext-pods-eat)
+                      ("E" "Eshell"             kubed-ext-pods-eshell)
+                      ("A" "Ansi-term"          kubed-ext-pods-ansi-term)
+                      ("&" "Shell command"      kubed-ext-pods-shell-command)
+                      ("i" "Init container log" kubed-ext-pods-logs-init-container)])
     ("nodes"       . [("T" "Top (metrics)"  kubed-ext-top-nodes)])
     ("services"    . [("F" "Forward Port"   kubed-ext-services-forward-port)])
-    ("deployments" . [("F" "Forward Port"      kubed-ext-deployments-forward-port)
-                      ("H" "Rollout History"   kubed-ext-deployments-rollout-history)
-                      ("j" "Jab (bounce)"      kubed-ext-deployments-jab)
-                      ("u" "Rollout Undo"      kubed-ext-deployments-rollout-undo)]))
+    ("deployments" . [("F" "Forward Port"       kubed-ext-deployments-forward-port)
+                      ("H" "Rollout History"    kubed-ext-deployments-rollout-history)
+                      ("j" "Jab (bounce)"       kubed-ext-deployments-jab)
+                      ("u" "Rollout Undo"       kubed-ext-deployments-rollout-undo)]))
   "Additional per-resource-type transient suffixes.")
 
 (defun kubed-ext-switch-context ()
   "Switch kubectl context and refresh current resource list."
   (interactive)
   (when (derived-mode-p 'kubed-list-mode)
-    (let ((type kubed-list-type) (ns kubed-list-namespace)
+    (let ((type kubed-list-type)
+          (ns kubed-list-namespace)
           (ctx (kubed-read-context "Switch to context")))
       (when type
         (let ((fn (intern (format "kubed-list-%s" type))))
@@ -2257,8 +2811,10 @@ ORIG-FN is advised. START and END are region bounds. PROGRAM and ARGS passed."
   "Switch namespace and refresh current resource list."
   (interactive)
   (when (derived-mode-p 'kubed-list-mode)
-    (let ((type kubed-list-type) (ctx kubed-list-context)
-          (ns (kubed-read-namespace "Switch to namespace" nil nil kubed-list-context)))
+    (let ((type kubed-list-type)
+          (ctx kubed-list-context)
+          (ns (kubed-read-namespace "Switch to namespace" nil nil
+                                    kubed-list-context)))
       (when type
         (let ((fn (intern (format "kubed-list-%s" type))))
           (when (fboundp fn)
@@ -2267,23 +2823,38 @@ ORIG-FN is advised. START and END are region bounds. PROGRAM and ARGS passed."
               (funcall fn ctx))))))))
 
 (defvar kubed-ext-common-resources
-  '(("pods" . "Pods") ("deployments" . "Deployments") ("services" . "Services")
-    ("configmaps" . "ConfigMaps") ("secrets" . "Secrets") ("ingresses" . "Ingresses")
-    ("jobs" . "Jobs") ("cronjobs" . "CronJobs") ("statefulsets" . "StatefulSets")
-    ("daemonsets" . "DaemonSets") ("replicasets" . "ReplicaSets")
-    ("persistentvolumeclaims" . "PVCs") ("persistentvolumes" . "PVs")
-    ("nodes" . "Nodes") ("namespaces" . "Namespaces") ("events" . "Events")
-    ("networkpolicies" . "NetworkPolicies") ("horizontalpodautoscalers" . "HPAs")
-    ("kafkas" . "Kafkas") ("kafkaconnects" . "KafkaConnects")
-    ("kafkaconnectors" . "KafkaConnectors") ("kafkatopics" . "KafkaTopics"))
+  '(("pods" . "Pods")
+    ("deployments" . "Deployments")
+    ("services" . "Services")
+    ("configmaps" . "ConfigMaps")
+    ("secrets" . "Secrets")
+    ("ingresses" . "Ingresses")
+    ("jobs" . "Jobs")
+    ("cronjobs" . "CronJobs")
+    ("statefulsets" . "StatefulSets")
+    ("daemonsets" . "DaemonSets")
+    ("replicasets" . "ReplicaSets")
+    ("persistentvolumeclaims" . "PVCs")
+    ("persistentvolumes" . "PVs")
+    ("nodes" . "Nodes")
+    ("namespaces" . "Namespaces")
+    ("events" . "Events")
+    ("networkpolicies" . "NetworkPolicies")
+    ("horizontalpodautoscalers" . "HPAs")
+    ("kafkas" . "Kafkas")
+    ("kafkaconnects" . "KafkaConnects")
+    ("kafkaconnectors" . "KafkaConnectors")
+    ("kafkatopics" . "KafkaTopics"))
   "Common resources for quick switching.")
 
 (defun kubed-ext-switch-resource ()
   "Switch to a different resource type in the same context/namespace."
   (interactive)
   (when (derived-mode-p 'kubed-list-mode)
-    (let* ((ctx kubed-list-context) (ns kubed-list-namespace)
-           (choices (mapcar (lambda (r) (cons (cdr r) (car r))) kubed-ext-common-resources))
+    (let* ((ctx kubed-list-context)
+           (ns kubed-list-namespace)
+           (choices (mapcar (lambda (r) (cons (cdr r) (car r)))
+                            kubed-ext-common-resources))
            (sel (completing-read "Switch to resource: " choices nil t))
            (type (alist-get sel choices nil nil #'string=)))
       (when type
@@ -2293,38 +2864,80 @@ ORIG-FN is advised. START and END are region bounds. PROGRAM and ARGS passed."
                 (funcall fn ctx (or ns (kubed--namespace ctx)))
               (funcall fn ctx))))))))
 
-(defun kubed-ext-jump-pods ()        "Jump to Pods."        (interactive) (kubed-list-pods kubed-list-context kubed-list-namespace))
-(defun kubed-ext-jump-deployments () "Jump to Deployments." (interactive) (kubed-list-deployments kubed-list-context kubed-list-namespace))
-(defun kubed-ext-jump-services ()    "Jump to Services."    (interactive) (kubed-list-services kubed-list-context kubed-list-namespace))
-(defun kubed-ext-jump-jobs ()        "Jump to Jobs."        (interactive) (kubed-list-jobs kubed-list-context kubed-list-namespace))
-(defun kubed-ext-jump-configmaps ()  "Jump to ConfigMaps."  (interactive) (kubed-list-configmaps kubed-list-context kubed-list-namespace))
-(defun kubed-ext-jump-secrets ()     "Jump to Secrets."     (interactive) (kubed-list-secrets kubed-list-context kubed-list-namespace))
-(defun kubed-ext-jump-ingresses ()   "Jump to Ingresses."   (interactive) (kubed-list-ingresses kubed-list-context kubed-list-namespace))
-(defun kubed-ext-jump-pvcs ()        "Jump to PVCs."        (interactive) (kubed-list-persistentvolumeclaims kubed-list-context kubed-list-namespace))
+(defun kubed-ext-jump-pods ()
+  "Jump to Pods."
+  (interactive)
+  (kubed-list-pods kubed-list-context kubed-list-namespace))
+
+(defun kubed-ext-jump-deployments ()
+  "Jump to Deployments."
+  (interactive)
+  (kubed-list-deployments kubed-list-context kubed-list-namespace))
+
+(defun kubed-ext-jump-services ()
+  "Jump to Services."
+  (interactive)
+  (kubed-list-services kubed-list-context kubed-list-namespace))
+
+(defun kubed-ext-jump-jobs ()
+  "Jump to Jobs."
+  (interactive)
+  (kubed-list-jobs kubed-list-context kubed-list-namespace))
+
+(defun kubed-ext-jump-configmaps ()
+  "Jump to ConfigMaps."
+  (interactive)
+  (kubed-list-configmaps kubed-list-context kubed-list-namespace))
+
+(defun kubed-ext-jump-secrets ()
+  "Jump to Secrets."
+  (interactive)
+  (kubed-list-secrets kubed-list-context kubed-list-namespace))
+
+(defun kubed-ext-jump-ingresses ()
+  "Jump to Ingresses."
+  (interactive)
+  (kubed-list-ingresses kubed-list-context kubed-list-namespace))
+
+(defun kubed-ext-jump-pvcs ()
+  "Jump to PVCs."
+  (interactive)
+  (kubed-list-persistentvolumeclaims kubed-list-context kubed-list-namespace))
 
 (defun kubed-ext--collect-action-groups ()
   "Build transient group vectors for the current resource type."
-  (let* ((type (or kubed-list-type "")) (type-label (capitalize type))
+  (let* ((type (or kubed-list-type ""))
+         (type-label (capitalize type))
          (upstream (bound-and-true-p kubed-list-transient-extra-suffixes))
-         (custom (alist-get type kubed-ext-extra-transient-suffixes nil nil #'string=))
+         (custom (alist-get type kubed-ext-extra-transient-suffixes
+                            nil nil #'string=))
          (all (append (when upstream upstream) (when custom (list custom))))
-         (result nil) (gidx 0))
+         (result nil)
+         (gidx 0))
     (dolist (gv all)
       (cl-incf gidx)
       (let* ((entries (if (vectorp gv) (append gv nil) gv))
-             (kw-args nil) (suffixes nil) (rest entries))
+             (kw-args nil)
+             (suffixes nil)
+             (rest entries))
         (while rest
           (cond
-           ((keywordp (car rest)) (push (pop rest) kw-args) (when rest (push (pop rest) kw-args)))
-           ((and (listp (car rest)) (>= (length (car rest)) 3)
-                 (stringp (nth 0 (car rest))) (stringp (nth 1 (car rest))))
+           ((keywordp (car rest))
+            (push (pop rest) kw-args)
+            (when rest (push (pop rest) kw-args)))
+           ((and (listp (car rest))
+                 (>= (length (car rest)) 3)
+                 (stringp (nth 0 (car rest)))
+                 (stringp (nth 1 (car rest))))
             (push (pop rest) suffixes))
            (t (pop rest))))
-        (setq kw-args (nreverse kw-args) suffixes (nreverse suffixes))
+        (setq kw-args (nreverse kw-args)
+              suffixes (nreverse suffixes))
         (when suffixes
           (push (apply #'vector
                        (format "%s Actions%s" type-label
-                               (if (> (length all) 1) (format " (%d)" gidx) ""))
+                               (if (> (length all) 1)
+                                   (format " (%d)" gidx) ""))
                        (append kw-args suffixes))
                 result))))
     (nreverse result)))
@@ -2334,7 +2947,8 @@ ORIG-FN is advised. START and END are region bounds. PROGRAM and ARGS passed."
 (defun kubed-ext-transient-menu ()
   "Show transient combining navigation, actions, and utilities."
   (interactive)
-  (require 'transient) (require 'kubed-transient nil t)
+  (require 'transient)
+  (require 'kubed-transient nil t)
   (let* ((in-list (derived-mode-p 'kubed-list-mode))
          (type (and in-list kubed-list-type))
          (agroups (and in-list (kubed-ext--collect-action-groups))))
@@ -2368,36 +2982,47 @@ ORIG-FN is advised. START and END are region bounds. PROGRAM and ARGS passed."
               ,@(cond
                  ((null agroups) nil)
                  ((= (length agroups) 1) agroups)
-                 ((<= (length agroups) 3) (list (apply #'vector agroups)))
+                 ((<= (length agroups) 3)
+                  (list (apply #'vector agroups)))
                  (t (let ((rows nil) (rest agroups))
                       (while rest
                         (let ((chunk (seq-take rest 3)))
                           (push (if (= (length chunk) 1) (car chunk)
-                                  (apply #'vector chunk)) rows)
+                                  (apply #'vector chunk))
+                                rows)
                           (setq rest (seq-drop rest 3))))
                       (nreverse rows))))
               ,@(when in-list
                   '([["General"
-                      ("g" "Refresh"         kubed-list-update :transient t)
-                      ("d" "Describe"        kubed-ext-list-describe-resource)
-                      ("/" "Filter"          kubed-list-set-filter)
-                      ("S" "Label Selector"  kubed-ext-list-set-label-selector)
-                      ("q" "Quit"            quit-window)]
+                      ("g" "Refresh"          kubed-list-update :transient t)
+                      ("d" "Describe"         kubed-ext-list-describe-resource)
+                      ("/" "Filter (S-expr)"  kubed-list-set-filter)
+                      ("f" "Filter (substr)"  kubed-ext-set-filter)
+                      ("S" "Label Selector"   kubed-ext-list-set-label-selector)
+                      ("W" "Wide view"        kubed-ext-list-wide)
+                      ("q" "Quit"             quit-window)]
                      ["Utilities"
-                      ("b" "Switch Buffer"   kubed-ext-switch-buffer)
-                      ("w" "Copy Name"       kubed-list-copy-as-kill)
-                      ("y" "Copy Menu"       kubed-ext-copy-popup)
-                      ("#" "Command Log"     kubed-ext-show-command-log)]])))
+                      ("b" "Switch Buffer"    kubed-ext-switch-buffer)
+                      ("w" "Copy Name"        kubed-list-copy-as-kill)
+                      ("y" "Copy Menu"        kubed-ext-copy-popup)
+                      ("#" "Command Log"      kubed-ext-show-command-log)
+                      ("m" "Mark item"        kubed-ext-mark-item)
+                      ("X" "Delete marked"    kubed-ext-delete-marked)]])))
            t)
           (funcall-interactively #'kubed-ext--dynamic-menu))
       (error
        (message "Dynamic transient error: %s" (error-message-string err))
-       (when (fboundp 'kubed-list-transient) (call-interactively #'kubed-list-transient))))))
+       (when (fboundp 'kubed-list-transient)
+         (call-interactively #'kubed-list-transient))))))
 
 (keymap-set kubed-list-mode-map "?" #'kubed-ext-transient-menu)
 (keymap-set kubed-list-mode-map "C" #'kubed-ext-switch-context)
 (keymap-set kubed-list-mode-map "N" #'kubed-ext-switch-namespace)
 (keymap-set kubed-list-mode-map "R" #'kubed-ext-switch-resource)
+
+;;; ═══════════════════════════════════════════════════════════════
+;;; § 20.  Setup
+;;; ═══════════════════════════════════════════════════════════════
 
 (defun kubed-ext-setup ()
   "Initialize kubed-ext functionality."
