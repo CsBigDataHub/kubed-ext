@@ -2,7 +2,6 @@
 
 ;; Author: Chetan Koneru
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (kubed "0.1.0") (futur "1.0") (transient "0.5.0"))
 ;; URL: https://github.com/CsBigDataHub/kubed-ext
 ;; Keywords: tools, kubernetes
 
@@ -683,6 +682,82 @@
           (vb (get-text-property 0 'kubed-sort-value (aref (cadr b) col-idx))))
       (< (or va 0) (or vb 0)))))
 
+;; ── Kubernetes Timestamp & Deployment Formatting ──
+
+(defun kubed-ext--parse-k8s-timestamp (s)
+  "Parse Kubernetes ISO 8601 timestamp S to an Emacs time value.
+Returns nil if S cannot be parsed."
+  (condition-case nil
+      (when (string-match
+             (concat "$[0-9]\\{4\\}$-$[0-9]\\{2\\}$-$[0-9]\\{2\\}$"
+                     "T$[0-9]\\{2\\}$:$[0-9]\\{2\\}$:$[0-9]\\{2\\}$Z?")
+             s)
+        (encode-time
+         (string-to-number (match-string 6 s))
+         (string-to-number (match-string 5 s))
+         (string-to-number (match-string 4 s))
+         (string-to-number (match-string 3 s))
+         (string-to-number (match-string 2 s))
+         (string-to-number (match-string 1 s))
+         0))
+    (error nil)))
+
+(defun kubed-ext--format-age (timestamp)
+  "Convert Kubernetes TIMESTAMP to human-readable age like kubel.
+Returns a propertized string with `kubed-sort-value' for sorting."
+  (if (or (null timestamp) (string-empty-p timestamp)
+          (string= timestamp ""))
+      (propertize "n/a" 'face 'shadow 'kubed-sort-value 0)
+    (let ((parsed (kubed-ext--parse-k8s-timestamp timestamp)))
+      (if (null parsed)
+          (propertize timestamp 'kubed-sort-value 0)
+        (let* ((seconds (float-time (time-subtract (current-time) parsed)))
+               (days (floor (/ seconds 86400)))
+               (years (/ days 365))
+               (remaining-days (mod days 365))
+               (hours (/ (mod (floor seconds) 86400) 3600))
+               (minutes (/ (mod (floor seconds) 3600) 60))
+               (str (cond
+                     ((>= years 1) (format "%dy%dd" years remaining-days))
+                     ((>= days 1) (format "%dd" days))
+                     ((>= hours 1) (format "%dh%dm" hours minutes))
+                     (t (format "%dm" minutes))))
+               (face (cond
+                      ((< seconds 3600) 'success)
+                      ((< days 7) nil)
+                      (t nil))))
+          (if face
+              (propertize str 'face face 'kubed-sort-value seconds)
+            (propertize str 'kubed-sort-value seconds)))))))
+
+(defun kubed-ext--format-ready-total (ready replicas)
+  "Format READY/REPLICAS as kubel-style ready/total with color coding.
+READY and REPLICAS are strings (possibly nil).
+Returns a propertized string with `kubed-sort-value' for sorting."
+  (let* ((r (string-to-number (or ready "0")))
+         (total (string-to-number (or replicas "0")))
+         (str (format "%d/%d" r total))
+         (face (cond
+                ((and (= r 0) (= total 0)) 'shadow)
+                ((= r total)                'success)
+                ((> r 0)                    'warning)
+                (t                          'error))))
+    (propertize str 'face face 'kubed-sort-value r)))
+
+(defun kubed-ext--format-deployment-count (count replicas)
+  "Format deployment COUNT relative to REPLICAS with color coding.
+COUNT and REPLICAS are strings (possibly nil).
+Returns a propertized string with `kubed-sort-value' for sorting."
+  (let* ((c (string-to-number (or count "0")))
+         (total (string-to-number (or replicas "0")))
+         (str (number-to-string c))
+         (face (cond
+                ((and (= c 0) (= total 0)) 'shadow)
+                ((>= c total)               'success)
+                ((> c 0)                    'warning)
+                (t                          'error))))
+    (propertize str 'face face 'kubed-sort-value c)))
+
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 6.  Enhance Upstream Resource Columns
 ;;; ═══════════════════════════════════════════════════════════════
@@ -692,10 +767,13 @@
  (list
   (cons "RESTARTS:.status.containerStatuses[*].restartCount"
         (lambda (s)
-          (if (string-empty-p s) "0"
-            (number-to-string
-             (apply #'+ (mapcar #'string-to-number
-                                (split-string s ",")))))))
+          (let* ((total (if (string-empty-p s) 0
+                          (apply #'+ (mapcar #'string-to-number
+                                             (split-string s ",")))))
+                 (str (number-to-string total)))
+            (if (> total 0)
+                (propertize str 'face (if (< total 5) 'warning 'error))
+              str))))
   '("IP:.status.podIP")
   '("NODE:.spec.nodeName"))
  (list
@@ -767,6 +845,72 @@
   (list "Claim-ns" 16 t)
   (list "Claim-name" 28 t)
   (list "Storageclass" 20 t)))
+
+;; ── Deployment: kubel-style Ready/Age display ──
+;;
+;; We fetch 5 columns (ready, replicas, updated, available, timestamp)
+;; but display 4 (Ready as "x/y", Up-to-date, Available, Age).
+;; An advice on `kubed-list-entries' performs the transformation so that
+;; filtering and sorting operate on the final display values.
+
+(kubed-ext-set-columns
+ "deployments"
+ ;; Fetch columns (5): raw values for transformation
+ (list
+  (cons "READY:.status.readyReplicas"
+        (lambda (s) (if (string= s "") "0" s)))
+  (cons "REPLICAS:.spec.replicas"
+        (lambda (s) (if (string= s "") "0" s)))
+  (cons "UPDATED:.status.updatedReplicas"
+        (lambda (s) (if (string= s "") "0" s)))
+  (cons "AVAILABLE:.status.availableReplicas"
+        (lambda (s) (if (string= s "") "0" s)))
+  '("AGE:.metadata.creationTimestamp"))
+ ;; Display columns (4): after transformation merges Ready+Replicas
+ (list
+  (list "Ready" 10 (kubed-ext-top-numeric-sorter 1))
+  (list "Up-to-date" 12 (kubed-ext-top-numeric-sorter 2) :right-align t)
+  (list "Available" 12 (kubed-ext-top-numeric-sorter 3) :right-align t)
+  (list "Age" 12 (kubed-ext-top-numeric-sorter 4))))
+
+(defun kubed-ext--transform-deployment-entries (orig-fn)
+  "Advice for `kubed-list-entries'- `ORIG-FN'.
+kubel-style deployment display.
+Combines Ready+Replicas into a single ready/total column, colors
+Up-to-date and Available, and converts timestamps to human-readable age.
+Filtering operates on the transformed values so column indices match."
+  (if (and (bound-and-true-p kubed-list-type)
+           (string= kubed-list-type "deployments"))
+      (let* ((raw-entries (alist-get 'resources
+                                     (kubed--alist kubed-list-type
+                                                   kubed-list-context
+                                                   kubed-list-namespace))))
+        (if (null raw-entries)
+            nil
+          (let ((pred (kubed-list-interpret-filter))
+                (result nil))
+            (dolist (entry raw-entries)
+              (let* ((vec (cadr entry))
+                     (new-entry
+                      (if (>= (length vec) 6)
+                          (list (car entry)
+                                (vector
+                                 (aref vec 0)
+                                 (kubed-ext--format-ready-total
+                                  (aref vec 1) (aref vec 2))
+                                 (kubed-ext--format-deployment-count
+                                  (aref vec 3) (aref vec 2))
+                                 (kubed-ext--format-deployment-count
+                                  (aref vec 4) (aref vec 2))
+                                 (kubed-ext--format-age (aref vec 5))))
+                        entry)))
+                (when (funcall pred new-entry)
+                  (push new-entry result))))
+            (nreverse result))))
+    (funcall orig-fn)))
+
+(advice-add 'kubed-list-entries :around
+            #'kubed-ext--transform-deployment-entries)
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 7.  New Built-in Resources
@@ -1230,7 +1374,6 @@ Call ERRBACK on first failure."
            (message "Node metrics failed: %s" err)))))))
 
 ;; ── Pod Top ──
-
 (defun kubed-ext--top-pods-fetch ()
   "Fetch pod metrics asynchronously and populate the table."
   (let ((ctx kubed-ext-top-context)
@@ -2055,8 +2198,7 @@ Call ERRBACK on first failure."
 (defun kubed-ext--make-process-logger (orig-fn &rest args)
   "Log kubectl `make-process' call.
 ORIG-FN is the advised function,
-ARGS its ARGS1.
-ARGS1 should be a plist of keyword-argument pairs as used by `make-process'."
+ARGS its arguments."
   (when-let* ((cmd (plist-get args :command))
               ((stringp (car cmd)))
               ((string-suffix-p "kubectl"
@@ -2072,8 +2214,7 @@ ARGS1 should be a plist of keyword-argument pairs as used by `make-process'."
 
 Logs if PROGRAM is a kubectl executable.
 ORIG-FN is the advised function.
-PROGRAM is the kubectl executable, and ARGS are passed to it.
-PROGRAM and ARGS should appear in this docstring for clarity."
+PROGRAM is the kubectl executable, and ARGS are passed to it."
   (when (and (stringp program)
              (string-suffix-p "kubectl"
                               (file-name-sans-extension
@@ -2086,11 +2227,12 @@ PROGRAM and ARGS should appear in this docstring for clarity."
 (advice-add 'call-process :around #'kubed-ext--call-process-logger)
 
 (defun kubed-ext--call-process-region-logger (orig-fn start end program &rest args)
-  "Logs if PROGRAM is a kubectl executable.
+  "Log kubectl `call-process-region'.
+
+Logs if PROGRAM is a kubectl executable.
 ORIG-FN is the advised function.
-START and END are region bounds,
-PROGRAM is the kubectl binary, and ARGS are passed to it.
-START, PROGRAM, and ARGS should appear in this docstring for clarity."
+START and END are region bounds.
+PROGRAM is the kubectl binary, and ARGS are passed to it."
   (when (and (stringp program)
              (string-suffix-p "kubectl"
                               (file-name-sans-extension
