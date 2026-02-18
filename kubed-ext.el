@@ -813,77 +813,135 @@ HEADERS is a list of strings, ROWS is a list of lists of strings."
                                data-lines))))
       (cons headers rows))))
 
+(defvar-local kubed-ext-wide--type      nil "Resource type shown in this wide view buffer.")
+(defvar-local kubed-ext-wide--context   nil "`kubectl' context used in this wide view buffer.")
+(defvar-local kubed-ext-wide--namespace nil "Namespace used in this wide view buffer.")
+
+(defun kubed-ext--colorize-wide-cell (header value)
+  "Return VALUE propertized with a face based on column HEADER name."
+  (let ((h (upcase (string-trim header))))
+    (cond
+     ((or (string= h "STATUS") (string= h "PHASE"))
+      (let ((face (cdr (assoc value kubed-ext-status-faces))))
+        (if face (propertize value 'face face) value)))
+     ((string= h "READY")
+      (if (string-match "\\([0-9]+\\)/\\([0-9]+\\)" value)
+          (let* ((r    (string-to-number (match-string 1 value)))
+                 (tot  (string-to-number (match-string 2 value)))
+                 (face (cond ((and (= r 0) (= tot 0)) 'shadow)
+                             ((= r tot)               'success)
+                             ((= r 0)                 'error)
+                             (t                       'warning))))
+            (propertize value 'face face))
+        value))
+     ((string= h "RESTARTS")
+      (let* ((n    (string-to-number value))
+             (face (cond ((= n 0) nil)
+                         ((< n 5) 'warning)
+                         (t       'error))))
+        (if face (propertize value 'face face) value)))
+     (t value))))
+
+(defun kubed-ext--wide-populate (type ctx ns)
+  "Fill the current buffer with a wide-format table for TYPE in CTX/NS."
+  (let* ((raw     (with-temp-buffer
+                    (apply #'call-process kubed-kubectl-program nil t nil
+                           `("get" ,type "-o" "wide"
+                             ,@(when ns  `("-n"        ,ns))
+                             ,@(when ctx `("--context" ,ctx))))
+                    (buffer-string)))
+         (parsed  (kubed-ext--parse-kubectl-table raw))
+         (headers (car parsed))
+         (rows    (cdr parsed)))
+    (unless headers
+      (user-error "`kubectl' returned no output for %s" type))
+    (setq kubed-ext-wide--type      type
+          kubed-ext-wide--context   ctx
+          kubed-ext-wide--namespace ns)
+    (setq tabulated-list-format
+          (apply #'vector
+                 (cl-loop for h in headers
+                          for i from 0
+                          collect (list h
+                                        (apply #'max
+                                               (length h) 4
+                                               (mapcar (lambda (row)
+                                                         (length (or (nth i row) "")))
+                                                       rows))
+                                        t))))
+    (setq tabulated-list-entries
+          (mapcar (lambda (row)
+                    (list (or (car row) "")
+                          (apply #'vector
+                                 (cl-loop for h in headers
+                                          for i from 0
+                                          collect (kubed-ext--colorize-wide-cell
+                                                   h (or (nth i row) ""))))))
+                  rows))
+    (setq tabulated-list-padding 2)
+    (tabulated-list-init-header)
+    (tabulated-list-print t)))
+
 (defun kubed-ext-list-wide ()
-  "Display current resource list in kubectl wide format as a tabulated list.
-Supports column resizing with `|' (`kubed-list-fit-column-width-to-content')."
+  "Display the current resource list in kubectl wide format with color coding."
   (interactive nil kubed-list-mode)
   (let* ((type kubed-list-type)
-         (ctx kubed-list-context)
-         (ns kubed-list-namespace)
-         (raw (with-temp-buffer
-                (apply #'call-process kubed-kubectl-program nil t nil
-                       "get" type "-o" "wide"
-                       (append (when ns (list "-n" ns))
-                               (when ctx (list "--context" ctx))))
-                (buffer-string)))
-         (parsed (kubed-ext--parse-kubectl-table raw))
-         (headers (car parsed))
-         (rows (cdr parsed))
-         (buf (get-buffer-create
-               (format "*Kubed wide %s@%s[%s]*"
-                       type (or ns "cluster") (or ctx "current")))))
+         (ctx  kubed-list-context)
+         (ns   kubed-list-namespace)
+         (buf  (get-buffer-create
+                (format "*Kubed wide %s/%s/%s*"
+                        type (or ns "cluster") (or ctx "current")))))
     (with-current-buffer buf
-      (let ((inhibit-read-only t))
-        (erase-buffer))
       (kubed-ext-wide-mode)
-      (setq tabulated-list-format
-            (apply #'vector
-                   (mapcar (lambda (h)
-                             (let ((width
-                                    (max (+ 2 (length h))
-                                         (apply #'max 4
-                                                (mapcar
-                                                 (lambda (row)
-                                                   (length
-                                                    (or (nth
-                                                         (cl-position
-                                                          h headers
-                                                          :test #'string=)
-                                                         row)
-                                                        "")))
-                                                 rows)))))
-                               (list h width t)))
-                           headers)))
-      (setq tabulated-list-entries
-            (mapcar (lambda (row)
-                      (let ((name (or (car row) "")))
-                        (list name
-                              (apply #'vector
-                                     (mapcar (lambda (c) (or c ""))
-                                             row)))))
-                    rows))
-      (setq tabulated-list-padding 2)
-      (tabulated-list-init-header)
-      (tabulated-list-print t))
+      (let ((inhibit-read-only t))
+        (kubed-ext--wide-populate type ctx ns)))
     (display-buffer buf)))
 
-(define-derived-mode kubed-ext-wide-mode tabulated-list-mode
-  "Kubed Wide"
-  "Major mode for displaying kubectl wide output as a table."
-  :interactive nil
-  (setq truncate-lines t))
+(defun kubed-ext-wide-describe-resource ()
+  "Describe the Kubernetes resource at point in the wide view buffer."
+  (interactive nil kubed-ext-wide-mode)
+  (if-let ((name (tabulated-list-get-id)))
+      (let ((buf (get-buffer-create
+                  (format "*Kubed describe %s/%s/%s/%s*"
+                          kubed-ext-wide--type name
+                          (or kubed-ext-wide--namespace "default")
+                          (or kubed-ext-wide--context   "current")))))
+        (with-current-buffer buf
+          (let ((inhibit-read-only t))
+            (erase-buffer)
+            (apply #'call-process kubed-kubectl-program nil t nil
+                   (append (list "describe" kubed-ext-wide--type name)
+                           (when kubed-ext-wide--namespace
+                             (list "-n" kubed-ext-wide--namespace))
+                           (when kubed-ext-wide--context
+                             (list "--context" kubed-ext-wide--context))))
+            (goto-char (point-min))
+            (special-mode)))
+        (display-buffer buf))
+    (user-error "No Kubernetes resource at point")))
 
-(keymap-set kubed-ext-wide-mode-map "g" #'kubed-ext-list-wide-refresh)
-(keymap-set kubed-ext-wide-mode-map "q" #'quit-window)
-(keymap-set kubed-ext-wide-mode-map "|"
-            #'kubed-list-fit-column-width-to-content)
+(define-derived-mode kubed-ext-wide-mode tabulated-list-mode "Kubed Wide"
+  "Major mode for displaying kubectl wide output with color coding.
+\\{kubed-ext-wide-mode-map}"
+  (setq truncate-lines t)
+  (keymap-set kubed-ext-wide-mode-map "g"   #'kubed-ext-list-wide-refresh)
+  (keymap-set kubed-ext-wide-mode-map "q"   #'quit-window)
+  (keymap-set kubed-ext-wide-mode-map "<"   #'kubed-list-fit-column-width-to-content)
+  (keymap-set kubed-ext-wide-mode-map "?"   #'kubed-ext-transient-menu)
+  (keymap-set kubed-ext-wide-mode-map "d"   #'kubed-ext-wide-describe-resource)
+  (keymap-set kubed-ext-wide-mode-map "RET" #'kubed-ext-wide-describe-resource))
 
 (defun kubed-ext-list-wide-refresh ()
-  "Refresh the wide view buffer by re-running the kubectl command."
+  "Refresh the wide view buffer by re-running kubectl."
   (interactive nil kubed-ext-wide-mode)
-  ;; Re-run wide from the parent list buffer context.
-  (message "Refreshing wide view...")
-  (kubed-ext-list-wide))
+  (unless kubed-ext-wide--type
+    (user-error "No resource context; open wide view from a resource list buffer"))
+  (message "Refreshing %s wide view..." kubed-ext-wide--type)
+  (let ((inhibit-read-only t))
+    (kubed-ext--wide-populate
+     kubed-ext-wide--type
+     kubed-ext-wide--context
+     kubed-ext-wide--namespace)))
 
 (defun kubed-ext-toggle-output-format ()
   "Toggle resource display format between YAML and JSON and revert."
