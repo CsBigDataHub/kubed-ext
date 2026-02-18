@@ -774,25 +774,115 @@ Empty string clears the filter."
 ;;; § 3d.  Wide View + Output Format Toggle
 ;;; ═══════════════════════════════════════════════════════════════
 
+(defun kubed-ext--parse-kubectl-table (text)
+  "Parse TEXT from kubectl output into (HEADERS . ROWS).
+HEADERS is a list of strings, ROWS is a list of lists of strings."
+  (let* ((lines (split-string text "\n" t))
+         (header-line (car lines))
+         (data-lines (cdr lines))
+         (starts nil)
+         (pos 0))
+    ;; Find column start positions from header.
+    (push 0 starts)
+    (while (string-match "\\S-+$\\s-+$\\S-" header-line pos)
+      (let ((gap-end (match-end 1)))
+        (push gap-end starts)
+        (setq pos gap-end)))
+    (setq starts (nreverse starts))
+    (let* ((parse-line
+            (lambda (line)
+              (let ((cols nil)
+                    (offsets starts))
+                (while offsets
+                  (let* ((beg (car offsets))
+                         (end (if (cdr offsets) (cadr offsets) (length line)))
+                         (end (min end (length line)))
+                         (str (if (>= beg (length line)) ""
+                                (string-trim
+                                 (substring line beg end)))))
+                    (push str cols))
+                  (setq offsets (cdr offsets)))
+                (nreverse cols))))
+           (headers (funcall parse-line header-line))
+           (rows (delq nil
+                       (mapcar (lambda (line)
+                                 (when (not (string-empty-p
+                                             (string-trim line)))
+                                   (funcall parse-line line)))
+                               data-lines))))
+      (cons headers rows))))
+
 (defun kubed-ext-list-wide ()
-  "Display current resource list in kubectl wide format in a new buffer."
+  "Display current resource list in kubectl wide format as a tabulated list.
+Supports column resizing with `|' (`kubed-list-fit-column-width-to-content')."
   (interactive nil kubed-list-mode)
   (let* ((type kubed-list-type)
          (ctx kubed-list-context)
          (ns kubed-list-namespace)
+         (raw (with-temp-buffer
+                (apply #'call-process kubed-kubectl-program nil t nil
+                       "get" type "-o" "wide"
+                       (append (when ns (list "-n" ns))
+                               (when ctx (list "--context" ctx))))
+                (buffer-string)))
+         (parsed (kubed-ext--parse-kubectl-table raw))
+         (headers (car parsed))
+         (rows (cdr parsed))
          (buf (get-buffer-create
                (format "*Kubed wide %s@%s[%s]*"
                        type (or ns "cluster") (or ctx "current")))))
     (with-current-buffer buf
       (let ((inhibit-read-only t))
-        (erase-buffer)
-        (apply #'call-process kubed-kubectl-program nil t nil
-               "get" type "-o" "wide"
-               (append (when ns (list "-n" ns))
-                       (when ctx (list "--context" ctx))))
-        (goto-char (point-min))
-        (special-mode)))
+        (erase-buffer))
+      (kubed-ext-wide-mode)
+      (setq tabulated-list-format
+            (apply #'vector
+                   (mapcar (lambda (h)
+                             (let ((width
+                                    (max (+ 2 (length h))
+                                         (apply #'max 4
+                                                (mapcar
+                                                 (lambda (row)
+                                                   (length
+                                                    (or (nth
+                                                         (cl-position
+                                                          h headers
+                                                          :test #'string=)
+                                                         row)
+                                                        "")))
+                                                 rows)))))
+                               (list h width t)))
+                           headers)))
+      (setq tabulated-list-entries
+            (mapcar (lambda (row)
+                      (let ((name (or (car row) "")))
+                        (list name
+                              (apply #'vector
+                                     (mapcar (lambda (c) (or c ""))
+                                             row)))))
+                    rows))
+      (setq tabulated-list-padding 2)
+      (tabulated-list-init-header)
+      (tabulated-list-print t))
     (display-buffer buf)))
+
+(define-derived-mode kubed-ext-wide-mode tabulated-list-mode
+  "Kubed Wide"
+  "Major mode for displaying kubectl wide output as a table."
+  :interactive nil
+  (setq truncate-lines t))
+
+(keymap-set kubed-ext-wide-mode-map "g" #'kubed-ext-list-wide-refresh)
+(keymap-set kubed-ext-wide-mode-map "q" #'quit-window)
+(keymap-set kubed-ext-wide-mode-map "|"
+            #'kubed-list-fit-column-width-to-content)
+
+(defun kubed-ext-list-wide-refresh ()
+  "Refresh the wide view buffer by re-running the kubectl command."
+  (interactive nil kubed-ext-wide-mode)
+  ;; Re-run wide from the parent list buffer context.
+  (message "Refreshing wide view...")
+  (kubed-ext-list-wide))
 
 (defun kubed-ext-toggle-output-format ()
   "Toggle resource display format between YAML and JSON and revert."
@@ -1133,7 +1223,7 @@ Returns nil if S cannot be parsed."
 (defun kubed-ext--compute-pod-status (phase waiting terminated deletion)
   "Compute kubel-style pod status from PHASE, WAITING, TERMINATED, DELETION.
 Returns a propertized string with face from `kubed-ext-status-faces'.
-Deletion is detected by positive timestamp match, not absence of ."
+Deletion is detected by positive timestamp match."
   (let* ((waiting-reason (unless (kubed-ext-none-p waiting)
                            (car (split-string waiting ","))))
          (terminated-reason (unless (kubed-ext-none-p terminated)
@@ -2657,10 +2747,13 @@ ERRBACK is called with error message on failure."
       (user-error "No kubed list buffers found"))))
 
 (defun kubed-ext--log-kubectl-command (cmd-str)
-  "Log CMD-STR to the kubectl command log buffer."
+  "Log CMD-STR to the kubectl command log buffer.
+Creates the buffer if it does not exist."
   (setq kubed-ext--last-kubectl-command cmd-str)
-  (when-let ((buf (get-buffer "*kubed-command-log*")))
+  (let ((buf (get-buffer-create "*kubed-command-log*")))
     (with-current-buffer buf
+      (unless (derived-mode-p 'special-mode)
+        (special-mode))
       (let ((inhibit-read-only t))
         (goto-char (point-max))
         (insert (format "[%s] %s\n"
