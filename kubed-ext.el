@@ -2152,23 +2152,42 @@ ORIG-FN is the advised function, ARGS its arguments."
 
 (defun kubed-ext--call-process-logger (orig-fn program &rest args)
   "Log kubectl `call-process'.
-ORIG-FN is the advised function.  PROGRAM is the executable and ARGS are passed."
+ORIG-FN is the advised function.  PROGRAM is the executable and ARGS are passed.
+
+Be careful: `call-process' allows nil values in ARGS (e.g., DESTINATION can be
+nil).  We must not pass nil to `mapconcat' or other string functions." 
   (when (and (stringp program)
              (string-suffix-p "kubectl" (file-name-sans-extension
                                          (file-name-nondirectory program))))
     (kubed-ext--log-kubectl-command
-     (mapconcat #'identity (cons program (seq-filter #'stringp (nthcdr 3 args))) " ")))
+     (mapconcat
+      #'identity
+      (cons program
+            (mapcar
+             (lambda (x) (format "%s" x))
+             ;; Skip INFILE/DESTINATION/DISPLAY; log the remaining arguments.
+             (nthcdr 3 args)))
+      " ")))
   (apply orig-fn program args))
 (advice-add 'call-process :around #'kubed-ext--call-process-logger)
 
 (defun kubed-ext--call-process-region-logger (orig-fn start end program &rest args)
   "Log kubectl `call-process-region'.
-ORIG-FN is advised. START and END are region bounds. PROGRAM and ARGS passed."
+ORIG-FN is advised. START and END are region bounds. PROGRAM and ARGS passed.
+
+Be careful: `call-process-region' allows nil values in ARGS (e.g., DESTINATION
+can be nil).  We must not pass nil to `mapconcat' or other string functions." 
   (when (and (stringp program)
              (string-suffix-p "kubectl" (file-name-sans-extension
                                          (file-name-nondirectory program))))
     (kubed-ext--log-kubectl-command
-     (mapconcat #'identity (cons program (seq-filter #'stringp (nthcdr 3 args))) " ")))
+     (mapconcat
+      #'identity
+      (cons program
+            (mapcar (lambda (x) (format "%s" x))
+                    ;; Skip INFILE/DESTINATION/DISPLAY; log the remaining args.
+                    (nthcdr 3 args)))
+      " ")))
   (apply orig-fn start end program args))
 (advice-add 'call-process-region :around #'kubed-ext--call-process-region-logger)
 
