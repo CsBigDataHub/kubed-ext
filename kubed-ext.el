@@ -940,6 +940,7 @@ number at point, or the numeric prefix argument if you provide one."
   (setq truncate-lines t)
   (keymap-set kubed-ext-wide-mode-map "g"   #'kubed-ext-list-wide-refresh)
   (keymap-set kubed-ext-wide-mode-map "q"   #'quit-window)
+  (keymap-set kubed-ext-wide-mode-map "b"   #'kubed-ext-switch-buffer)
   (keymap-set kubed-ext-wide-mode-map "<"   #'kubed-ext-wide-fit-column)
   (keymap-set kubed-ext-wide-mode-map "|"   #'kubed-ext-wide-fit-column)
   (keymap-set kubed-ext-wide-mode-map "}"   #'tabulated-list-widen-current-column)
@@ -2071,8 +2072,10 @@ ERRBACK is called with error message on failure."
 
 (keymap-set kubed-ext-top-nodes-mode-map "g" #'kubed-ext-top-refresh)
 (keymap-set kubed-ext-top-nodes-mode-map "q" #'quit-window)
+(keymap-set kubed-ext-top-nodes-mode-map "b" #'kubed-ext-switch-buffer)
 (keymap-set kubed-ext-top-pods-mode-map  "g" #'kubed-ext-top-refresh)
 (keymap-set kubed-ext-top-pods-mode-map  "q" #'quit-window)
+(keymap-set kubed-ext-top-pods-mode-map  "b" #'kubed-ext-switch-buffer)
 
 (defun kubed-ext-top-nodes (&optional context)
   "Display node resource usage in CONTEXT."
@@ -2806,21 +2809,49 @@ ERRBACK is called with error message on failure."
 ;;; ═══════════════════════════════════════════════════════════════
 
 (defun kubed-ext-switch-buffer ()
-  "Switch to another Kubed list buffer."
+  "Switch to another Kubed buffer.
+
+Includes list buffers, wide-view buffers, and top/metrics buffers."
   (interactive)
   (let (bufs)
     (dolist (buf (buffer-list))
-      (when (with-current-buffer buf (derived-mode-p 'kubed-list-mode))
-        (push (cons (format "%-14s  %s"
-                            (buffer-local-value 'kubed-list-type buf)
-                            (buffer-name buf))
-                    buf)
-              bufs)))
+      (when (with-current-buffer buf
+              (or (derived-mode-p 'kubed-list-mode)
+                  (derived-mode-p 'kubed-ext-wide-mode)
+                  (derived-mode-p 'kubed-ext-top-nodes-mode)
+                  (derived-mode-p 'kubed-ext-top-pods-mode)
+                  (derived-mode-p 'kubed-ext-port-forwards-mode)))
+        (push (cons (kubed-ext--buffer-switch-candidate buf) buf) bufs)))
+    (setq bufs (nreverse bufs))
     (if bufs
         (let* ((sel (completing-read "Switch to kubed buffer: " bufs nil t))
                (buf (alist-get sel bufs nil nil #'string=)))
           (switch-to-buffer buf))
-      (user-error "No kubed list buffers found"))))
+      (user-error "No kubed buffers found"))))
+
+(defun kubed-ext--buffer-switch-candidate (buf)
+  "Return a human-readable completion candidate string for BUF."
+  (with-current-buffer buf
+    (cond
+     ((derived-mode-p 'kubed-list-mode)
+      (format "%-14s  %s"
+              (or (bound-and-true-p kubed-list-type) "")
+              (buffer-name buf)))
+     ((derived-mode-p 'kubed-ext-wide-mode)
+      (format "%-14s  %s"
+              (format "wide:%s" (or kubed-ext-wide--type ""))
+              (buffer-name buf)))
+     ((derived-mode-p 'kubed-ext-top-nodes-mode)
+      (format "%-14s  %s"
+              (format "top:nodes@%s" (or kubed-ext-top-context ""))
+              (buffer-name buf)))
+     ((derived-mode-p 'kubed-ext-top-pods-mode)
+      (format "%-14s  %s"
+              (format "top:pods@%s" (or kubed-ext-top-namespace ""))
+              (buffer-name buf)))
+     ((derived-mode-p 'kubed-ext-port-forwards-mode)
+      (format "%-14s  %s" "portfwds" (buffer-name buf)))
+     (t (buffer-name buf)))))
 
 (defun kubed-ext--log-kubectl-command (cmd-str)
   "Log CMD-STR to the kubectl command log buffer.
