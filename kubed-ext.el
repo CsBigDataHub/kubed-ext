@@ -901,24 +901,38 @@ HEADERS is a list of strings, ROWS is a list of lists of strings."
   "Describe the Kubernetes resource at point in the wide view buffer."
   (interactive nil kubed-ext-wide-mode)
   (if-let ((name (tabulated-list-get-id)))
-      (let ((buf (get-buffer-create
-                  (format "*Kubed describe %s/%s/%s/%s*"
-                          kubed-ext-wide--type name
-                          (or kubed-ext-wide--namespace "default")
-                          (or kubed-ext-wide--context   "current")))))
-        (with-current-buffer buf
-          (let ((inhibit-read-only t))
-            (erase-buffer)
-            (apply #'call-process kubed-kubectl-program nil t nil
-                   (append (list "describe" kubed-ext-wide--type name)
-                           (when kubed-ext-wide--namespace
-                             (list "-n" kubed-ext-wide--namespace))
-                           (when kubed-ext-wide--context
-                             (list "--context" kubed-ext-wide--context))))
-            (goto-char (point-min))
-            (special-mode)))
-        (display-buffer buf))
+      (let* ((type kubed-ext-wide--type)
+             (ns   kubed-ext-wide--namespace)
+             (ctx  kubed-ext-wide--context))
+        (unless type
+          (user-error "No resource type context in this buffer"))
+        (let ((buf (get-buffer-create
+                    (format "*Kubed describe %s/%s/%s/%s*"
+                            type name
+                            (or ns "default")
+                            (or ctx "current")))))
+          (with-current-buffer buf
+            (let ((inhibit-read-only t))
+              (erase-buffer)
+              (apply #'call-process kubed-kubectl-program nil t nil
+                     (append (list "describe" type name)
+                             (when ns (list "-n" ns))
+                             (when ctx (list "--context" ctx))))
+              (goto-char (point-min))
+              (special-mode)))
+          (display-buffer buf)))
     (user-error "No Kubernetes resource at point")))
+
+(defun kubed-ext-wide-fit-column (n)
+  "Fit width of Nth table column to its content in wide view.
+If N is negative, fit all columns.  Interactively, N is the column
+number at point, or the numeric prefix argument if you provide one."
+  (interactive
+   (list (if current-prefix-arg
+             (prefix-numeric-value current-prefix-arg)
+           (kubed-list-column-number-at-point)))
+   kubed-ext-wide-mode)
+  (kubed-list-fit-column-width-to-content n))
 
 (define-derived-mode kubed-ext-wide-mode tabulated-list-mode "Kubed Wide"
   "Major mode for displaying kubectl wide output with color coding.
@@ -926,7 +940,10 @@ HEADERS is a list of strings, ROWS is a list of lists of strings."
   (setq truncate-lines t)
   (keymap-set kubed-ext-wide-mode-map "g"   #'kubed-ext-list-wide-refresh)
   (keymap-set kubed-ext-wide-mode-map "q"   #'quit-window)
-  (keymap-set kubed-ext-wide-mode-map "<"   #'kubed-list-fit-column-width-to-content)
+  (keymap-set kubed-ext-wide-mode-map "<"   #'kubed-ext-wide-fit-column)
+  (keymap-set kubed-ext-wide-mode-map "|"   #'kubed-ext-wide-fit-column)
+  (keymap-set kubed-ext-wide-mode-map "}"   #'tabulated-list-widen-current-column)
+  (keymap-set kubed-ext-wide-mode-map "{"   #'tabulated-list-narrow-current-column)
   (keymap-set kubed-ext-wide-mode-map "?"   #'kubed-ext-transient-menu)
   (keymap-set kubed-ext-wide-mode-map "d"   #'kubed-ext-wide-describe-resource)
   (keymap-set kubed-ext-wide-mode-map "RET" #'kubed-ext-wide-describe-resource))
@@ -2922,7 +2939,7 @@ ORIG-FN is advised.  START END PROGRAM ARGS are passed through."
 (keymap-set kubed-list-mode-map "c" #'kubed-ext-copy-popup)
 (keymap-set kubed-list-mode-map "b" #'kubed-ext-switch-buffer)
 (keymap-set kubed-list-mode-map "f" #'kubed-ext-set-filter)
-(keymap-set kubed-list-mode-map "W" #'kubed-ext-list-wide)
+(keymap-set kubed-list-mode-map "V" #'kubed-ext-list-wide)
 (keymap-set kubed-list-mode-map "m" #'kubed-ext-mark-item)
 (keymap-set kubed-list-mode-map "U" #'kubed-ext-unmark-all)
 (keymap-set kubed-list-mode-map "M-m" #'kubed-ext-mark-all)
@@ -3164,7 +3181,7 @@ ORIG-FN is advised.  START END PROGRAM ARGS are passed through."
                       ("/" "Filter (S-expr)"  kubed-list-set-filter)
                       ("f" "Filter (substr)"  kubed-ext-set-filter)
                       ("S" "Label Selector"   kubed-ext-list-set-label-selector)
-                      ("W" "Wide view"        kubed-ext-list-wide)
+                      ("V" "Wide view"        kubed-ext-list-wide)
                       ("q" "Quit"             quit-window)]
                      ["Utilities"
                       ("b" "Switch Buffer"    kubed-ext-switch-buffer)
