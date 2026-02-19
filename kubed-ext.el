@@ -873,7 +873,7 @@ Name column.  We treat rows with a non-empty Name column as primary."
            (not (string-empty-p (string-trim name)))))))
 
 (defun kubed-ext--wide-populate-kubectl-wide (type ctx ns)
-  "Populate current buffer using raw `kubectl get -o wide' for TYPE."
+  "Populate current buffer using raw `kubectl get -o wide' for TYPE, CTX, NS."
   (let* ((raw     (with-temp-buffer
                     (apply #'call-process kubed-kubectl-program nil t nil
                            `("get" ,type "-o" "wide"
@@ -960,7 +960,8 @@ CTX is the kubectl context, NS is the namespace."
             (buffer-string)))
          (obj (json-parse-string json-str :object-type 'alist :array-type 'list))
          (items (or (alist-get 'items obj) '()))
-         (entries nil))
+         (entries nil)
+         (seen-detail (make-hash-table :test 'equal)))
 
     ;; Columns: keep it stable and readable.
     (setq tabulated-list-padding 2)
@@ -1019,37 +1020,47 @@ CTX is the kubectl context, NS is the namespace."
                       (vector name ready-str updated-str avail-str age summary))
                 entries))
 
-        ;; Containers/images rows (more detailed), but keep them ABOVE selectors/labels.
-        (dolist (c (or containers '()))
-          (let* ((cname (or (alist-get 'name c) ""))
-                 (img (or (alist-get 'image c) ""))
-                 (img-face 'font-lock-constant-face))
-            (push (list name
-                        (vector "" "" "" "" ""
-                                (concat
-                                 (propertize "container: " 'face 'shadow)
-                                 (propertize cname 'face 'shadow)
-                                 (propertize "  image: " 'face 'shadow)
-                                 (propertize img 'face img-face))))
-                  entries)))
+        ;; Helpers to avoid duplicate continuation lines.
+        (cl-labels
+            ((push-detail
+              (detail)
+              (when (and (stringp detail) (not (string-empty-p (string-trim detail))))
+                (let ((k (cons name detail)))
+                  (unless (gethash k seen-detail)
+                    (puthash k t seen-detail)
+                    (push (list name
+                                (vector "" "" "" "" ""
+                                        (propertize detail 'face 'shadow)))
+                          entries))))))
 
-        ;; Selector rows (matchLabels)
-        (when (and match-labels (listp match-labels))
-          (dolist (pair match-labels)
-            (push (list name
-                        (vector "" "" "" "" ""
-                                (propertize (format "selector: %s=%s" (car pair) (cdr pair))
-                                            'face 'shadow)))
-                  entries)))
+          ;; Containers/images rows (more detailed), but keep them ABOVE selectors/labels.
+          (dolist (c (or containers '()))
+            (let* ((cname (or (alist-get 'name c) ""))
+                   (img (or (alist-get 'image c) ""))
+                   (img-face 'font-lock-constant-face)
+                   (detail (concat "container: " cname "  image: " img)))
+              ;; Here we *don't* use push-detail because we want the image face.
+              (let ((k (cons name detail)))
+                (unless (gethash k seen-detail)
+                  (puthash k t seen-detail)
+                  (push (list name
+                              (vector "" "" "" "" ""
+                                      (concat
+                                       (propertize "container: " 'face 'shadow)
+                                       (propertize cname 'face 'shadow)
+                                       (propertize "  image: " 'face 'shadow)
+                                       (propertize img 'face img-face))))
+                        entries)))))
 
-        ;; Deployment labels rows
-        (when (and labels (listp labels))
-          (dolist (pair labels)
-            (push (list name
-                        (vector "" "" "" "" ""
-                                (propertize (format "label: %s=%s" (car pair) (cdr pair))
-                                            'face 'shadow)))
-                  entries))))
+          ;; Selector rows (matchLabels)
+          (when (and match-labels (listp match-labels))
+            (dolist (pair match-labels)
+              (push-detail (format "selector: %s=%s" (car pair) (cdr pair)))))
+
+          ;; Deployment labels rows
+          (when (and labels (listp labels))
+            (dolist (pair labels)
+              (push-detail (format "label: %s=%s" (car pair) (cdr pair)))))))
 
       (setq tabulated-list-entries (nreverse entries))
       (tabulated-list-init-header)
