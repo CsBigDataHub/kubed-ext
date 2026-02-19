@@ -843,7 +843,15 @@ HEADERS is a list of strings, ROWS is a list of lists of strings."
      (t value))))
 
 (defun kubed-ext--wide-populate (type ctx ns)
-  "Fill the current buffer with a wide-format table for TYPE in CTX/NS."
+  "Fill the current buffer with a wide-format table for TYPE in CTX/NS.
+
+This runs `kubectl' synchronously, but it must not block the UI by
+waiting for a window to exist.  In particular, avoid calling
+`get-buffer-window' here (it can loop while redisplay is inhibited),
+which can appear as an Emacs freeze when opening wide view from certain
+list buffers.
+
+Column widths are computed relative to the currently selected window."
   (let* ((raw     (with-temp-buffer
                     (apply #'call-process kubed-kubectl-program nil t nil
                            `("get" ,type "-o" "wide"
@@ -878,7 +886,7 @@ HEADERS is a list of strings, ROWS is a list of lists of strings."
                                          (max (length h) 6)))))
            (available
             ;; Reserve a bit for padding and the tag column.
-            (max 20 (- (window-body-width (get-buffer-window (current-buffer) t)) 2)))
+            (max 20 (- (window-body-width (selected-window)) 2)))
            (padding tabulated-list-padding)
            (total (lambda (widths)
                     (+ (apply #'+ widths)
@@ -923,11 +931,12 @@ HEADERS is a list of strings, ROWS is a list of lists of strings."
          (buf  (get-buffer-create
                 (format "*Kubed wide %s/%s/%s*"
                         type (or ns "cluster") (or ctx "current")))))
-    (with-current-buffer buf
-      (kubed-ext-wide-mode)
-      (let ((inhibit-read-only t))
-        (kubed-ext--wide-populate type ctx ns)))
-    (display-buffer buf)))
+    ;; Display the buffer FIRST, before any mode setup or population
+    (pop-to-buffer buf)
+    ;; Now populate in the displayed buffer
+    (kubed-ext-wide-mode)
+    (let ((inhibit-read-only t))
+      (kubed-ext--wide-populate type ctx ns))))
 
 (defun kubed-ext-wide-describe-resource ()
   "Describe the Kubernetes resource at point in the wide view buffer."
