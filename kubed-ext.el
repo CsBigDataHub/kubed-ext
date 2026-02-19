@@ -845,13 +845,35 @@ HEADERS is a list of strings, ROWS is a list of lists of strings."
 (defun kubed-ext--wide-populate (type ctx ns)
   "Fill the current buffer with a wide-format table for TYPE in CTX/NS.
 
-This runs `kubectl' synchronously, but it must not block the UI by
-waiting for a window to exist.  In particular, avoid calling
-`get-buffer-window' here (it can loop while redisplay is inhibited),
-which can appear as an Emacs freeze when opening wide view from certain
-list buffers.
+For most types, this shells out to:
+  kubectl get TYPE -o wide
 
-Column widths are computed relative to the currently selected window."
+For deployments, we render a more intuitive multi-row view based on JSON:
+- One primary row per Deployment
+- Additional rows for each container/image
+- Additional rows for selector labels and deployment labels
+
+This runs `kubectl' synchronously."
+  (setq kubed-ext-wide--type      type
+        kubed-ext-wide--context   ctx
+        kubed-ext-wide--namespace ns)
+
+  (if (string= type "deployments")
+      (kubed-ext--wide-populate-deployments ctx ns)
+    (kubed-ext--wide-populate-kubectl-wide type ctx ns)))
+
+(defun kubed-ext--wide-row-primary-p ()
+  "Return non-nil if point is on a primary wide-view row.
+
+In the multi-row deployments wide view, continuation rows use an empty
+Name column.  We treat rows with a non-empty Name column as primary."
+  (when-let ((ent (tabulated-list-get-entry)))
+    (let ((name (aref ent 0)))
+      (and (stringp name)
+           (not (string-empty-p (string-trim name)))))))
+
+(defun kubed-ext--wide-populate-kubectl-wide (type ctx ns)
+  "Populate current buffer using raw `kubectl get -o wide' for TYPE."
   (let* ((raw     (with-temp-buffer
                     (apply #'call-process kubed-kubectl-program nil t nil
                            `("get" ,type "-o" "wide"
@@ -863,9 +885,6 @@ Column widths are computed relative to the currently selected window."
          (rows    (cdr parsed)))
     (unless headers
       (user-error "`kubectl' returned no output for %s" type))
-    (setq kubed-ext-wide--type      type
-          kubed-ext-wide--context   ctx
-          kubed-ext-wide--namespace ns)
 
     ;; Start with natural (content) column widths, then shrink to fit the
     ;; current window (so we never wrap).
@@ -887,21 +906,27 @@ Column widths are computed relative to the currently selected window."
            (available
             ;; Reserve a bit for padding and the tag column.
             (max 20 (- (window-body-width (selected-window)) 2)))
-           (padding tabulated-list-padding)
+           (padding 2)
            (total (lambda (widths)
                     (+ (apply #'+ widths)
                        (* padding (max 0 (1- (length widths)))))))
            (widths (copy-sequence content-widths)))
 
       ;; Greedily shrink widest columns until we fit.
+      ;; IMPORTANT: If we hit the minimum widths and still don't fit,
+      ;; break out to avoid an infinite loop (which manifests as an Emacs
+      ;; "hang" on wide view for contexts with very wide columns).
       (while (> (funcall total widths) available)
         (let* ((idx (cl-position (apply #'max widths) widths))
                (w (nth idx widths))
                (minw (nth idx min-widths)))
           (if (<= w minw)
-              ;; Can't shrink any further without breaking minimums.
-              (setq widths widths)
+              (setq widths nil)
             (setf (nth idx widths) (1- w)))))
+      (unless widths
+        ;; Fall back to minimum widths; the table may be wider than the
+        ;; window, but `truncate-lines' prevents wrapping.
+        (setq widths min-widths))
 
       (setq tabulated-list-format
             (apply #'vector
@@ -922,6 +947,114 @@ Column widths are computed relative to the currently selected window."
     (tabulated-list-init-header)
     (tabulated-list-print t)))
 
+(defun kubed-ext--wide-populate-deployments (ctx ns)
+  "Populate a multi-row, intuitive wide view for Deployments.
+
+CTX is the kubectl context, NS is the namespace."
+  (let* ((json-str
+          (with-temp-buffer
+            (apply #'call-process kubed-kubectl-program nil t nil
+                   (append (list "get" "deployments" "-o" "json")
+                           (when ns (list "-n" ns))
+                           (when ctx (list "--context" ctx))))
+            (buffer-string)))
+         (obj (json-parse-string json-str :object-type 'alist :array-type 'list))
+         (items (or (alist-get 'items obj) '()))
+         (entries nil))
+
+    ;; Columns: keep it stable and readable.
+    (setq tabulated-list-padding 2)
+    (setq tabulated-list-format
+          (vector
+           (list "Name" 34 t)
+           (list "Ready" 10 t)
+           (list "Up-to-date" 12 t)
+           (list "Available" 12 t)
+           (list "Age" 10 t)
+           (list "Detail" 70 t)))
+
+    (dolist (it items)
+      (let* ((meta (alist-get 'metadata it))
+             (spec (alist-get 'spec it))
+             (status (alist-get 'status it))
+             (name (or (alist-get 'name meta) ""))
+             (labels (alist-get 'labels meta))
+             (selector (alist-get 'selector spec))
+             (match-labels (alist-get 'matchLabels selector))
+             (replicas (number-to-string (or (alist-get 'replicas spec) 0)))
+             (ready (number-to-string (or (alist-get 'readyReplicas status) 0)))
+             (updated (number-to-string (or (alist-get 'updatedReplicas status) 0)))
+             (available (number-to-string (or (alist-get 'availableReplicas status) 0)))
+             (creation (or (alist-get 'creationTimestamp meta) ""))
+             (age (kubed-ext--format-age creation))
+             (ready-str (kubed-ext--format-ready-total ready replicas))
+             (updated-str (kubed-ext--format-deployment-count updated replicas))
+             (avail-str (kubed-ext--format-deployment-count available replicas))
+             (tmpl (alist-get 'template spec))
+             (podspec (and tmpl (alist-get 'spec tmpl)))
+             (containers (and podspec (alist-get 'containers podspec))))
+
+        ;; Primary row: include a compact container->image summary in Detail.
+        (let* ((pairs
+                (mapcar (lambda (c)
+                          (let ((cname (or (alist-get 'name c) ""))
+                                (img (or (alist-get 'image c) "")))
+                            (cons cname img)))
+                        (or containers '())))
+               (summary
+                (if (null pairs)
+                    ""
+                  (mapconcat
+                   (lambda (p)
+                     (let ((cname (car p))
+                           (img (cdr p))
+                           (img-face 'font-lock-constant-face))
+                       (concat
+                        (propertize cname 'face 'shadow)
+                        (propertize " → " 'face 'shadow)
+                        (propertize img 'face img-face))))
+                   pairs
+                   (propertize " | " 'face 'shadow)))))
+          (push (list name
+                      (vector name ready-str updated-str avail-str age summary))
+                entries))
+
+        ;; Containers/images rows (more detailed), but keep them ABOVE selectors/labels.
+        (dolist (c (or containers '()))
+          (let* ((cname (or (alist-get 'name c) ""))
+                 (img (or (alist-get 'image c) ""))
+                 (img-face 'font-lock-constant-face))
+            (push (list name
+                        (vector "" "" "" "" ""
+                                (concat
+                                 (propertize "container: " 'face 'shadow)
+                                 (propertize cname 'face 'shadow)
+                                 (propertize "  image: " 'face 'shadow)
+                                 (propertize img 'face img-face))))
+                  entries)))
+
+        ;; Selector rows (matchLabels)
+        (when (and match-labels (listp match-labels))
+          (dolist (pair match-labels)
+            (push (list name
+                        (vector "" "" "" "" ""
+                                (propertize (format "selector: %s=%s" (car pair) (cdr pair))
+                                            'face 'shadow)))
+                  entries)))
+
+        ;; Deployment labels rows
+        (when (and labels (listp labels))
+          (dolist (pair labels)
+            (push (list name
+                        (vector "" "" "" "" ""
+                                (propertize (format "label: %s=%s" (car pair) (cdr pair))
+                                            'face 'shadow)))
+                  entries))))
+
+      (setq tabulated-list-entries (nreverse entries))
+      (tabulated-list-init-header)
+      (tabulated-list-print t))))
+
 (defun kubed-ext-list-wide ()
   "Display the current resource list in kubectl wide format with color coding."
   (interactive nil kubed-list-mode)
@@ -941,6 +1074,8 @@ Column widths are computed relative to the currently selected window."
 (defun kubed-ext-wide-describe-resource ()
   "Describe the Kubernetes resource at point in the wide view buffer."
   (interactive nil kubed-ext-wide-mode)
+  (unless (kubed-ext--wide-row-primary-p)
+    (user-error "No primary resource row at point"))
   (if-let ((name (tabulated-list-get-id)))
       (let* ((type kubed-ext-wide--type)
              (ns   kubed-ext-wide--namespace)
