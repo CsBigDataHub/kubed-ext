@@ -858,17 +858,49 @@ HEADERS is a list of strings, ROWS is a list of lists of strings."
     (setq kubed-ext-wide--type      type
           kubed-ext-wide--context   ctx
           kubed-ext-wide--namespace ns)
-    (setq tabulated-list-format
-          (apply #'vector
-                 (cl-loop for h in headers
-                          for i from 0
-                          collect (list h
-                                        (apply #'max
-                                               (length h) 4
-                                               (mapcar (lambda (row)
-                                                         (length (or (nth i row) "")))
-                                                       rows))
-                                        t))))
+
+    ;; Start with natural (content) column widths, then shrink to fit the
+    ;; current window (so we never wrap).
+    (let* ((content-widths
+            (cl-loop for h in headers
+                     for i from 0
+                     collect (apply #'max
+                                    (length h)
+                                    4
+                                    (mapcar (lambda (row)
+                                              (length (or (nth i row) "")))
+                                            rows))))
+           ;; A conservative, always-tabular minimum.  Keeps columns readable.
+           (min-widths
+            (cl-loop for h in headers
+                     for i from 0
+                     collect (max 6 (min (nth i content-widths)
+                                         (max (length h) 6)))))
+           (available
+            ;; Reserve a bit for padding and the tag column.
+            (max 20 (- (window-body-width (get-buffer-window (current-buffer) t)) 2)))
+           (padding tabulated-list-padding)
+           (total (lambda (widths)
+                    (+ (apply #'+ widths)
+                       (* padding (max 0 (1- (length widths)))))))
+           (widths (copy-sequence content-widths)))
+
+      ;; Greedily shrink widest columns until we fit.
+      (while (> (funcall total widths) available)
+        (let* ((idx (cl-position (apply #'max widths) widths))
+               (w (nth idx widths))
+               (minw (nth idx min-widths)))
+          (if (<= w minw)
+              ;; Can't shrink any further without breaking minimums.
+              (setq widths widths)
+            (setf (nth idx widths) (1- w)))))
+
+      (setq tabulated-list-format
+            (apply #'vector
+                   (cl-loop for h in headers
+                            for w in widths
+                            collect (list h w t)))))
+
     (setq tabulated-list-entries
           (mapcar (lambda (row)
                     (list (or (car row) "")
@@ -937,7 +969,12 @@ number at point, or the numeric prefix argument if you provide one."
 (define-derived-mode kubed-ext-wide-mode tabulated-list-mode "Kubed Wide"
   "Major mode for displaying kubectl wide output with color coding.
 \\{kubed-ext-wide-mode-map}"
+  ;; We want a proper single-line tabular view.  Never wrap table lines.
   (setq truncate-lines t)
+  (setq-local word-wrap nil)
+  (setq-local truncate-string-ellipsis (propertize "…" 'face 'shadow))
+
+
   (keymap-set kubed-ext-wide-mode-map "g"   #'kubed-ext-list-wide-refresh)
   (keymap-set kubed-ext-wide-mode-map "q"   #'quit-window)
   (keymap-set kubed-ext-wide-mode-map "b"   #'kubed-ext-switch-buffer)
@@ -1234,27 +1271,29 @@ ORIG-FN is the original function, ARGS its arguments."
 ;; ── Kubernetes Timestamp ──
 
 (defun kubed-ext--parse-k8s-timestamp (s)
-  "Parse Kubernetes ISO 8601 timestamp S to an Emacs time value.
-Returns nil if S cannot be parsed."
+  "Parse Kubernetes RFC3339/ISO8601 timestamp S to an Emacs time value.
+
+Supports the common Kubernetes forms:
+- YYYY-MM-DDTHH:MM:SSZ
+- YYYY-MM-DDTHH:MM:SS.sssZ
+- YYYY-MM-DDTHH:MM:SS±HH:MM
+
+Return nil if S cannot be parsed."
   (when (and (stringp s)
              (string-match
-              (concat "$[0-9]\\{4\\}$"
-                      "-$[0-9]\\{2\\}$"
-                      "-$[0-9]\\{2\\}$"
-                      "T$[0-9]\\{2\\}$"
-                      ":$[0-9]\\{2\\}$"
-                      ":$[0-9]\\{2\\}$"
-                      "Z?")
+              (concat
+               "\\`"
+               "\\([0-9]\\{4\\}\\)-\\([0-9]\\{2\\}\\)-\\([0-9]\\{2\\}\\)"
+               "T"
+               "\\([0-9]\\{2\\}\\):\\([0-9]\\{2\\}\\):\\([0-9]\\{2\\}\\)"
+               "\\(?:\\.[0-9]+\\)?" ;; optional fractional seconds
+               "\\(Z\\|[+-][0-9]\\{2\\}:[0-9]\\{2\\}\\)"
+               "\\'"
+               )
               s))
     (condition-case nil
-        (encode-time
-         (string-to-number (match-string 6 s))
-         (string-to-number (match-string 5 s))
-         (string-to-number (match-string 4 s))
-         (string-to-number (match-string 3 s))
-         (string-to-number (match-string 2 s))
-         (string-to-number (match-string 1 s))
-         0)
+        ;; `parse-iso8601-time-string' handles Z and numeric offsets.
+        (parse-iso8601-time-string s)
       (error nil))))
 
 (defun kubed-ext--format-age (timestamp)
