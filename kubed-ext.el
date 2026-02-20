@@ -46,9 +46,9 @@
       (not (stringp s))
       (string-empty-p s)
       (string= s "<none>")
-      (string= s "<unknown>")
+      (string= s "")
       (string= s "nil")
-      (string-match-p "\\`[ \t]*\\'" s)))
+      (string-match-p "\\`[ \t]*\'" s)))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 0b.  Defcustoms: Status Faces, Output Format, Shell
@@ -333,7 +333,7 @@ Customize this to change colors for different Kubernetes statuses."
   (let ((res-spec (pcase type
                     ((or "pod" "pods") name)
                     ((or "service" "services") (concat "svc/" name))
-                    (_ (concat (replace-regexp-in-string "s\'" "" type)
+                    (_ (concat (replace-regexp-in-string "s'" "" type)
                                "/" name))))
         (desc (format "%s/%s %d:%d in %s[%s]"
                       type name local-port remote-port
@@ -730,7 +730,6 @@ Empty string clears the filter."
           (when (string-match-p kubed-ext-resource-filter text)
             (setq found t)))))
     (unless found
-      ;; Wrap around from top.
       (goto-char (point-min))
       (while (and (not found) (< (point) start))
         (when-let ((entry (tabulated-list-get-entry)))
@@ -758,7 +757,6 @@ Empty string clears the filter."
           (when (string-match-p kubed-ext-resource-filter text)
             (setq found t)))))
     (unless found
-      ;; Wrap around from bottom.
       (goto-char (point-max))
       (while (and (not found) (> (point) start))
         (forward-line -1)
@@ -783,7 +781,6 @@ HEADERS is a list of strings, ROWS is a list of lists of strings."
          (data-lines (cdr lines))
          (starts nil)
          (pos 0))
-    ;; Find column start positions from header.
     (push 0 starts)
     (while (string-match "\\S-+$\\s-+$\\S-" header-line pos)
       (let ((gap-end (match-end 1)))
@@ -816,6 +813,10 @@ HEADERS is a list of strings, ROWS is a list of lists of strings."
 (defvar-local kubed-ext-wide--type      nil "Resource type shown in this wide view buffer.")
 (defvar-local kubed-ext-wide--context   nil "`kubectl' context used in this wide view buffer.")
 (defvar-local kubed-ext-wide--namespace nil "Namespace used in this wide view buffer.")
+(defvar-local kubed-ext-wide--name nil "Resource name shown in this wide view buffer, or nil for all.")
+
+(dolist (sym '(kubed-ext-wide--type kubed-ext-wide--context kubed-ext-wide--namespace kubed-ext-wide--name))
+  (put sym 'permanent-local t))
 
 (defun kubed-ext--colorize-wide-cell (header value)
   "Return VALUE propertized with a face based on column HEADER name."
@@ -825,7 +826,7 @@ HEADERS is a list of strings, ROWS is a list of lists of strings."
       (let ((face (cdr (assoc value kubed-ext-status-faces))))
         (if face (propertize value 'face face) value)))
      ((string= h "READY")
-      (if (string-match "\\([0-9]+\\)/\\([0-9]+\\)" value)
+      (if (string-match "$[0-9]+$/$[0-9]+$" value)
           (let* ((r    (string-to-number (match-string 1 value)))
                  (tot  (string-to-number (match-string 2 value)))
                  (face (cond ((and (= r 0) (= tot 0)) 'shadow)
@@ -842,25 +843,7 @@ HEADERS is a list of strings, ROWS is a list of lists of strings."
         (if face (propertize value 'face face) value)))
      (t value))))
 
-(defun kubed-ext--wide-populate (type ctx ns)
-  "Fill the current buffer with a wide-format table for TYPE in CTX/NS.
-
-For most types, this shells out to:
-  kubectl get TYPE -o wide
-
-For deployments, we render a more intuitive multi-row view based on JSON:
-- One primary row per Deployment
-- Additional rows for each container/image
-- Additional rows for selector labels and deployment labels
-
-This runs `kubectl' synchronously."
-  (setq kubed-ext-wide--type      type
-        kubed-ext-wide--context   ctx
-        kubed-ext-wide--namespace ns)
-
-  (if (string= type "deployments")
-      (kubed-ext--wide-populate-deployments ctx ns)
-    (kubed-ext--wide-populate-kubectl-wide type ctx ns)))
+;; NOTE: Callees defined BEFORE the caller to satisfy the byte-compiler.
 
 (defun kubed-ext--wide-row-primary-p ()
   "Return non-nil if point is on a primary wide-view row.
@@ -872,22 +855,21 @@ Name column.  We treat rows with a non-empty Name column as primary."
       (and (stringp name)
            (not (string-empty-p (string-trim name)))))))
 
-(defun kubed-ext--wide-populate-kubectl-wide (type ctx ns)
-  "Populate current buffer using raw `kubectl get -o wide' for TYPE, CTX, NS."
+(defun kubed-ext--wide-populate-kubectl-wide (type ctx ns &optional name)
+  "Populate current buffer using raw `kubectl get -o wide' for TYPE, CTX, NS.
+Optional NAME limits output to a single named resource."
   (let* ((raw     (with-temp-buffer
                     (apply #'call-process kubed-kubectl-program nil t nil
-                           `("get" ,type "-o" "wide"
+                           `("get" ,type ,@(when name (list name))
+                             "-o" "wide"
                              ,@(when ns  `("-n"        ,ns))
                              ,@(when ctx `("--context" ,ctx))))
                     (buffer-string)))
-         (parsed  (kubed-ext--parse-kubectl-table raw))
+         (parsed (kubed-ext--parse-kubectl-table raw))
          (headers (car parsed))
-         (rows    (cdr parsed)))
+         (rows (cdr parsed)))
     (unless headers
       (user-error "`kubectl' returned no output for %s" type))
-
-    ;; Start with natural (content) column widths, then shrink to fit the
-    ;; current window (so we never wrap).
     (let* ((content-widths
             (cl-loop for h in headers
                      for i from 0
@@ -897,25 +879,18 @@ Name column.  We treat rows with a non-empty Name column as primary."
                                     (mapcar (lambda (row)
                                               (length (or (nth i row) "")))
                                             rows))))
-           ;; A conservative, always-tabular minimum.  Keeps columns readable.
            (min-widths
             (cl-loop for h in headers
                      for i from 0
                      collect (max 6 (min (nth i content-widths)
                                          (max (length h) 6)))))
            (available
-            ;; Reserve a bit for padding and the tag column.
             (max 20 (- (window-body-width (selected-window)) 2)))
            (padding 2)
            (total (lambda (widths)
                     (+ (apply #'+ widths)
                        (* padding (max 0 (1- (length widths)))))))
            (widths (copy-sequence content-widths)))
-
-      ;; Greedily shrink widest columns until we fit.
-      ;; IMPORTANT: If we hit the minimum widths and still don't fit,
-      ;; break out to avoid an infinite loop (which manifests as an Emacs
-      ;; "hang" on wide view for contexts with very wide columns).
       (while (> (funcall total widths) available)
         (let* ((idx (cl-position (apply #'max widths) widths))
                (w (nth idx widths))
@@ -924,16 +899,12 @@ Name column.  We treat rows with a non-empty Name column as primary."
               (setq widths nil)
             (setf (nth idx widths) (1- w)))))
       (unless widths
-        ;; Fall back to minimum widths; the table may be wider than the
-        ;; window, but `truncate-lines' prevents wrapping.
         (setq widths min-widths))
-
       (setq tabulated-list-format
             (apply #'vector
                    (cl-loop for h in headers
                             for w in widths
                             collect (list h w t)))))
-
     (setq tabulated-list-entries
           (mapcar (lambda (row)
                     (list (or (car row) "")
@@ -947,23 +918,28 @@ Name column.  We treat rows with a non-empty Name column as primary."
     (tabulated-list-init-header)
     (tabulated-list-print t)))
 
-(defun kubed-ext--wide-populate-deployments (ctx ns)
+(defun kubed-ext--wide-populate-deployments (ctx ns &optional name)
   "Populate a multi-row, intuitive wide view for Deployments.
 
-CTX is the kubectl context, NS is the namespace."
+CTX is the kubectl context, NS is the namespace.
+Optional NAME limits output to a single named deployment."
   (let* ((json-str
           (with-temp-buffer
             (apply #'call-process kubed-kubectl-program nil t nil
-                   (append (list "get" "deployments" "-o" "json")
+                   (append (list "get" "deployments")
+                           (when name (list name))
+                           (list "-o" "json")
                            (when ns (list "-n" ns))
                            (when ctx (list "--context" ctx))))
             (buffer-string)))
          (obj (json-parse-string json-str :object-type 'alist :array-type 'list))
-         (items (or (alist-get 'items obj) '()))
+         (items (if name
+                    (if (alist-get 'items obj)
+                        (alist-get 'items obj)
+                      (list obj))
+                  (or (alist-get 'items obj) '())))
          (entries nil)
          (seen-detail (make-hash-table :test 'equal)))
-
-    ;; Columns: keep it stable and readable.
     (setq tabulated-list-padding 2)
     (setq tabulated-list-format
           (vector
@@ -973,12 +949,11 @@ CTX is the kubectl context, NS is the namespace."
            (list "Available" 12 t)
            (list "Age" 10 t)
            (list "Detail" 70 t)))
-
     (dolist (it items)
       (let* ((meta (alist-get 'metadata it))
              (spec (alist-get 'spec it))
              (status (alist-get 'status it))
-             (name (or (alist-get 'name meta) ""))
+             (dep-name (or (alist-get 'name meta) ""))
              (labels (alist-get 'labels meta))
              (selector (alist-get 'selector spec))
              (match-labels (alist-get 'matchLabels selector))
@@ -994,8 +969,6 @@ CTX is the kubectl context, NS is the namespace."
              (tmpl (alist-get 'template spec))
              (podspec (and tmpl (alist-get 'spec tmpl)))
              (containers (and podspec (alist-get 'containers podspec))))
-
-        ;; Primary row: include a compact container->image summary in Detail.
         (let* ((pairs
                 (mapcar (lambda (c)
                           (let ((cname (or (alist-get 'name c) ""))
@@ -1016,34 +989,29 @@ CTX is the kubectl context, NS is the namespace."
                         (propertize img 'face img-face))))
                    pairs
                    (propertize " | " 'face 'shadow)))))
-          (push (list name
-                      (vector name ready-str updated-str avail-str age summary))
+          (push (list dep-name
+                      (vector dep-name ready-str updated-str avail-str age summary))
                 entries))
-
-        ;; Helpers to avoid duplicate continuation lines.
-        (cl-labels
+        (cl-flet
             ((push-detail
               (detail)
               (when (and (stringp detail) (not (string-empty-p (string-trim detail))))
-                (let ((k (cons name detail)))
+                (let ((k (cons dep-name detail)))
                   (unless (gethash k seen-detail)
                     (puthash k t seen-detail)
-                    (push (list name
+                    (push (list dep-name
                                 (vector "" "" "" "" ""
                                         (propertize detail 'face 'shadow)))
                           entries))))))
-
-          ;; Containers/images rows (more detailed), but keep them ABOVE selectors/labels.
           (dolist (c (or containers '()))
             (let* ((cname (or (alist-get 'name c) ""))
                    (img (or (alist-get 'image c) ""))
                    (img-face 'font-lock-constant-face)
                    (detail (concat "container: " cname "  image: " img)))
-              ;; Here we *don't* use push-detail because we want the image face.
-              (let ((k (cons name detail)))
+              (let ((k (cons dep-name detail)))
                 (unless (gethash k seen-detail)
                   (puthash k t seen-detail)
-                  (push (list name
+                  (push (list dep-name
                               (vector "" "" "" "" ""
                                       (concat
                                        (propertize "container: " 'face 'shadow)
@@ -1051,36 +1019,51 @@ CTX is the kubectl context, NS is the namespace."
                                        (propertize "  image: " 'face 'shadow)
                                        (propertize img 'face img-face))))
                         entries)))))
-
-          ;; Selector rows (matchLabels)
           (when (and match-labels (listp match-labels))
             (dolist (pair match-labels)
               (push-detail (format "selector: %s=%s" (car pair) (cdr pair)))))
-
-          ;; Deployment labels rows
           (when (and labels (listp labels))
             (dolist (pair labels)
-              (push-detail (format "label: %s=%s" (car pair) (cdr pair)))))))
+              (push-detail (format "label: %s=%s" (car pair) (cdr pair))))))))
+    (setq tabulated-list-entries (nreverse entries))
+    (tabulated-list-init-header)
+    (tabulated-list-print t)))
 
-      (setq tabulated-list-entries (nreverse entries))
-      (tabulated-list-init-header)
-      (tabulated-list-print t))))
+(defun kubed-ext--wide-populate (type ctx ns &optional name)
+  "Fill the current buffer with a wide-format table for TYPE in CTX/NS.
+
+Optional argument NAME limits output to a single named resource.
+
+For most types, this shells out to:
+  kubectl get TYPE -o wide
+
+For deployments, we render a more intuitive multi-row view based on JSON.
+
+This runs `kubectl' synchronously."
+  (setq kubed-ext-wide--type      type
+        kubed-ext-wide--context   ctx
+        kubed-ext-wide--namespace ns
+        kubed-ext-wide--name      name)
+  (if (string= type "deployments")
+      (kubed-ext--wide-populate-deployments ctx ns name)
+    (kubed-ext--wide-populate-kubectl-wide type ctx ns name)))
 
 (defun kubed-ext-list-wide ()
-  "Display the current resource list in kubectl wide format with color coding."
+  "Display the current resource list in kubectl wide format with color coding.
+When point is on a resource, show only that resource."
   (interactive nil kubed-list-mode)
   (let* ((type kubed-list-type)
          (ctx  kubed-list-context)
          (ns   kubed-list-namespace)
+         (name (tabulated-list-get-id))
          (buf  (get-buffer-create
-                (format "*Kubed wide %s/%s/%s*"
-                        type (or ns "cluster") (or ctx "current")))))
-    ;; Display the buffer FIRST, before any mode setup or population
+                (format "*Kubed wide %s/%s/%s%s*"
+                        type (or ns "cluster") (or ctx "current")
+                        (if name (concat "/" name) "")))))
     (pop-to-buffer buf)
-    ;; Now populate in the displayed buffer
     (kubed-ext-wide-mode)
     (let ((inhibit-read-only t))
-      (kubed-ext--wide-populate type ctx ns))))
+      (kubed-ext--wide-populate type ctx ns name))))
 
 (defun kubed-ext-wide-describe-resource ()
   "Describe the Kubernetes resource at point in the wide view buffer."
@@ -1124,12 +1107,9 @@ number at point, or the numeric prefix argument if you provide one."
 (define-derived-mode kubed-ext-wide-mode tabulated-list-mode "Kubed Wide"
   "Major mode for displaying kubectl wide output with color coding.
 \\{kubed-ext-wide-mode-map}"
-  ;; We want a proper single-line tabular view.  Never wrap table lines.
   (setq truncate-lines t)
   (setq-local word-wrap nil)
   (setq-local truncate-string-ellipsis (propertize "…" 'face 'shadow))
-
-
   (keymap-set kubed-ext-wide-mode-map "g"   #'kubed-ext-list-wide-refresh)
   (keymap-set kubed-ext-wide-mode-map "q"   #'quit-window)
   (keymap-set kubed-ext-wide-mode-map "b"   #'kubed-ext-switch-buffer)
@@ -1151,7 +1131,8 @@ number at point, or the numeric prefix argument if you provide one."
     (kubed-ext--wide-populate
      kubed-ext-wide--type
      kubed-ext-wide--context
-     kubed-ext-wide--namespace)))
+     kubed-ext-wide--namespace
+     kubed-ext-wide--name)))
 
 (defun kubed-ext-toggle-output-format ()
   "Toggle resource display format between YAML and JSON and revert."
@@ -1438,16 +1419,14 @@ Return nil if S cannot be parsed."
              (string-match
               (concat
                "\\`"
-               "\\([0-9]\\{4\\}\\)-\\([0-9]\\{2\\}\\)-\\([0-9]\\{2\\}\\)"
+               "$[0-9]\\{4\\}$-$[0-9]\\{2\\}$-$[0-9]\\{2\\}$"
                "T"
-               "\\([0-9]\\{2\\}\\):\\([0-9]\\{2\\}\\):\\([0-9]\\{2\\}\\)"
-               "\\(?:\\.[0-9]+\\)?" ;; optional fractional seconds
-               "\\(Z\\|[+-][0-9]\\{2\\}:[0-9]\\{2\\}\\)"
-               "\\'"
-               )
+               "$[0-9]\\{2\\}$:$[0-9]\\{2\\}$:$[0-9]\\{2\\}$"
+               "$?:\\.[0-9]+$?"
+               "$Z\\|[+-][0-9]\\{2\\}:[0-9]\\{2\\}$"
+               "\'")
               s))
     (condition-case nil
-        ;; `parse-iso8601-time-string' handles Z and numeric offsets.
         (parse-iso8601-time-string s)
       (error nil))))
 
@@ -1564,8 +1543,6 @@ Deletion is detected by positive timestamp match."
 ;;; § 6.  Enhance Upstream Resource Columns + Mode Hooks
 ;;; ═══════════════════════════════════════════════════════════════
 
-;; ── Pods: fetch extra fields, display kubel-style via hook ──
-
 (kubed-ext-set-columns
  "pods"
  (list
@@ -1582,7 +1559,7 @@ Deletion is detected by positive timestamp match."
  nil)
 
 (defun kubed-ext--count-csv-items (s)
-  "Count comma-separated items in S. Empty/none=0, single item=1."
+  "Count comma-separated items in S.  Empty/none=0, single item=1."
   (cond
    ((kubed-ext-none-p s)             0)
    ((string-empty-p (string-trim s)) 0)
@@ -1645,8 +1622,6 @@ Name, Ready(x/y), Status, Restarts, Age, IP, Node."
 
 (add-hook 'kubed-pods-mode-hook #'kubed-ext--pod-mode-setup)
 
-;; ── Services: append Selector column ──
-
 (kubed-ext-append-columns
  "services"
  (list
@@ -1657,8 +1632,6 @@ Name, Ready(x/y), Status, Restarts, Age, IP, Node."
            ((string-prefix-p "map[" s) (substring s 4 -1))
            (t s)))))
  (list (list "Selector" 40 t)))
-
-;; ── Ingresses: enhanced columns ──
 
 (kubed-ext-set-columns
  "ingresses"
@@ -1683,8 +1656,6 @@ Name, Ready(x/y), Status, Restarts, Age, IP, Node."
   (list "Ports" 10 t)
   (list "Age" 20 t)))
 
-;; ── Persistent Volumes: enhanced columns ──
-
 (kubed-ext-set-columns
  "persistentvolumes"
  (list
@@ -1706,8 +1677,6 @@ Name, Ready(x/y), Status, Restarts, Age, IP, Node."
   (list "Claim-ns" 16 t)
   (list "Claim-name" 28 t)
   (list "Storageclass" 20 t)))
-
-;; ── Deployments: kubel-style Ready/Age via hook ──
 
 (defun kubed-ext--deployment-entries ()
   "Custom entries for deployments with kubel-style Ready and Age."
@@ -2547,7 +2516,7 @@ ERRBACK is called with error message on failure."
 ;;; ═══════════════════════════════════════════════════════════════
 
 (defun kubed-ext-pod-init-containers (pod &optional context namespace)
-  "CONTEXT Return list of init container names in POD, or nil if none."
+  "Return list of init container names in POD in CONTEXT/NAMESPACE, or nil."
   (condition-case nil
       (let ((output (car (apply #'process-lines
                                 kubed-kubectl-program "get" "pod" pod
@@ -2696,6 +2665,7 @@ ERRBACK is called with error message on failure."
         (goto-char (point-min))
         (special-mode)))
     (display-buffer buf)))
+
 (defun kubed-ext-rollout-undo (type name &optional revision context namespace)
   "Undo rollout of TYPE/NAME to REVISION in CONTEXT/NAMESPACE."
   (interactive
@@ -3124,7 +3094,6 @@ ORIG-FN is advised.  START END PROGRAM ARGS are passed through."
 ;;; § 18.  Keybindings
 ;;; ═══════════════════════════════════════════════════════════════
 
-;; Pod-specific keys
 (keymap-set kubed-pods-mode-map   "T" #'kubed-ext-top-pods)
 (keymap-set kubed-pods-mode-map   "M" #'kubed-ext-top-pods)
 (keymap-set kubed-pods-mode-map   "v" #'kubed-ext-pods-vterm)
@@ -3136,15 +3105,12 @@ ORIG-FN is advised.  START END PROGRAM ARGS are passed through."
 (keymap-set kubed-pod-prefix-map  "S" #'kubed-ext-eshell-pod)
 (keymap-set kubed-pod-prefix-map  "i" #'kubed-ext-logs-init-container)
 
-;; Node-specific keys
 (keymap-set kubed-nodes-mode-map  "M" #'kubed-ext-top-nodes)
 (keymap-set kubed-node-prefix-map "T" #'kubed-ext-top-nodes)
 
-;; Service-specific keys
 (keymap-set kubed-services-mode-map  "F" #'kubed-ext-services-forward-port)
 (keymap-set kubed-service-prefix-map "F" #'kubed-ext-forward-port-to-service)
 
-;; Deployment-specific keys
 (keymap-set kubed-deployments-mode-map  "F"
             #'kubed-ext-deployments-forward-port)
 (keymap-set kubed-deployments-mode-map  "r"
@@ -3158,7 +3124,6 @@ ORIG-FN is advised.  START END PROGRAM ARGS are passed through."
 (keymap-set kubed-deployment-prefix-map "j" #'kubed-ext-jab-deployment)
 (keymap-set kubed-deployment-prefix-map "U" #'kubed-ext-rollout-undo)
 
-;; Generic list-mode keys
 (keymap-set kubed-list-mode-map "d" #'kubed-ext-list-describe-resource)
 (keymap-set kubed-list-mode-map "S" #'kubed-ext-list-set-label-selector)
 (keymap-set kubed-list-mode-map "c" #'kubed-ext-copy-popup)
@@ -3173,7 +3138,6 @@ ORIG-FN is advised.  START END PROGRAM ARGS are passed through."
 (keymap-set kubed-list-mode-map "M-p" #'kubed-ext-jump-to-previous-highlight)
 (keymap-set kubed-list-mode-map "X" #'kubed-ext-delete-marked)
 
-;; Prefix map keys
 (keymap-set kubed-prefix-map "F" #'kubed-ext-list-port-forwards)
 (keymap-set kubed-prefix-map "b" #'kubed-ext-switch-buffer)
 (keymap-set kubed-prefix-map "#" #'kubed-ext-show-command-log)
