@@ -1,7 +1,7 @@
 ;;; kubed-ext.el --- Extensions for Kubed with Async Metrics -*- lexical-binding: t; -*-
 
 ;; Author: Chetan Koneru
-;; Version: 0.2.0
+;; Version: 0.3.0
 ;; URL: https://github.com/CsBigDataHub/kubed-ext
 ;; Keywords: tools, kubernetes
 ;; Package-Requires: ((emacs "29.1") (kubed "0.5.1") (transient "0.4.0"))
@@ -116,6 +116,158 @@ Customize this to change colors for different Kubernetes statuses."
 (defvar vterm-buffer-name)
 (defvar eat-buffer-name)
 (defvar eshell-buffer-name)
+
+;;; ═══════════════════════════════════════════════════════════════
+;;; § 0d.  Namespace Prefetch Cache
+;;; ═══════════════════════════════════════════════════════════════
+
+(defvar kubed-ext--namespace-prefetch-contexts (make-hash-table :test 'equal)
+  "Contexts for which namespace prefetch has been triggered.")
+
+(defun kubed-ext-prefetch-namespaces (&optional context)
+  "Asynchronously prefetch namespace list for CONTEXT.
+Does nothing if namespaces are already cached or a fetch is in progress.
+This ensures `kubed-read-namespace' completions appear without delay."
+  (let ((ctx (or context (ignore-errors (kubed-local-context)))))
+    (when ctx
+      (condition-case nil
+          (when (and (not (alist-get 'resources
+                                     (kubed--alist "namespaces" ctx nil)))
+                     (not (process-live-p
+                           (alist-get 'process
+                                      (kubed--alist "namespaces" ctx nil)))))
+            (puthash ctx t kubed-ext--namespace-prefetch-contexts)
+            (kubed-update "namespaces" ctx nil))
+        (error nil)))))
+
+(defun kubed-ext--ensure-namespaces-ready (context)
+  "Ensure namespace list for CONTEXT is available, waiting if necessary.
+If a fetch is in progress, wait for it.  If no fetch has started and no
+cached data exists, start one and wait.  If data is already cached,
+return immediately."
+  (let ((ctx (or context (kubed-local-context))))
+    (when ctx
+      (unless (alist-get 'resources (kubed--alist "namespaces" ctx nil))
+        (let ((proc (alist-get 'process
+                               (kubed--alist "namespaces" ctx nil))))
+          ;; No live fetch in progress — start one.
+          (unless (and proc (process-live-p proc))
+            (condition-case nil
+                (kubed-update "namespaces" ctx nil)
+              (error nil))
+            (setq proc (alist-get 'process
+                                  (kubed--alist "namespaces" ctx nil))))
+          ;; Wait for the running fetch to finish.
+          (when (and proc (process-live-p proc))
+            (message "Loading namespaces for `%s'..." ctx)
+            (while (process-live-p proc)
+              (accept-process-output proc 1))))))))
+
+(defun kubed-ext--prefetch-namespaces-hook ()
+  "Prefetch namespaces when a kubed list buffer is created."
+  (when (bound-and-true-p kubed-list-context)
+    (kubed-ext-prefetch-namespaces kubed-list-context)))
+
+(add-hook 'kubed-list-mode-hook #'kubed-ext--prefetch-namespaces-hook)
+
+(defun kubed-ext--prefetch-after-use-context (&rest _)
+  "Prefetch namespaces after `kubed-use-context' changes the default context."
+  (when (and (consp kubed-default-context-and-namespace)
+             (car kubed-default-context-and-namespace))
+    ;; Clear prefetch flag so the new context gets a fresh fetch.
+    (remhash (car kubed-default-context-and-namespace)
+             kubed-ext--namespace-prefetch-contexts)
+    (kubed-ext-prefetch-namespaces
+     (car kubed-default-context-and-namespace))))
+
+(advice-add 'kubed-use-context :after #'kubed-ext--prefetch-after-use-context)
+
+;;; ═══════════════════════════════════════════════════════════════
+;;; § 0e.  Auto-Refresh Visible List Buffers
+;;; ═══════════════════════════════════════════════════════════════
+
+(defcustom kubed-ext-auto-refresh-interval '(15 . 30)
+  "Interval range in seconds for auto-refreshing visible kubed list buffers.
+
+A cons cell (MIN . MAX).  Each cycle picks a random delay between MIN
+and MAX seconds before the next refresh.  Set to nil to disable even
+when the mode is on."
+  :type '(choice (const :tag "Disabled" nil)
+                 (cons :tag "Interval range (seconds)"
+                       (natnum :tag "Minimum")
+                       (natnum :tag "Maximum")))
+  :group 'kubed-ext)
+
+(defvar kubed-ext--auto-refresh-timer nil
+  "Timer for auto-refreshing visible kubed list buffers.")
+
+(defun kubed-ext--auto-refresh-random-delay ()
+  "Return a random delay in seconds, or nil if auto-refresh is disabled."
+  (when (consp kubed-ext-auto-refresh-interval)
+    (let ((lo (car kubed-ext-auto-refresh-interval))
+          (hi (cdr kubed-ext-auto-refresh-interval)))
+      (+ lo (random (max 1 (1+ (- hi lo))))))))
+
+(defun kubed-ext--auto-refresh-tick ()
+  "Refresh visible kubed list buffers, then schedule the next tick."
+  ;; Skip if user is in the minibuffer (typing a filter, reading a
+  ;; namespace, etc.) to avoid disrupting interactive input.
+  (unless (active-minibuffer-window)
+    (let ((refreshed 0))
+      (dolist (win (window-list))
+        (let ((buf (window-buffer win)))
+          (when (buffer-live-p buf)
+            (with-current-buffer buf
+              (when (and (derived-mode-p 'kubed-list-mode)
+                         ;; Don't stack concurrent fetches.
+                         (not (process-live-p
+                               (alist-get
+                                'process
+                                (kubed--alist kubed-list-type
+                                              kubed-list-context
+                                              kubed-list-namespace)))))
+                (condition-case nil
+                    (progn (kubed-list-update t)
+                           (cl-incf refreshed))
+                  (error nil)))))))
+      (when (> refreshed 0)
+        (message "Kubed: auto-refreshed %d buffer%s."
+                 refreshed (if (= refreshed 1) "" "s")))))
+  ;; Always reschedule regardless of whether we refreshed.
+  (kubed-ext--auto-refresh-schedule))
+
+(defun kubed-ext--auto-refresh-schedule ()
+  "Schedule the next auto-refresh tick with a random delay."
+  (kubed-ext--auto-refresh-cancel-timer)
+  (when-let ((delay (kubed-ext--auto-refresh-random-delay)))
+    (setq kubed-ext--auto-refresh-timer
+          (run-with-timer delay nil #'kubed-ext--auto-refresh-tick))))
+
+(defun kubed-ext--auto-refresh-cancel-timer ()
+  "Cancel the pending auto-refresh timer if any."
+  (when (timerp kubed-ext--auto-refresh-timer)
+    (cancel-timer kubed-ext--auto-refresh-timer)
+    (setq kubed-ext--auto-refresh-timer nil)))
+
+;;;###autoload
+(define-minor-mode kubed-ext-auto-refresh-mode
+  "Periodically refresh visible kubed list buffers.
+
+Refresh interval is randomized between the bounds in
+`kubed-ext-auto-refresh-interval' (default 15-30 s).  Only buffers
+currently shown in a window are refreshed, and a refresh is skipped
+when an update is already in progress or the minibuffer is active."
+  :global t
+  :lighter " KRef"
+  :group 'kubed-ext
+  (if kubed-ext-auto-refresh-mode
+      (progn
+        (kubed-ext--auto-refresh-schedule)
+        (message "Kubed auto-refresh enabled (%d-%ds)."
+                 (car kubed-ext-auto-refresh-interval)
+                 (cdr kubed-ext-auto-refresh-interval)))
+    (kubed-ext--auto-refresh-cancel-timer)
+    (message "Kubed auto-refresh disabled.")))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 1.  CRD Auto-Column Discovery
@@ -333,7 +485,7 @@ Customize this to change colors for different Kubernetes statuses."
   (let ((res-spec (pcase type
                     ((or "pod" "pods") name)
                     ((or "service" "services") (concat "svc/" name))
-                    (_ (concat (replace-regexp-in-string "s'" "" type)
+                    (_ (concat (replace-regexp-in-string "s\'" "" type)
                                "/" name))))
         (desc (format "%s/%s %d:%d in %s[%s]"
                       type name local-port remote-port
@@ -3137,6 +3289,7 @@ ORIG-FN is advised.  START END PROGRAM ARGS are passed through."
 (keymap-set kubed-list-mode-map "M-n" #'kubed-ext-jump-to-next-highlight)
 (keymap-set kubed-list-mode-map "M-p" #'kubed-ext-jump-to-previous-highlight)
 (keymap-set kubed-list-mode-map "X" #'kubed-ext-delete-marked)
+(keymap-set kubed-list-mode-map "A" #'kubed-ext-auto-refresh-mode)
 
 (keymap-set kubed-prefix-map "F" #'kubed-ext-list-port-forwards)
 (keymap-set kubed-prefix-map "b" #'kubed-ext-switch-buffer)
@@ -3168,20 +3321,31 @@ ORIG-FN is advised.  START END PROGRAM ARGS are passed through."
   "Switch kubectl context and refresh current resource list."
   (interactive)
   (when (derived-mode-p 'kubed-list-mode)
-    (let ((type kubed-list-type)
-          (ns kubed-list-namespace)
-          (ctx (kubed-read-context "Switch to context")))
+    (let* ((type kubed-list-type)
+           (ns kubed-list-namespace)
+           (ctx (kubed-read-context "Switch to context")))
+      ;; Immediately start prefetching namespaces for the new context.
+      (kubed-ext-prefetch-namespaces ctx)
       (when type
         (let ((fn (intern (format "kubed-list-%s" type))))
           (when (fboundp fn)
-            (if (kubed-namespaced-p type ctx)
-                (funcall fn ctx (or ns (kubed--namespace ctx)))
-              (funcall fn ctx))))))))
+            (cond
+             ;; Non-namespaced resource type.
+             ((not (kubed-namespaced-p type ctx))
+              (funcall fn ctx))
+             ;; Reuse current namespace.
+             (ns (funcall fn ctx ns))
+             ;; Must determine namespace — ensure list is ready first.
+             (t
+              (kubed-ext--ensure-namespaces-ready ctx)
+              (funcall fn ctx (kubed--namespace ctx))))))))))
 
 (defun kubed-ext-switch-namespace ()
   "Switch namespace and refresh current resource list."
   (interactive)
   (when (derived-mode-p 'kubed-list-mode)
+    ;; Ensure namespace completions are available before prompting.
+    (kubed-ext--ensure-namespaces-ready kubed-list-context)
     (let ((type kubed-list-type)
           (ctx kubed-list-context)
           (ns (kubed-read-namespace "Switch to namespace" nil nil
@@ -3371,6 +3535,7 @@ ORIG-FN is advised.  START END PROGRAM ARGS are passed through."
                       ("f" "Filter (substr)"  kubed-ext-set-filter)
                       ("S" "Label Selector"   kubed-ext-list-set-label-selector)
                       ("V" "Wide view"        kubed-ext-list-wide)
+                      ("A" "Auto-refresh"     kubed-ext-auto-refresh-mode)
                       ("q" "Quit"             quit-window)]
                      ["Utilities"
                       ("b" "Switch Buffer"    kubed-ext-switch-buffer)
