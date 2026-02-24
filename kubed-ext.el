@@ -171,7 +171,7 @@ return immediately."
 (add-hook 'kubed-list-mode-hook #'kubed-ext--prefetch-namespaces-hook)
 
 (defun kubed-ext--prefetch-after-use-context (&rest _)
-  "Prefetch namespaces after `kubed-use-context' changes the default context."
+  "Prefetch namespaces after `kubed-use-context' change the default context."
   (when (and (consp kubed-default-context-and-namespace)
              (car kubed-default-context-and-namespace))
     ;; Clear prefetch flag so the new context gets a fresh fetch.
@@ -194,8 +194,8 @@ and MAX seconds before the next refresh.  Set to nil to disable even
 when the mode is on."
   :type '(choice (const :tag "Disabled" nil)
                  (cons :tag "Interval range (seconds)"
-                       (natnum :tag "Minimum")
-                       (natnum :tag "Maximum")))
+                   (natnum :tag "Minimum")
+                   (natnum :tag "Maximum")))
   :group 'kubed-ext)
 
 (defvar kubed-ext--auto-refresh-timer nil
@@ -1568,28 +1568,38 @@ Supports the common Kubernetes forms:
 
 Return nil if S cannot be parsed."
   (when (and (stringp s)
-             (string-match
-              (concat
-               "\\`"
-               "$[0-9]\\{4\\}$-$[0-9]\\{2\\}$-$[0-9]\\{2\\}$"
-               "T"
-               "$[0-9]\\{2\\}$:$[0-9]\\{2\\}$:$[0-9]\\{2\\}$"
-               "$?:\\.[0-9]+$?"
-               "$Z\\|[+-][0-9]\\{2\\}:[0-9]\\{2\\}$"
-               "\'")
+             (not (string-empty-p s))
+             ;; Quick guard: must start with YYYY-MM-DDTHH:MM:SS
+             (string-match-p
+              "\\`[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}T[0-9]\\{2\\}:[0-9]\\{2\\}:[0-9]\\{2\\}"
               s))
     (condition-case nil
         (parse-iso8601-time-string s)
       (error nil))))
 
 (defun kubed-ext--format-age (timestamp)
-  "Convert TIMESTAMP to human-readable age matching kubectl HumanDuration."
-  (if (kubed-ext-none-p timestamp)
-      (propertize "n/a" 'face 'shadow 'kubed-sort-value 0)
+  "Convert TIMESTAMP to human-readable relative age like kubectl.
+
+If TIMESTAMP already carries a `kubed-sort-value' text property (i.e. it
+was already formatted by a previous call), return it unchanged.
+Returns `n/a' for nil, empty, or placeholder values like `<none>'."
+  (cond
+   ;; Nil, empty, or kubectl placeholder.
+   ((kubed-ext-none-p timestamp)
+    (propertize "n/a" 'face 'shadow 'kubed-sort-value 0))
+   ;; Already formatted — return as-is (idempotency guard).
+   ((and (stringp timestamp)
+         (get-text-property 0 'kubed-sort-value timestamp))
+    timestamp)
+   ;; Try to parse as ISO 8601 timestamp.
+   (t
     (let ((parsed (kubed-ext--parse-k8s-timestamp timestamp)))
       (if (null parsed)
-          (propertize timestamp 'kubed-sort-value 0)
-        (let* ((secs (floor (float-time (time-subtract nil parsed))))
+          ;; Not a recognizable timestamp — pass through.
+          (propertize (if (stringp timestamp) timestamp
+                        (format "%s" timestamp))
+                      'kubed-sort-value 0)
+        (let* ((secs (max 0 (floor (float-time (time-subtract nil parsed)))))
                (total-minutes (/ secs 60))
                (hours (/ secs 3600))
                (days (/ secs 86400))
@@ -1618,7 +1628,7 @@ Return nil if S cannot be parsed."
                      ((< years 8)
                       (format "%dy%dd" years (mod days 365)))
                      (t (format "%dy" years)))))
-          (propertize str 'kubed-sort-value (float secs)))))))
+          (propertize str 'kubed-sort-value (float secs))))))))
 
 ;; ── Pod Status Computation (kubel-style) ──
 
@@ -1800,7 +1810,7 @@ Name, Ready(x/y), Status, Restarts, Age, IP, Node."
   (cons "PORTS:.spec.tls[0].hosts"
         (lambda (s)
           (if (kubed-ext-none-p s) "80" "80, 443")))
-  '("AGE:.metadata.creationTimestamp"))
+  (cons "AGE:.metadata.creationTimestamp" #'kubed-ext--format-age))
  (list
   (list "Class" 20 t)
   (list "Hosts" 40 t)
@@ -2178,6 +2188,127 @@ Name, Ready(x/y), Status, Restarts, Age, IP, Node."
                 (endpointslice) (rolebinding) (role)
                 (azureapplicationgatewayrewrite) (podmonitor) (servicemonitor)))
   (eval (cons 'kubed-define-resource spec) t))
+
+;;; ═══════════════════════════════════════════════════════════════
+;;; § 9a.  Human-Readable Age for All Timestamp Columns
+;;; ═══════════════════════════════════════════════════════════════
+
+(defvar kubed-ext--timestamp-patched-types
+  (make-hash-table :test 'equal)
+  "Resource types whose timestamp columns carry a formatter.")
+
+(defun kubed-ext--timestamp-column-spec-p (spec)
+  "Non-nil if SPEC names a Kubernetes timestamp column.
+SPEC is a fetch-column string such as
+`CREATIONTIMESTAMP:.metadata.creationTimestamp'."
+  (and
+   (stringp spec)
+   (or (string-match-p "\\.creationTimestamp" spec)
+       (string-match-p "\\.startTime" spec)
+       (string-match-p "\\.lastTimestamp" spec)
+       (string-match-p "\\.lastScheduleTime" spec)
+       (string-match-p "\\.lastSuccessfulTime" spec)
+       (string-match-p "\\.deletionTimestamp" spec)
+       (string-match-p "\\`AGE:" spec)
+       (string-match-p "\\`LAST.SEEN:" spec)
+       (string-match-p "\\`LASTSCHEDULE:" spec)
+       (string-match-p "\\`LASTSUCCESS:" spec)
+       (string-match-p "\\`STARTTIME:" spec)
+       (string-match-p "TIMESTAMP:" spec))))
+
+(defun kubed-ext--patch-type-timestamp-columns (type)
+  "Attach age formatter to timestamp columns for TYPE.
+Pods and deployments are skipped because they format
+ages inside their custom entries functions."
+  (unless (or (gethash type kubed-ext--timestamp-patched-types)
+              (member type '("pods" "deployments")))
+    (puthash type t kubed-ext--timestamp-patched-types)
+    (let ((columns (alist-get type kubed--columns
+                              nil nil #'string=)))
+      (when columns
+        (setf (alist-get type kubed--columns
+                         nil nil #'string=)
+              (mapcar
+               (lambda (col)
+                 (let ((spec (if (consp col)
+                                 (car col)
+                               col)))
+                   (if (and (kubed-ext--timestamp-column-spec-p
+                             spec)
+                            (not (and (consp col) (cdr col))))
+                       (cons spec #'kubed-ext--format-age)
+                     col)))
+               columns))))))
+
+(defun kubed-ext--patch-all-timestamp-columns ()
+  "Patch timestamp columns for all known resource types."
+  (dolist (entry kubed--columns)
+    (kubed-ext--patch-type-timestamp-columns (car entry))))
+
+(defun kubed-ext--fix-timestamp-display-columns ()
+  "Rename timestamp display columns to short labels.
+Install numeric sort via the `kubed-sort-value' text
+property that `kubed-ext--format-age' attaches."
+  (dolist (type-name '("services" "secrets" "jobs"
+                       "replicasets" "daemonsets"
+                       "statefulsets" "ingressclasses"
+                       "namespaces" "nodes" "events"
+                       "cronjobs"))
+    (let ((fmt-var (intern
+                    (format "kubed-%s-columns"
+                            type-name))))
+      (when (and (boundp fmt-var)
+                 (symbol-value fmt-var))
+        (let ((idx 0))
+          (set fmt-var
+               (mapcar
+                (lambda (col)
+                  (cl-incf idx)
+                  (let ((nm (downcase (car col))))
+                    (cond
+                     ((or (string= nm "creationtimestamp")
+                          (string= nm "starttime"))
+                      (append
+                       (list "Age" 10
+                             (kubed-ext-top-numeric-sorter
+                              idx))
+                       (nthcdr 3 col)))
+                     ((string= nm "last-seen")
+                      (append
+                       (list "Last Seen" 10
+                             (kubed-ext-top-numeric-sorter
+                              idx))
+                       (nthcdr 3 col)))
+                     ((string= nm "lastschedule")
+                      (append
+                       (list "Last Sched" 10
+                             (kubed-ext-top-numeric-sorter
+                              idx))
+                       (nthcdr 3 col)))
+                     ((string= nm "lastsuccess")
+                      (append
+                       (list "Last OK" 10
+                             (kubed-ext-top-numeric-sorter
+                              idx))
+                       (nthcdr 3 col)))
+                     (t col))))
+                (symbol-value fmt-var))))))))
+
+(defun kubed-ext--ensure-age-formatting
+    (orig-fn type context &optional namespace)
+  "Around-advice for `kubed-update'.
+Patch timestamp columns for TYPE before calling
+ORIG-FN with TYPE, CONTEXT, and NAMESPACE."
+  (kubed-ext--patch-type-timestamp-columns type)
+  (funcall orig-fn type context namespace))
+
+(advice-add 'kubed-update :around
+            #'kubed-ext--ensure-age-formatting)
+
+;; Apply patches now -- all kubed-define-resource forms
+;; have already been evaluated.
+(kubed-ext--patch-all-timestamp-columns)
+(kubed-ext--fix-timestamp-display-columns)
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 10.  Async Helpers
@@ -3378,6 +3509,9 @@ ORIG-FN is advised.  START END PROGRAM ARGS are passed through."
     ("horizontalpodautoscalers" . "HPAs")
     ("kafkas" . "Kafkas")
     ("kafkaconnects" . "KafkaConnects")
+    ("strimzipodsets" . "StrimziPodSets")
+    ("kafkanodepool" . "KafkaNodePools")
+    ("kafkarebalance" . "KafkaRebalances")
     ("kafkaconnectors" . "KafkaConnectors")
     ("kafkatopics" . "KafkaTopics"))
   "Common resources for quick switching.")
