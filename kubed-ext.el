@@ -3292,7 +3292,7 @@ Creates the buffer if it does not exist."
           (delete-region (point-min) (point)))))))
 
 (defun kubed-ext--make-process-logger (orig-fn &rest args)
-  "Log kubectl `make-process' calls, including shell-wrapped invocations.
+  "Log kubectl `make-process' call, including shell-wrapped invocations.
 
 Handles two forms:
   Direct:  (:command (kubectl get pods ...))
@@ -3783,7 +3783,7 @@ auto-refresh timer if it is running."
   "Consecutive network-error count per context.")
 
 (defvar kubed-ext--cb-open (make-hash-table :test 'equal)
-  "Non-nil when the circuit is OPEN for a context.")
+  "Non-nil when the circuit is OPEN (suspended) for a context.")
 
 (defvar kubed-ext--cb-backoff (make-hash-table :test 'equal)
   "Current probe-backoff interval in seconds per context.")
@@ -3792,51 +3792,67 @@ auto-refresh timer if it is running."
   "Pending recovery-probe timer per context.")
 
 (defvar kubed-ext--cb-attempt-count (make-hash-table :test 'equal)
-  "How many consecutive network failures have been seen per context.
-Shown in messages as k9s-style \"(N/threshold)\".")
+  "Consecutive failure count per context for mode-line display.")
 
-;; ── Network-error fingerprinting ─────────────────────────────────
+(defvar kubed-ext--cb-auth-error (make-hash-table :test 'equal)
+  "Non-nil when the last failure for a context was an auth/credential error.")
+
+;; ── Error fingerprinting ──────────────────────────────────────────
 
 (defconst kubed-ext--network-error-patterns
-  '(;; ── TCP / TLS layer ──────────────────────────────────────────
-    "EOF"                            ; VPN drop mid-request (most common)
+  '("EOF"
     "unexpected EOF"
     "connection reset by peer"
     "connection refused"
     "network is unreachable"
     "no route to host"
     "broken pipe"
-    ;; ── DNS ──────────────────────────────────────────────────────
     "no such host"
     "Name or service not known"
     "Temporary failure in name resolution"
-    ;; ── Timeout ──────────────────────────────────────────────────
     "i/o timeout"
     "TLS handshake timeout"
     "context deadline exceeded"
     "request timeout"
-    ;; ── kubectl / HTTP transport ─────────────────────────────────
     "Unable to connect to the server"
     "transport: Error while dialing"
     "dial tcp"
     "proxy: "
-    ;; ── Cloud provider specifics ─────────────────────────────────
-    "azmk8s.io"                      ; Azure AKS unreachable
-    "googleapis.com"                 ; GKE unreachable
-    "eks.amazonaws.com"              ; EKS unreachable
-    "certificate has expired")       ; expired cert after long VPN pause
-  "Kubectl stderr substrings that identify transient network / failures.
-Only these patterns trip the circuit breaker.  Auth errors,
-RBAC denials, missing resources etc. are NOT listed here and therefore
-never suppress auto-refresh.")
+    "azmk8s.io"
+    "googleapis.com"
+    "eks.amazonaws.com"
+    "certificate has expired")
+  "Kubectl stderr substrings that identify transient network/VPN failures.
+Only these patterns trip the circuit breaker.")
 
-;; ── Network-error predicate ───────────────────────────────────────
+(defconst kubed-ext--auth-error-patterns
+  '("AzureCLICredential"
+    "kubelogin failed"
+    "AADSTS"
+    "failed to get token"
+    "getting credentials: exec"
+    "exec: executable kubelogin"
+    "TokenRequestError"
+    "invalid_client"
+    "Unauthorized"
+    "unauthorized"
+    "az login"
+    "az logout")
+  "Kubectl stderr substrings that identify credential/auth failures.
+These mean the network is reachable but credentials need refreshing.
+They do NOT trip the circuit breaker.")
 
 (defun kubed-ext--network-error-p (msg)
-  "Return non-nil if MSG look like a transient network / VPN error."
+  "Return non-nil if MSG look like a transient network/VPN error."
   (and (stringp msg)
        (seq-some (lambda (pat) (string-match-p (regexp-quote pat) msg))
                  kubed-ext--network-error-patterns)))
+
+(defun kubed-ext--auth-error-p (msg)
+  "Return non-nil if MSG indicates an expired or invalid credential."
+  (and (stringp msg)
+       (seq-some (lambda (pat) (string-match-p (regexp-quote pat) msg))
+                 kubed-ext--auth-error-patterns)))
 
 ;; ── Core state machine ────────────────────────────────────────────
 
@@ -3844,54 +3860,91 @@ never suppress auto-refresh.")
   "Non-nil when the circuit is OPEN (suspended) for CONTEXT."
   (gethash (or context "") kubed-ext--cb-open))
 
+(defun kubed-ext--cb-auth-error-p (context)
+  "Non-nil when the last known failure for CONTEXT was an auth error."
+  (gethash (or context "") kubed-ext--cb-auth-error))
+
 (defun kubed-ext--cb-on-failure (context err-msg)
-  "Record a network failure for CONTEXT with message ERR-MSG.
-Ignores non-network errors.  Shows a k9s-style (N/threshold) counter
-while building up to `kubed-ext-cb-threshold', then trips the circuit."
+  "Record a failure for CONTEXT with message ERR-MSG.
+
+Auth errors (kubelogin, AADSTS, az login etc.) do NOT trip the circuit
+because the network is reachable — only credentials need refreshing.
+They emit a prominent re-auth warning and set a mode-line indicator.
+
+Network/transport errors increment the failure counter and trip the
+circuit once `kubed-ext-cb-threshold' is reached.
+
+Any other error is ignored."
   (let ((ctx (or context "")))
-    (when (kubed-ext--network-error-p err-msg)
-      (let* ((n (1+ (gethash ctx kubed-ext--cb-failures 0)))
-             (thr kubed-ext-cb-threshold)
+    (cond
+     ;; ── Auth / credential error: network is up ────────────────
+     ((kubed-ext--auth-error-p err-msg)
+      (puthash ctx t kubed-ext--cb-auth-error)
+      ;; Extract the most useful part of the message for display.
+      (let* ((lines (split-string (string-trim err-msg) "\n" t))
+             (az-line (seq-find (lambda (l)
+                                  (string-match-p "az login\\|az logout" l))
+                                lines))
+             (summary (or az-line
+                          (car lines)
+                          "Credentials expired — please re-authenticate.")))
+        (message "Kubed 🔑 [%s]: %s" ctx (string-trim summary))
+        ;; Show in header overlay of all visible list buffers for context.
+        (dolist (buf (buffer-list))
+          (when (buffer-live-p buf)
+            (with-current-buffer buf
+              (when (and (derived-mode-p 'kubed-list-mode)
+                         (equal kubed-list-context ctx))
+                (kubed-ext--set-header-error
+                 (concat "🔑 Auth expired — "
+                         (string-trim summary)))))))))
+
+     ;; ── Network / transport error: may trip the circuit ───────
+     ((kubed-ext--network-error-p err-msg)
+      (puthash ctx nil kubed-ext--cb-auth-error)
+      (let* ((n    (1+ (gethash ctx kubed-ext--cb-failures 0)))
+             (thr  kubed-ext-cb-threshold)
              (open (kubed-ext--cb-open-p ctx)))
         (puthash ctx n kubed-ext--cb-failures)
         (cond
-         ;; Already open — probe handles recovery.
          (open nil)
-         ;; Threshold reached — trip the circuit.
-         ((>= n thr)
-          (kubed-ext--cb-trip ctx err-msg))
-         ;; Below threshold — warn with k9s-style counter.
+         ((>= n thr) (kubed-ext--cb-trip ctx err-msg))
          (t
           (message "Kubed [%s]: conn check failed (%d/%d) — %s"
                    ctx n thr
                    (truncate-string-to-width
-                    (replace-regexp-in-string "\n" " " (string-trim err-msg))
-                    80 nil nil "…"))))))))
+                    (replace-regexp-in-string
+                     "\n" " " (string-trim err-msg))
+                    80 nil nil "…")))))))))
 
 (defun kubed-ext--cb-on-success (context)
   "Record a successful kubectl call for CONTEXT.
-Resets failure counters; closes the circuit if it was open."
+Resets failure and auth-error state; closes the circuit if it was open."
   (let ((ctx (or context "")))
     (puthash ctx 0 kubed-ext--cb-failures)
     (puthash ctx 0 kubed-ext--cb-attempt-count)
+    (puthash ctx nil kubed-ext--cb-auth-error)
     (when (kubed-ext--cb-open-p ctx)
       (kubed-ext--cb-close ctx))))
 
 (defun kubed-ext--cb-trip (context err-msg)
   "Open the circuit for CONTEXT and schedule the first recovery probe.
 ERR-MSG is used to extract a short human-readable summary."
-  (let* ((ctx (or context ""))
-         (delay kubed-ext-cb-initial-backoff)
-         (summary (if (string-match ": \\([^\n\"]+\\)\"?\\s-*$" err-msg)
-                      (match-string 1 err-msg)
-                    (truncate-string-to-width
-                     (replace-regexp-in-string "\n" " " (string-trim err-msg))
-                     60 nil nil "…"))))
-    (puthash ctx t kubed-ext--cb-open)
+  (let* ((ctx     (or context ""))
+         (delay   kubed-ext-cb-initial-backoff)
+         (summary (truncate-string-to-width
+                   (replace-regexp-in-string
+                    "\n" " "
+                    (string-trim
+                     (if (string-match ": $.+$" err-msg)
+                         (match-string 1 err-msg)
+                       err-msg)))
+                   60 nil nil "…")))
+    (puthash ctx t     kubed-ext--cb-open)
     (puthash ctx delay kubed-ext--cb-backoff)
     (message
-     "Kubed ⚡ [%s]: Cluster updates failed. Giving up ;( — %s  \
-[Probing in %ds. Press `g' or `Z' to retry now.]"
+     "Kubed ⚡ [%s]: Cluster unreachable — %s  \
+[Probing in %ds.  Press `g' or `Z' to retry now.]"
      ctx summary delay)
     (kubed-ext--cb-refresh-mode-lines ctx)
     (kubed-ext--cb-schedule-probe ctx delay)))
@@ -3900,14 +3953,13 @@ ERR-MSG is used to extract a short human-readable summary."
   "Close the circuit for CONTEXT — connection has been restored.
 Cancels any pending probe timer, clears error overlays, and triggers
 an immediate refresh in all visible kubed buffers for this context.
-Optional SKIP-REFRESH suppresses the auto-refresh (use when the
-caller will itself refresh, to avoid a double update)."
+Optional SKIP-REFRESH suppresses the auto-refresh."
   (let ((ctx (or context "")))
-    (puthash ctx nil kubed-ext--cb-open)
-    (puthash ctx 0 kubed-ext--cb-failures)
-    (puthash ctx 0 kubed-ext--cb-attempt-count)
+    (puthash ctx nil  kubed-ext--cb-open)
+    (puthash ctx 0    kubed-ext--cb-failures)
+    (puthash ctx 0    kubed-ext--cb-attempt-count)
+    (puthash ctx nil  kubed-ext--cb-auth-error)
     (puthash ctx kubed-ext-cb-initial-backoff kubed-ext--cb-backoff)
-    ;; Cancel any pending probe timer.
     (when-let ((timer (gethash ctx kubed-ext--cb-probe-timers)))
       (when (timerp timer) (cancel-timer timer))
       (remhash ctx kubed-ext--cb-probe-timers))
@@ -3934,52 +3986,68 @@ caller will itself refresh, to avoid a double update)."
              kubed-ext--cb-probe-timers)))
 
 (defun kubed-ext--cb-run-probe (context)
-  "Lightweight connectivity probe for CONTEXT using `kubectl version'.
+  "Connectivity probe for CONTEXT using `kubectl api-versions'.
 
-Exit 0                    → close circuit (connection restored).
-Exit non-0 + network err  → still down; double backoff and reschedule.
-Exit non-0 + other err    → server reachable (auth/RBAC issue);
-                            close circuit and let normal error
-                            handling surface the problem."
+This makes a real API call to the cluster with a short timeout,
+distinguishing three outcomes:
+
+  Exit 0                  → network and auth are fine; close circuit.
+  Exit non-0 + network    → still unreachable; double backoff, reschedule.
+  Exit non-0 + auth error → network is up but credentials expired;
+                            close the circuit (stop suppressing refreshes)
+                            and emit a re-auth warning.
+  Exit non-0 + other      → server is reachable; close circuit and let
+                            normal error handling surface the problem."
   (let ((ctx (or context "")))
     (when (kubed-ext--cb-open-p ctx)
       (let ((probe-buf (generate-new-buffer " *kubed-ext-cb-probe*")))
         (make-process
-         :name "kubed-ext-cb-probe"
-         :buffer probe-buf
+         :name    "kubed-ext-cb-probe"
+         :buffer  probe-buf
          :noquery t
          :command (list kubed-kubectl-program
-                        "version"
-                        "--context" ctx
+                        "api-versions"
+                        "--context"         ctx
                         "--request-timeout" "5s")
          :sentinel
          (lambda (proc _event)
            (when (memq (process-status proc) '(exit signal))
-             (let* ((code (process-exit-status proc))
+             (let* ((code   (process-exit-status proc))
                     (output (when (buffer-live-p probe-buf)
-                              (with-current-buffer probe-buf
-                                (buffer-string)))))
-               (when (buffer-live-p probe-buf) (kill-buffer probe-buf))
+                              (prog1
+                                  (with-current-buffer probe-buf
+                                    (buffer-string))
+                                (kill-buffer probe-buf)))))
                (remhash ctx kubed-ext--cb-probe-timers)
                (cond
-                ;; ── Probe succeeded ──────────────────────────────
+                ;; Success — network and auth are working.
                 ((zerop code)
                  (kubed-ext--cb-on-success ctx))
-                ;; ── Still a network error: back off further ──────
+
+                ;; Network still down — extend backoff and reschedule.
                 ((kubed-ext--network-error-p (or output ""))
-                 (let* ((cur (gethash ctx kubed-ext--cb-backoff
-                                      kubed-ext-cb-initial-backoff))
+                 (let* ((cur  (gethash ctx kubed-ext--cb-backoff
+                                       kubed-ext-cb-initial-backoff))
                         (next (min kubed-ext-cb-max-backoff
-                                   (round (* cur kubed-ext-cb-backoff-factor)))))
+                                   (round (* cur
+                                             kubed-ext-cb-backoff-factor)))))
                    (puthash ctx next kubed-ext--cb-backoff)
                    (message
                     "Kubed ⚡ [%s]: still unreachable — next probe in %ds."
                     ctx next)
                    (kubed-ext--cb-refresh-mode-lines ctx)
                    (kubed-ext--cb-schedule-probe ctx next)))
-                ;; ── Non-network error: server is up ───────────────
+
+                ;; Auth/credential error — network is up, creds expired.
+                ;; Close circuit so normal refreshes resume, but warn loudly
+                ;; so the user knows they need to re-authenticate.
+                ((kubed-ext--auth-error-p (or output ""))
+                 (kubed-ext--cb-close ctx 'skip-refresh)
+                 (kubed-ext--cb-on-failure ctx (or output "")))
+
+                ;; Any other non-zero exit — server is reachable.
                 (t
-                 (kubed-ext--cb-on-success ctx)))))))))))
+                 (kubed-ext--cb-close ctx)))))))))))
 
 ;; ── Mode-line refresh helper ──────────────────────────────────────
 
@@ -3996,31 +4064,28 @@ Exit non-0 + other err    → server reachable (auth/RBAC issue);
 ;; ── Feed kubed-update sentinels into the state machine ───────────
 
 (defun kubed-ext--cb-update-advice (orig-fn type context &optional namespace)
-  "Around-advice on `kubed-update': wire circuit-breaker accounting.
-ORIG-FN, TYPE, CONTEXT/NAMESPACE.
-Wraps the process sentinel to record success / network-failure without
-disturbing the existing error-overlay sentinel from § 3a."
+  "Around-advice on `kubed-update': wire circuit-breaker accounting."
   (funcall orig-fn type context namespace)
   (when-let ((proc (alist-get 'process
                               (kubed--alist type context namespace))))
     (when (process-live-p proc)
-      (let* ((ctx (or context ""))
-             (err-buf-name (format " *kubed-get-%s-stderr*" type))
-             (inner-sent (process-sentinel proc)))
+      (let* ((ctx           (or context ""))
+             (err-buf-name  (format " *kubed-get-%s-stderr*" type))
+             (inner-sent    (process-sentinel proc)))
         (set-process-sentinel
          proc
          (lambda (p status)
-           ;; 1. Run the existing sentinel chain first.
            (funcall inner-sent p status)
-           ;; 2. Feed result into circuit-breaker state machine.
            (cond
             ((string= status "finished\n")
              (kubed-ext--cb-on-success ctx))
             ((string= status "exited abnormally with code 1\n")
              (when-let ((err-buf (get-buffer err-buf-name)))
-               (kubed-ext--cb-on-failure
-                ctx (with-current-buffer err-buf
-                      (string-trim (buffer-string)))))))))))))
+               (when (buffer-live-p err-buf)
+                 (kubed-ext--cb-on-failure
+                  ctx
+                  (with-current-buffer err-buf
+                    (string-trim (buffer-string))))))))))))))
 
 (advice-add 'kubed-update :around #'kubed-ext--cb-update-advice)
 
@@ -4029,21 +4094,20 @@ disturbing the existing error-overlay sentinel from § 3a."
 (defun kubed-ext--cb-before-manual-refresh (&rest _)
   "Before-advice on `kubed-list-update': reset an open circuit.
 When the user explicitly presses `g', give the connection another
-chance without waiting for the scheduled probe.
-SKIP-REFRESH=t avoids a double update — `kubed-list-update' does it."
+chance without waiting for the scheduled probe."
   (when (and (derived-mode-p 'kubed-list-mode)
              kubed-list-context
              (kubed-ext--cb-open-p kubed-list-context))
-    (kubed-ext--cb-close kubed-list-context t)))
+    (kubed-ext--cb-close kubed-list-context 'skip-refresh)))
 
 (advice-add 'kubed-list-update :before #'kubed-ext--cb-before-manual-refresh)
 
 ;; ── Manual reset command ──────────────────────────────────────────
 
 (defun kubed-ext-circuit-breaker-reset (&optional context)
-  "Reset the circuit breaker for CONTEXT (default: current buffer's context).
-Call this after reconnecting your VPN to immediately resume auto-refresh
-without waiting for the next scheduled probe.
+  "Reset the circuit breaker for CONTEXT.
+Call this after reconnecting your VPN or refreshing credentials to
+immediately resume auto-refresh without waiting for the next probe.
 With a prefix argument, prompt for CONTEXT."
   (interactive
    (list (if current-prefix-arg
@@ -4053,17 +4117,18 @@ With a prefix argument, prompt for CONTEXT."
   (let ((ctx (or context (kubed-local-context))))
     (if (kubed-ext--cb-open-p ctx)
         (kubed-ext--cb-close ctx)
-      (puthash ctx 0 kubed-ext--cb-failures)
+      (puthash ctx 0   kubed-ext--cb-failures)
+      (puthash ctx nil kubed-ext--cb-auth-error)
       (message "Circuit for `%s' is already closed (failure count reset)."
                ctx))))
 
 (keymap-set kubed-list-mode-map "Z" #'kubed-ext-circuit-breaker-reset)
-(keymap-set kubed-prefix-map "Z" #'kubed-ext-circuit-breaker-reset)
+(keymap-set kubed-prefix-map    "Z" #'kubed-ext-circuit-breaker-reset)
 
-;; ── Updated auto-refresh tick (replaces § 0e definition) ─────────
+;; ── Auto-refresh tick ─────────────────────────────────────────────
 
 (defun kubed-ext--auto-refresh-tick ()
-  "Refresh visible kubed list buffers; silently skip open-circuit contexts.
+  "Refresh visible kubed list buffers; skip open-circuit contexts.
 After each tick reschedules itself with a fresh random delay."
   (unless (active-minibuffer-window)
     (let ((refreshed 0) (skipped 0))
@@ -4073,47 +4138,44 @@ After each tick reschedules itself with a fresh random delay."
             (with-current-buffer buf
               (when (derived-mode-p 'kubed-list-mode)
                 (cond
-                 ;; ── Circuit open: skip silently ───────────────
                  ((kubed-ext--cb-open-p kubed-list-context)
                   (cl-incf skipped))
-                 ;; ── Update already running: skip ─────────────
                  ((process-live-p
                    (alist-get 'process
                               (kubed--alist kubed-list-type
                                             kubed-list-context
                                             kubed-list-namespace))))
-                 ;; ── Normal refresh ────────────────────────────
                  (t
                   (condition-case nil
                       (progn (kubed-list-update t) (cl-incf refreshed))
                     (error nil)))))))))
       (cond
        ((and (> refreshed 0) (> skipped 0))
-        (message "Kubed: refreshed %d buffer%s; %d paused ⚡ (VPN/network)."
+        (message "Kubed: refreshed %d buffer%s; %d paused ⚡."
                  refreshed (if (= refreshed 1) "" "s") skipped))
        ((> refreshed 0)
         (message "Kubed: auto-refreshed %d buffer%s."
                  refreshed (if (= refreshed 1) "" "s"))))))
   (kubed-ext--auto-refresh-schedule))
 
-;; ── Updated mode-line (replaces § 16 setq) ───────────────────────
+;; ── Mode-line format ──────────────────────────────────────────────
 
 (setq kubed-list-mode-line-format
       '(:eval
-        (let* ((ctx kubed-list-context)
+        (let* ((ctx      kubed-list-context)
                (updating (process-live-p
                           (alist-get 'process
                                      (kubed--alist kubed-list-type ctx
                                                    kubed-list-namespace))))
-               (cb-open (and ctx (kubed-ext--cb-open-p ctx)))
-               (backoff (when cb-open
-                          (gethash ctx kubed-ext--cb-backoff
-                                   kubed-ext-cb-initial-backoff))))
+               (cb-open  (and ctx (kubed-ext--cb-open-p ctx)))
+               (cb-auth  (and ctx (kubed-ext--cb-auth-error-p ctx)))
+               (backoff  (when cb-open
+                           (gethash ctx kubed-ext--cb-backoff
+                                    kubed-ext-cb-initial-backoff))))
           (cond
-           ;; Spinner while an update process is live.
            (updating
             (propertize " [...]" 'help-echo "Updating..."))
-           ;; Lightning bolt while circuit is open.
+
            (cb-open
             (propertize
              (format " ⚡~%ds" (round backoff))
@@ -4123,25 +4185,39 @@ After each tick reschedules itself with a fresh random delay."
                              "Auto-refresh paused; probing every ~%ds.\n"
                              "Press `g' or `Z' to retry immediately.")
                      ctx (round backoff))))
-           ;; Normal indicators.
+
+           (cb-auth
+            (propertize
+             " 🔑 re-auth needed"
+             'face 'warning
+             'help-echo
+             (format (concat "Credentials expired for `%s'.\n"
+                             "Run `az login' (or equivalent), then\n"
+                             "press `g' or `Z' to resume.")
+                     ctx)))
+
            (t
             (concat
              (when kubed-list-filter
                (propertize
                 (concat " ["
-                        (mapconcat #'prin1-to-string kubed-list-filter " ")
+                        (mapconcat #'prin1-to-string
+                                   kubed-list-filter " ")
                         "]")
                 'help-echo "Current filter"))
              (when kubed-ext-list-label-selector
-               (propertize (concat " {" kubed-ext-list-label-selector "}")
-                           'help-echo "Label selector"
-                           'face 'warning))
+               (propertize
+                (concat " {" kubed-ext-list-label-selector "}")
+                'help-echo "Label selector"
+                'face 'warning))
              (when (and (bound-and-true-p kubed-ext-resource-filter)
                         (not (string-empty-p kubed-ext-resource-filter)))
-               (propertize (concat " /" kubed-ext-resource-filter "/")
-                           'help-echo "Substring filter"
-                           'face 'italic))))))))
-;;; ═══════════════════════════════════════════════════════════════
+               (propertize
+                (concat " /" kubed-ext-resource-filter "/")
+                'help-echo "Substring filter"
+                'face 'italic))))))))
+
+;;;; ═══════════════════════════════════════════════════════════════
 ;;; § 22.  Enhanced Log Filtering and Parallel Streaming
 ;;; ═══════════════════════════════════════════════════════════════
 ;;
