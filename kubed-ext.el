@@ -3292,15 +3292,28 @@ Creates the buffer if it does not exist."
           (delete-region (point-min) (point)))))))
 
 (defun kubed-ext--make-process-logger (orig-fn &rest args)
-  "Log kubectl `make-process' call.
+  "Log kubectl `make-process' calls, including shell-wrapped invocations.
+
+Handles two forms:
+  Direct:  (:command (kubectl get pods ...))
+  Wrapped: (:command (/bin/sh -c \"kubectl logs ... | rg ...\"))
+
 ORIG-FN is the advised function, ARGS its arguments."
-  (when-let* ((cmd (plist-get args :command))
-              ((stringp (car cmd)))
-              ((string-suffix-p
-                "kubectl"
-                (file-name-sans-extension
-                 (file-name-nondirectory (car cmd))))))
-    (kubed-ext--log-kubectl-command (mapconcat #'identity cmd " ")))
+  (let ((cmd (plist-get args :command)))
+    (when (and (consp cmd) (stringp (car cmd)))
+      (let ((prog (file-name-nondirectory
+                   (file-name-sans-extension (car cmd)))))
+        (cond
+         ;; Direct kubectl invocation.
+         ((string-suffix-p "kubectl" prog)
+          (kubed-ext--log-kubectl-command
+           (mapconcat #'identity (seq-filter #'stringp cmd) " ")))
+         ;; Shell wrapper: /bin/sh -c "kubectl ... | rg ..."
+         ((member prog '("sh" "bash" "zsh"))
+          (let ((shell-arg (car (last (seq-filter #'stringp cmd)))))
+            (when (and (stringp shell-arg)
+                       (string-match-p "kubectl" shell-arg))
+              (kubed-ext--log-kubectl-command shell-arg))))))))
   (apply orig-fn args))
 
 (advice-add 'make-process :around #'kubed-ext--make-process-logger)
@@ -4303,32 +4316,57 @@ A nil or empty PATTERN yields an identity filter (all lines pass)."
   "Start a kubectl process writing to BUF, optionally filtered.
 
 KUBECTL-ARGS is the complete argument list (program name excluded).
-FILTER-PATTERN is a regex string, or nil / empty string for no
-filtering.  Returns the started process.
+Nil values are silently removed before passing to kubectl.
+FILTER-PATTERN is a regex string, or nil/empty for no filtering.
 
-When a shell pipeline is used, rg ANSI colour output is decoded in
-Emacs so the buffer renders with proper syntax highlighting."
-  (let* ((pattern   (and (stringp filter-pattern)
-                         (not (string-empty-p filter-pattern))
-                         filter-pattern))
-         (use-shell (kubed-ext--log-use-shell-p pattern)))
+Shell-pipeline path (rg/grep): a custom sentinel suppresses the
+spurious exit-code-1 message that rg emits when no lines match.
+Emacs-native path: per-process line-filter closure is used instead."
+  (let* ((clean-args (delq nil kubectl-args))
+         (pattern    (and (stringp filter-pattern)
+                          (not (string-empty-p filter-pattern))
+                          filter-pattern))
+         (use-shell  (kubed-ext--log-use-shell-p pattern)))
     (if use-shell
-        ;; ── Shell pipeline via rg / grep ──────────────────────
         (let* ((filt-cmd (kubed-ext--log-shell-filter-cmd pattern))
                (kube-cmd (mapconcat #'shell-quote-argument
-                                    (cons kubed-kubectl-program kubectl-args)
+                                    (cons kubed-kubectl-program clean-args)
                                     " "))
                (full-cmd (format "%s | %s" kube-cmd filt-cmd))
                (proc     (start-process-shell-command
                           "*kubed-logs-filtered*" buf full-cmd)))
-          ;; rg emits ANSI colour escapes; translate them for Emacs.
           (when (executable-find "rg")
             (set-process-filter proc #'kubed-ext--log-ansi-filter))
+          ;; rg exits 1 when no lines match — suppress the default
+          ;; "exited abnormally" sentinel message for that case.
+          (set-process-sentinel
+           proc
+           (lambda (_p status)
+             (when (buffer-live-p buf)
+               (with-current-buffer buf
+                 (let ((inhibit-read-only t))
+                   (cond
+                    ;; exit 0 — matches found, nothing to add.
+                    ((string= status "finished\n") nil)
+                    ;; exit 1 — rg/grep found no matching lines.
+                    ((string= status "exited abnormally with code 1\n")
+                     (goto-char (point-max))
+                     (insert (propertize
+                              "(no matching lines found)\n"
+                              'face 'shadow)))
+                    ;; any other exit — show it so the user knows.
+                    (t
+                     (goto-char (point-max))
+                     (insert (propertize
+                              (format "[process: %s]\n"
+                                      (string-trim status))
+                              'face 'error)))))))))
           proc)
-      ;; ── Emacs-native line filter ──────────────────────────────
+      ;; Emacs-native: start-process calls make-process internally,
+      ;; so the make-process logger captures it automatically.
       (let ((proc (apply #'start-process
                          "*kubed-logs*" buf
-                         kubed-kubectl-program kubectl-args)))
+                         kubed-kubectl-program clean-args)))
         (when pattern
           (set-process-filter proc (kubed-ext--make-line-filter pattern)))
         proc))))
