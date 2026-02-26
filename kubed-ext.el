@@ -3812,15 +3812,15 @@ Shown in messages as k9s-style \"(N/threshold)\".")
     "googleapis.com"                 ; GKE unreachable
     "eks.amazonaws.com"              ; EKS unreachable
     "certificate has expired")       ; expired cert after long VPN pause
-  "kubectl stderr substrings that identify transient network / VPN
-failures.  Only these patterns trip the circuit breaker.  Auth errors,
+  "Kubectl stderr substrings that identify transient network / failures.
+Only these patterns trip the circuit breaker.  Auth errors,
 RBAC denials, missing resources etc. are NOT listed here and therefore
 never suppress auto-refresh.")
 
 ;; ── Network-error predicate ───────────────────────────────────────
 
 (defun kubed-ext--network-error-p (msg)
-  "Return non-nil if MSG looks like a transient network / VPN error."
+  "Return non-nil if MSG look like a transient network / VPN error."
   (and (stringp msg)
        (seq-some (lambda (pat) (string-match-p (regexp-quote pat) msg))
                  kubed-ext--network-error-patterns)))
@@ -3984,6 +3984,7 @@ Exit non-0 + other err    → server reachable (auth/RBAC issue);
 
 (defun kubed-ext--cb-update-advice (orig-fn type context &optional namespace)
   "Around-advice on `kubed-update': wire circuit-breaker accounting.
+ORIG-FN, TYPE, CONTEXT/NAMESPACE.
 Wraps the process sentinel to record success / network-failure without
 disturbing the existing error-overlay sentinel from § 3a."
   (funcall orig-fn type context namespace)
@@ -4127,9 +4128,848 @@ After each tick reschedules itself with a fresh random delay."
                (propertize (concat " /" kubed-ext-resource-filter "/")
                            'help-echo "Substring filter"
                            'face 'italic))))))))
+;;; ═══════════════════════════════════════════════════════════════
+;;; § 22.  Enhanced Log Filtering and Parallel Streaming
+;;; ═══════════════════════════════════════════════════════════════
+;;
+;; Three capabilities are added here:
+;;
+;;  1. Error-filtered logs for a single pod / resource.
+;;     kubed-ext-pods-logs-errors     — pod-list action (key "E")
+;;     kubed-ext-pods-logs-custom-filter — pod-list action (key "H")
+;;     kubed-ext-logs-errors          — standalone command
+;;
+;;  2. Filtered logs streamed by label selector (single kubectl call).
+;;     kubed-ext-logs-by-label-filtered
+;;     Mirrors: kubectl logs -l SELECTOR --all-containers=true \
+;;                --follow --since=0s | rg -i PATTERN
+;;
+;;  3. Parallel filtered logs (one kubectl process per pod).
+;;     kubed-ext-logs-parallel-by-label
+;;     Mirrors: kubectl get pods -l SEL -o name \
+;;                | xargs -n1 -P5 … kubectl logs … | rg -i PATTERN
+;;     Uses Emacs-native per-process filtering for a shared buffer.
+;;
+;;  4. Post-hoc filter on any existing log buffer.
+;;     kubed-ext-filter-log-buffer    — wraps `occur'
+;;
+;; Filter dispatch:
+;;   • auto  (default) — rg if found, else grep, else Emacs-native
+;;   • emacs           — always Emacs-native (portable, no colour)
+;;   • shell           — always rg/grep pipeline (error if absent)
+
+;;; ─── Customization ────────────────────────────────────────────
+
+(defgroup kubed-ext-logs nil
+  "Kubernetes log filtering and parallel streaming."
+  :group 'kubed-ext)
+
+(defcustom kubed-ext-log-error-pattern
+  "exception\\|error\\|critical\\|failure\\|fatal\\|panic"
+  "Case-insensitive regex for filtering error log lines.
+
+Accepted by \\='grep -Ei\\=', \\='rg -i\\=', and `string-match-p'
+\(with `case-fold-search' t\).  Extend this with site-specific patterns
+such as your application's exception class names."
+  :type 'string
+  :group 'kubed-ext-logs)
+
+(defcustom kubed-ext-log-parallel-limit 5
+  "Maximum simultaneous kubectl log processes for parallel streaming.
+
+Mirrors the \\='xargs -P5\\=' idiom.  Higher values consume more
+file descriptors but reduce total wall-clock latency."
+  :type 'natnum
+  :group 'kubed-ext-logs)
+
+(defcustom kubed-ext-log-default-since "1h"
+  "Default --since duration for filtered log commands (e.g. \"30m\", \"24h\")."
+  :type 'string
+  :group 'kubed-ext-logs)
+
+(defcustom kubed-ext-log-use-external-filter 'auto
+  "Controls whether rg/grep or Emacs-native filtering is used.
+
+`auto'  — prefer rg, then grep, then Emacs-native.
+`emacs' — always use Emacs-native line-by-line filtering.
+`shell' — always use a shell pipeline; signals an error if neither
+           rg nor grep is installed."
+  :type '(choice (const :tag "Auto-detect (rg > grep > Emacs)" auto)
+                 (const :tag "Emacs-native only"  emacs)
+                 (const :tag "Shell pipeline only" shell))
+  :group 'kubed-ext-logs)
+
+(defvar kubed-ext-log-filter-history nil
+  "Minibuffer history for log-filter pattern prompts.")
+
+;;; ─── Internal: tool selection ─────────────────────────────────
+
+(defun kubed-ext--log-shell-filter-cmd (pattern)
+  "Return a shell command string filtering stdin for PATTERN, or nil.
+
+Prefers `rg' (with --color=always for ANSI highlighting) when
+available; falls back to `grep -Ei'."
+  (cond
+   ((executable-find "rg")
+    (concat "rg --color=always --line-buffered -i "
+            (shell-quote-argument pattern)))
+   ((executable-find "grep")
+    (concat "grep --line-buffered -Ei "
+            (shell-quote-argument pattern)))
+   (t nil)))
+
+(defun kubed-ext--log-use-shell-p (pattern)
+  "Return non-nil when a shell pipeline should filter PATTERN."
+  (when (and (stringp pattern) (not (string-empty-p pattern)))
+    (pcase kubed-ext-log-use-external-filter
+      ('emacs nil)
+      ('shell
+       (unless (kubed-ext--log-shell-filter-cmd pattern)
+         (user-error
+          (concat "No rg or grep found; set "
+                  "`kubed-ext-log-use-external-filter' to `emacs'")))
+       t)
+      (_ (not (null (kubed-ext--log-shell-filter-cmd pattern)))))))
+
+;;; ─── Internal: interactive filter prompt ──────────────────────
+
+(defun kubed-ext--read-log-filter (prompt &optional default)
+  "Prompt with PROMPT for a log-filter regex, defaulting to DEFAULT.
+
+Offers an error-pattern preset, a no-filter option, and free-form
+custom input.  Returns an empty string when the user chooses no filter."
+  (let* ((opt-err    (concat "(errors)  " kubed-ext-log-error-pattern))
+         (opt-none   "(none)    show all lines")
+         (opt-custom "(custom)  enter pattern…")
+         (choice
+          (completing-read
+           (format-prompt prompt (or default ""))
+           (list opt-err opt-none opt-custom)
+           nil nil nil
+           'kubed-ext-log-filter-history
+           (or default ""))))
+    (cond
+     ((string= choice opt-err)    kubed-ext-log-error-pattern)
+     ((string= choice opt-none)   "")
+     ((string= choice opt-custom)
+      (read-string (format-prompt "Pattern" default)
+                   default 'kubed-ext-log-filter-history))
+     (t choice))))
+
+;;; ─── Internal: Emacs-native per-process line filter ───────────
+
+(defun kubed-ext--make-line-filter (pattern)
+  "Return a `process-filter' closure keeping only lines matching PATTERN.
+
+Matching is case-insensitive.  A partial final line (i.e. one not yet
+terminated by \\n) is held in an accumulator and prepended to the next
+chunk, so no content is dropped at process-output boundaries.
+
+A nil or empty PATTERN yields an identity filter (all lines pass)."
+  (let ((acc ""))
+    (lambda (proc string)
+      (when (buffer-live-p (process-buffer proc))
+        (let* ((combined (concat acc string))
+               (lines    (split-string combined "\n"))
+               (complete (butlast lines))
+               (tail     (car (last lines)))
+               (case-fold-search t))
+          (setq acc (or tail ""))
+          (with-current-buffer (process-buffer proc)
+            (let ((inhibit-read-only t))
+              (goto-char (point-max))
+              (dolist (line complete)
+                (when (or (null pattern)
+                          (string-empty-p pattern)
+                          (string-match-p pattern line))
+                  (insert line "\n"))))))))))
+
+;;; ─── Internal: ANSI-color process filter ──────────────────────
+
+(defun kubed-ext--log-ansi-filter (proc string)
+  "Process filter inserting STRING into PROC's buffer, decoding ANSI escapes."
+  (require 'ansi-color)
+  (when (buffer-live-p (process-buffer proc))
+    (with-current-buffer (process-buffer proc)
+      (let ((inhibit-read-only t)
+            (beg (point-max)))
+        (goto-char beg)
+        (insert string)
+        (ansi-color-apply-on-region beg (point-max))))))
+
+;;; ─── Internal: core launch helper ────────────────────────────
+
+(defun kubed-ext--launch-log-process (buf kubectl-args filter-pattern)
+  "Start a kubectl process writing to BUF, optionally filtered.
+
+KUBECTL-ARGS is the complete argument list (program name excluded).
+FILTER-PATTERN is a regex string, or nil / empty string for no
+filtering.  Returns the started process.
+
+When a shell pipeline is used, rg ANSI colour output is decoded in
+Emacs so the buffer renders with proper syntax highlighting."
+  (let* ((pattern   (and (stringp filter-pattern)
+                         (not (string-empty-p filter-pattern))
+                         filter-pattern))
+         (use-shell (kubed-ext--log-use-shell-p pattern)))
+    (if use-shell
+        ;; ── Shell pipeline via rg / grep ──────────────────────
+        (let* ((filt-cmd (kubed-ext--log-shell-filter-cmd pattern))
+               (kube-cmd (mapconcat #'shell-quote-argument
+                                    (cons kubed-kubectl-program kubectl-args)
+                                    " "))
+               (full-cmd (format "%s | %s" kube-cmd filt-cmd))
+               (proc     (start-process-shell-command
+                          "*kubed-logs-filtered*" buf full-cmd)))
+          ;; rg emits ANSI colour escapes; translate them for Emacs.
+          (when (executable-find "rg")
+            (set-process-filter proc #'kubed-ext--log-ansi-filter))
+          proc)
+      ;; ── Emacs-native line filter ──────────────────────────────
+      (let ((proc (apply #'start-process
+                         "*kubed-logs*" buf
+                         kubed-kubectl-program kubectl-args)))
+        (when pattern
+          (set-process-filter proc (kubed-ext--make-line-filter pattern)))
+        proc))))
+
+;;; ─── Command 1: error logs for pod at point ───────────────────
+
+(defun kubed-ext-pods-logs-errors (click)
+  "Show error-filtered logs for the pod at CLICK position.
+
+Uses `kubed-ext-log-error-pattern' as the filter and fetches logs
+from all containers so nothing is missed.  The --prefix flag prepends
+the container name to each line."
+  (interactive (list last-nonmenu-event) kubed-pods-mode)
+  (if-let ((pod (tabulated-list-get-id (mouse-set-point click))))
+      (let* ((ctx  kubed-list-context)
+             (ns   kubed-list-namespace)
+             (args (list "logs" pod
+                         "--context" ctx "-n" ns
+                         "--all-containers"
+                         "--prefix"
+                         "--since" kubed-ext-log-default-since))
+             (buf  (generate-new-buffer
+                    (format "*kubed-logs-errors pods/%s@%s[%s]*"
+                            pod (or ns "default") (or ctx "current")))))
+        (with-current-buffer buf (run-hooks 'kubed-logs-setup-hook))
+        (kubed-ext--launch-log-process buf args kubed-ext-log-error-pattern)
+        (display-buffer buf))
+    (user-error "No Kubernetes pod at point")))
+
+;;; ─── Command 2: custom-filtered logs for pod at point ─────────
+
+(defun kubed-ext-pods-logs-custom-filter (click)
+  "Show filtered logs for the pod at CLICK, prompting for a filter pattern.
+
+Offers error-pattern preset, no-filter, or free-form regex input.
+Prompts for since-duration, follow, and container selection."
+  (interactive (list last-nonmenu-event) kubed-pods-mode)
+  (if-let ((pod (tabulated-list-get-id (mouse-set-point click))))
+      (let* ((ctx  kubed-list-context)
+             (ns   kubed-list-namespace)
+             (filt   (kubed-ext--read-log-filter
+                      "Filter pattern" kubed-ext-log-error-pattern))
+             (since  (read-string (format-prompt "Since"
+                                                 kubed-ext-log-default-since)
+                                  nil nil kubed-ext-log-default-since))
+             (follow (y-or-n-p "Follow (stream) logs? "))
+             (container (kubed-read-container pod "Container" t ctx ns))
+             (args (append
+                    (list "logs" pod
+                          "--context" ctx "-n" ns
+                          "--prefix"
+                          "--since" since)
+                    (when follow '("--follow"))
+                    (if (stringp container)
+                        (list "-c" container)
+                      (list "--all-containers"))))
+             (buf  (generate-new-buffer
+                    (format "*kubed-logs-filtered pods/%s@%s[%s]*"
+                            pod (or ns "default") (or ctx "current")))))
+        (with-current-buffer buf (run-hooks 'kubed-logs-setup-hook))
+        (kubed-ext--launch-log-process buf args filt)
+        (display-buffer buf))
+    (user-error "No Kubernetes pod at point")))
+
+;;; ─── Command 3: standalone error-log viewer ──────────────────
+
+;;;###autoload
+(defun kubed-ext-logs-errors (&optional context namespace)
+  "Show error-filtered logs for a Kubernetes resource.
+
+Prompts for resource TYPE and NAME, then applies
+`kubed-ext-log-error-pattern' without further prompting.
+
+With prefix $$universal-argument], prompt for NAMESPACE.
+With double prefix $$universal-argument] $$universal-argument],
+also prompt for CONTEXT."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg)))
+     (list c n)))
+  (let* ((ctx    (or context (kubed-local-context)))
+         (ns     (or namespace (kubed--namespace ctx)))
+         (type   (kubed-read-resource-type "Resource type" nil ctx))
+         (res    (kubed-read-resource-name type "Error logs for" nil nil ctx ns))
+         (since  (read-string (format-prompt "Since"
+                                             kubed-ext-log-default-since)
+                              nil nil kubed-ext-log-default-since))
+         (follow (y-or-n-p "Follow (stream) logs? "))
+         (args   (append
+                  (list "logs" (concat type "/" res)
+                        "--context" ctx "-n" ns
+                        "--prefix" "--since" since)
+                  (when follow '("--follow"))))
+         (buf    (generate-new-buffer
+                  (format "*kubed-logs-errors %s/%s@%s[%s]*"
+                          type res (or ns "default") ctx))))
+    (with-current-buffer buf (run-hooks 'kubed-logs-setup-hook))
+    (kubed-ext--launch-log-process buf args kubed-ext-log-error-pattern)
+    (display-buffer buf)))
+
+;;; ─── Command 4: logs by label with filtering ──────────────────
+
+;;;###autoload
+(defun kubed-ext-logs-by-label-filtered (&optional context namespace)
+  "Stream filtered logs for pods matching a label selector.
+
+Single kubectl call — mirrors the shell pattern:
+
+  kubectl logs -l SELECTOR --all-containers=true \\
+    --follow --since=0s --prefix | rg -i PATTERN
+
+Prompts for label selector, filter pattern (error preset or custom),
+--since duration, and whether to follow the stream.
+
+With prefix $$universal-argument], prompt for NAMESPACE.
+With double prefix $$universal-argument] $$universal-argument],
+also prompt for CONTEXT."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg)))
+     (list c n)))
+  (let* ((ctx      (or context (kubed-local-context)))
+         (ns       (or namespace (kubed--namespace ctx)))
+         (labels   (kubed-ext-discover-labels "pods" ctx ns))
+         (selector (completing-read "Label selector: " labels nil nil
+                                    nil 'kubed-ext-label-selector-history))
+         (filt     (kubed-ext--read-log-filter
+                    "Filter pattern" kubed-ext-log-error-pattern))
+         (since    (read-string (format-prompt "Since"
+                                               kubed-ext-log-default-since)
+                                nil nil kubed-ext-log-default-since))
+         (follow   (y-or-n-p "Follow (stream) logs? "))
+         (args     (append
+                    (list "logs" "-l" selector
+                          "--all-containers=true"
+                          "--prefix"
+                          "--context" ctx
+                          "-n" ns
+                          "--since" since)
+                    (when follow '("--follow"))))
+         (buf      (generate-new-buffer
+                    (format "*kubed-logs-filtered -l %s@%s[%s]*"
+                            selector (or ns "default") ctx))))
+    (with-current-buffer buf (run-hooks 'kubed-logs-setup-hook))
+    (kubed-ext--launch-log-process buf args filt)
+    (display-buffer buf)))
+
+;;; ─── Command 5: parallel pod logs with filtering ──────────────
+
+(defun kubed-ext--pods-by-selector (selector context namespace)
+  "Return sorted pod names matching SELECTOR in CONTEXT/NAMESPACE, or nil."
+  (condition-case err
+      (let ((output
+             (with-temp-buffer
+               (apply #'call-process
+                      kubed-kubectl-program nil '(t nil) nil
+                      (append
+                       (list "get" "pods"
+                             "-l"           selector
+                             "--context"    context
+                             "--no-headers"
+                             "-o"           "custom-columns=NAME:.metadata.name")
+                       (when namespace (list "-n" namespace))))
+               (buffer-string))))
+        (sort (seq-filter
+               (lambda (s) (not (string-empty-p (string-trim s))))
+               (split-string output "\n" t))
+              #'string<))
+    (error
+     (message "kubed-ext: cannot list pods: %s" (error-message-string err))
+     nil)))
+
+;;; ─── Command 6: post-hoc filter on an existing log buffer ─────
+
+(defun kubed-ext-filter-log-buffer (pattern)
+  "Show lines from the current buffer matching PATTERN using `occur'.
+
+PATTERN is a case-insensitive regular expression.  Interactively,
+offers the error preset, a no-filter option, and free-form input.
+`occur' provides click-to-navigate and all its usual keybindings."
+  (interactive
+   (list (kubed-ext--read-log-filter
+          "Filter log buffer" kubed-ext-log-error-pattern)))
+  (when (or (null pattern) (string-empty-p (string-trim pattern)))
+    (user-error "No filter pattern specified"))
+  (let ((case-fold-search t))
+    (occur pattern)))
+
+;;; ─── Keybindings ──────────────────────────────────────────────
+
+;; Pod list buffer  (keys free: E not in pods-mode-map, H not in pods-mode-map)
+(keymap-set kubed-pods-mode-map "E" #'kubed-ext-pods-logs-errors)
+(keymap-set kubed-pods-mode-map "H" #'kubed-ext-pods-logs-custom-filter)
+
+;; Global kubed prefix map  (C-c k …)
+;;   "e"   — error logs for any resource (mnemonic: E=Errors)
+;;   "l f" — label + filter  ("l" is free, creating a mini-prefix)
+;;   "l p" — label + parallel
+(keymap-set kubed-prefix-map "e"   #'kubed-ext-logs-errors)
+(keymap-set kubed-prefix-map "l f" #'kubed-ext-logs-by-label-filtered)
+(keymap-set kubed-prefix-map "l p" #'kubed-ext-logs-parallel-by-label)
+
+;;; ─── Extend transient extra suffixes for pods mode ────────────
+
+(let ((entry (assoc "pods" kubed-ext-extra-transient-suffixes)))
+  (when entry
+    (let ((existing (append (cdr entry) nil)))
+      (setcdr entry
+              (apply #'vector
+                     (append
+                      existing
+                      (list
+                       '("le" "Error logs"
+                         kubed-ext-pods-logs-errors)
+                       '("lf" "Filter logs (custom)"
+                         kubed-ext-pods-logs-custom-filter)
+                       '("lp" "Parallel logs by label"
+                         kubed-ext-logs-parallel-by-label))))))))
 
 ;;; ═══════════════════════════════════════════════════════════════
-;;; § 22.  Setup
+;;; § 22b.  Log Filtering for Deployments and Generic Workloads
+;;; ═══════════════════════════════════════════════════════════════
+;;
+;; Extends § 23 to support error/filtered/parallel logs for
+;; deployments and any other workload type (statefulset, daemonset …).
+;;
+;; New internal helpers:
+;;   `kubed-ext--matchexpr-to-selector'  — matchExpression → selector
+;;   `kubed-ext--workload-pod-selector'  — label selector for workload
+;;   `kubed-ext--parallel-logs-run'      — shared parallel runner
+;;
+;; The § 23 definition of `kubed-ext-logs-parallel-by-label' is
+;; replaced here to delegate its concurrency loop to the shared runner.
+;;
+;; New deployment list actions:
+;;   `kubed-ext-deployments-logs-errors'          key "E"
+;;   `kubed-ext-deployments-logs-custom-filter'   key "H"
+;;   `kubed-ext-deployments-logs-parallel'        via transient / M-x
+;;
+;; New standalone command:
+;;   `kubed-ext-logs-parallel-for-workload'       C-c k w
+
+;;; ─── Helper: matchExpression → selector segment ───────────────
+
+(defun kubed-ext--matchexpr-to-selector (expr)
+  "Convert a single Kubernetes matchExpression EXPR alist to a string.
+
+EXPR is an alist with `key', `operator', and optional `values' keys.
+Returns a selector segment string, or nil for unsupported operators.
+
+Supported operators: Exists, DoesNotExist, In, NotIn."
+  (let ((key  (alist-get 'key expr))
+        (op   (alist-get 'operator expr))
+        (vals (alist-get 'values expr)))
+    (and (stringp key)
+         (stringp op)
+         (pcase op
+           ("Exists"       key)
+           ("DoesNotExist" (concat "!" key))
+           ("In"
+            (when (and (listp vals) vals)
+              (format "%s in (%s)" key (mapconcat #'identity vals ","))))
+           ("NotIn"
+            (when (and (listp vals) vals)
+              (format "%s notin (%s)" key (mapconcat #'identity vals ","))))
+           (_ nil)))))
+
+;;; ─── Helper: workload → pod label selector ────────────────────
+
+(defun kubed-ext--workload-pod-selector (type name context namespace)
+  "Return a kubectl --selector string for pods belonging to TYPE/NAME.
+CONTEXT/NAMESPACE
+Fetches the resource as JSON via kubectl and extracts the pod selector
+from `spec.selector.matchLabels' and `spec.selector.matchExpressions'.
+
+Supported values of TYPE: deployment(s), statefulset(s), daemonset(s),
+replicaset(s), job(s), replicationcontroller(s).
+
+Returns nil (with a brief message) when the selector cannot be
+determined — for example when kubectl is unreachable or the resource
+has no selector."
+  (condition-case err
+      (let ((json-str
+             (with-temp-buffer
+               (when (zerop
+                      (apply #'call-process
+                             kubed-kubectl-program nil '(t nil) nil
+                             (append
+                              (list "get" type name "-o" "json")
+                              (when namespace (list "-n"        namespace))
+                              (when context   (list "--context" context)))))
+                 (string-trim (buffer-string))))))
+        (when (and json-str
+                   (not (string-empty-p json-str))
+                   (string-prefix-p "{" json-str))
+          (let* ((obj      (json-parse-string json-str
+                                              :object-type 'alist
+                                              :array-type  'list))
+                 (spec     (and (listp obj)  (alist-get 'spec obj)))
+                 (selector (and (listp spec) (alist-get 'selector spec)))
+                 (result
+                  (cond
+                   ;; ReplicationControllers use a flat label map.
+                   ((member type '("replicationcontroller"
+                                   "replicationcontrollers"))
+                    (when (and selector (listp selector))
+                      (mapconcat (lambda (kv)
+                                   (format "%s=%s" (car kv) (cdr kv)))
+                                 selector ",")))
+                   ;; Deployments, StatefulSets, DaemonSets, ReplicaSets, Jobs:
+                   ;; selector.matchLabels and selector.matchExpressions.
+                   ((and selector
+                         (listp selector)
+                         (not (eq selector :null)))
+                    (let* ((ml    (alist-get 'matchLabels selector))
+                           (me    (alist-get 'matchExpressions selector))
+                           (lparts
+                            (when (and ml (listp ml) (not (eq ml :null)))
+                              (mapcar (lambda (kv)
+                                        (format "%s=%s" (car kv) (cdr kv)))
+                                      ml)))
+                           (eparts
+                            (when (and me (listp me) (not (eq me :null)))
+                              (delq nil
+                                    (mapcar #'kubed-ext--matchexpr-to-selector
+                                            me))))
+                           (all (append lparts eparts)))
+                      (when all (mapconcat #'identity all ","))))
+                   (t nil))))
+            ;; Never return an empty string — that would match all pods.
+            (and (stringp result)
+                 (not (string-empty-p result))
+                 result))))
+    (error
+     (message "kubed-ext: selector for %s/%s: %s"
+              type name (error-message-string err))
+     nil)))
+
+;;; ─── Shared parallel log runner ───────────────────────────────
+
+(defun kubed-ext--parallel-logs-run
+    (pods context namespace filter since follow all-containers buf)
+  "Stream logs from PODS concurrently into BUF, up to N processes in parallel.
+
+Maintains at most `kubed-ext-log-parallel-limit' simultaneous kubectl
+log processes; new ones start as slots free.
+
+Arguments:
+  PODS           list of pod-name strings; nil inserts a notice in BUF.
+  CONTEXT        kubectl context string.
+  NAMESPACE      Kubernetes namespace string.
+  FILTER         case-insensitive regex string; nil or empty passes all lines.
+  SINCE          kubectl --since duration value such as 30m or 1h.
+  FOLLOW         non-nil appends --follow to each kubectl invocation.
+  ALL-CONTAINERS non-nil appends --all-containers to each kubectl invocation.
+  BUF            pre-existing buffer that receives all log output.
+
+Per-process Emacs-native line filters are always used.  Routing N
+independent kubectl log streams through a single shared filter process
+would interleave their stderr output and corrupt the buffer."
+  (if (null pods)
+      (with-current-buffer buf
+        (let ((inhibit-read-only t))
+          (insert "No pods found for the given selector.\n")))
+    (message "Streaming from %d pod%s (≤%d parallel)…"
+             (length pods)
+             (if (= (length pods) 1) "" "s")
+             kubed-ext-log-parallel-limit)
+    (let ((remaining (copy-sequence pods))
+          (active    0)
+          (limit     kubed-ext-log-parallel-limit))
+      (cl-labels
+          ((maybe-start ()
+                        (while (and remaining (< active limit))
+                          (let ((pod (pop remaining)))
+                            (condition-case start-err
+                                (let* ((args
+                                        (append
+                                         (list "logs" pod
+                                               "--context" context
+                                               "-n"        namespace
+                                               "--prefix"
+                                               "--since"   since)
+                                         (when follow         '("--follow"))
+                                         (when all-containers '("--all-containers"))))
+                                       (proc
+                                        (apply #'start-process
+                                               (format "*kubed-plog-%s*" pod)
+                                               buf
+                                               kubed-kubectl-program
+                                               args)))
+                                  (when (and (stringp filter)
+                                             (not (string-empty-p filter)))
+                                    (set-process-filter
+                                     proc (kubed-ext--make-line-filter filter)))
+                                  (cl-incf active)
+                                  (set-process-sentinel
+                                   proc
+                                   (lambda (_p _status)
+                                     (cl-decf active)
+                                     (maybe-start))))
+                              (error
+                               (message "kubed-ext: log process for %s: %s"
+                                        pod
+                                        (error-message-string start-err))))))))
+        (maybe-start)))))
+
+;;; ─── Updated kubed-ext-logs-parallel-by-label ────────────────
+;; Replaces the § 23 definition; delegates the concurrency loop to
+;; `kubed-ext--parallel-logs-run'.
+
+;;;###autoload
+(defun kubed-ext-logs-parallel-by-label (&optional context namespace)
+  "Stream logs from pods matching a label selector, up to N in parallel.
+
+Emacs-native implementation of:
+
+  kubectl get pods -l SELECTOR -o name \\
+    | xargs -n1 -P5 -I{} sh -c \\
+        \\='kubectl logs {} --all-containers --follow --prefix\\=' \\
+    | rg -i PATTERN
+
+Up to `kubed-ext-log-parallel-limit' (default 5) kubectl log processes
+run simultaneously; new ones start as earlier ones finish.  Each line
+is prefixed with the originating pod name.
+
+Per-process Emacs-native filters are always used regardless of
+`kubed-ext-log-use-external-filter': sharing a single rg/grep process
+across N independent streams would interleave stderr and corrupt output.
+
+With prefix $$universal-argument], prompt for NAMESPACE.
+With double prefix $$universal-argument] $$universal-argument],
+also prompt for CONTEXT."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg)))
+     (list c n)))
+  (let* ((ctx      (or context (kubed-local-context)))
+         (ns       (or namespace (kubed--namespace ctx)))
+         (labels   (kubed-ext-discover-labels "pods" ctx ns))
+         (selector (completing-read "Label selector: " labels nil nil
+                                    nil 'kubed-ext-label-selector-history))
+         (filt     (kubed-ext--read-log-filter
+                    "Filter pattern" kubed-ext-log-error-pattern))
+         (since    (read-string (format-prompt "Since"
+                                               kubed-ext-log-default-since)
+                                nil nil kubed-ext-log-default-since))
+         (follow   (y-or-n-p "Follow (stream) logs? "))
+         (all-con  (y-or-n-p "All containers? "))
+         (pods     (kubed-ext--pods-by-selector selector ctx ns))
+         (buf      (generate-new-buffer
+                    (format "*kubed-parallel-logs -l %s@%s[%s]*"
+                            selector (or ns "default") ctx))))
+    (with-current-buffer buf (run-hooks 'kubed-logs-setup-hook))
+    (kubed-ext--parallel-logs-run pods ctx ns filt since follow all-con buf)
+    (display-buffer buf)))
+
+;;; ─── Deployment list actions ──────────────────────────────────
+
+(defun kubed-ext-deployments-logs-errors (click)
+  "Show error-filtered logs for the deployment at CLICK position.
+
+Streams via `kubectl logs deployment/NAME --all-containers --prefix'
+and applies `kubed-ext-log-error-pattern'.
+
+Note: kubectl picks one representative pod from the deployment.
+To stream from ALL pods simultaneously use
+`kubed-ext-deployments-logs-parallel'."
+  (interactive (list last-nonmenu-event) kubed-deployments-mode)
+  (if-let ((dep (tabulated-list-get-id (mouse-set-point click))))
+      (let* ((ctx  kubed-list-context)
+             (ns   kubed-list-namespace)
+             (args (list "logs"
+                         (concat "deployment/" dep)
+                         "--context"        ctx
+                         "-n"               ns
+                         "--all-containers"
+                         "--prefix"
+                         "--since"          kubed-ext-log-default-since))
+             (buf  (generate-new-buffer
+                    (format "*kubed-logs-errors deployments/%s@%s[%s]*"
+                            dep (or ns "default") (or ctx "current")))))
+        (with-current-buffer buf (run-hooks 'kubed-logs-setup-hook))
+        (kubed-ext--launch-log-process buf args kubed-ext-log-error-pattern)
+        (display-buffer buf))
+    (user-error "No Kubernetes deployment at point")))
+
+(defun kubed-ext-deployments-logs-custom-filter (click)
+  "Show filtered logs for the deployment at CLICK, prompting for options.
+
+Prompts for filter pattern (error preset or free-form), --since
+duration, and whether to follow the stream.
+
+Note: kubectl picks one representative pod from the deployment.
+To stream from ALL pods simultaneously use
+`kubed-ext-deployments-logs-parallel'."
+  (interactive (list last-nonmenu-event) kubed-deployments-mode)
+  (if-let ((dep (tabulated-list-get-id (mouse-set-point click))))
+      (let* ((ctx    kubed-list-context)
+             (ns     kubed-list-namespace)
+             (filt   (kubed-ext--read-log-filter
+                      "Filter pattern" kubed-ext-log-error-pattern))
+             (since  (read-string
+                      (format-prompt "Since" kubed-ext-log-default-since)
+                      nil nil kubed-ext-log-default-since))
+             (follow (y-or-n-p "Follow (stream) logs? "))
+             (args   (append
+                      (list "logs"
+                            (concat "deployment/" dep)
+                            "--context"        ctx
+                            "-n"               ns
+                            "--all-containers"
+                            "--prefix"
+                            "--since"          since)
+                      (when follow '("--follow"))))
+             (buf    (generate-new-buffer
+                      (format "*kubed-logs-filtered deployments/%s@%s[%s]*"
+                              dep (or ns "default") (or ctx "current")))))
+        (with-current-buffer buf (run-hooks 'kubed-logs-setup-hook))
+        (kubed-ext--launch-log-process buf args filt)
+        (display-buffer buf))
+    (user-error "No Kubernetes deployment at point")))
+
+(defun kubed-ext-deployments-logs-parallel (click)
+  "Stream filtered logs from ALL pods of the deployment at CLICK.
+
+Discovers the deployment's pod label selector from its JSON definition,
+enumerates every matching pod, and starts up to
+`kubed-ext-log-parallel-limit' concurrent kubectl log processes — all
+writing to a single shared buffer with each line prefixed by pod name.
+
+Prompts for filter pattern, --since duration, --follow, and
+--all-containers."
+  (interactive (list last-nonmenu-event) kubed-deployments-mode)
+  (if-let ((dep (tabulated-list-get-id (mouse-set-point click))))
+      (let* ((ctx kubed-list-context)
+             (ns  kubed-list-namespace)
+             (sel (kubed-ext--workload-pod-selector "deployments" dep ctx ns)))
+        (unless sel
+          (user-error
+           "Cannot determine pod selector for deployment `%s'" dep))
+        (let* ((filt   (kubed-ext--read-log-filter
+                        "Filter pattern" kubed-ext-log-error-pattern))
+               (since  (read-string
+                        (format-prompt "Since" kubed-ext-log-default-since)
+                        nil nil kubed-ext-log-default-since))
+               (follow (y-or-n-p "Follow (stream) logs? "))
+               (all-c  (y-or-n-p "All containers per pod? "))
+               (pods   (kubed-ext--pods-by-selector sel ctx ns))
+               (buf    (generate-new-buffer
+                        (format "*kubed-parallel-logs deployments/%s@%s[%s]*"
+                                dep (or ns "default") (or ctx "current")))))
+          (with-current-buffer buf (run-hooks 'kubed-logs-setup-hook))
+          (kubed-ext--parallel-logs-run pods ctx ns filt since follow all-c buf)
+          (display-buffer buf)))
+    (user-error "No Kubernetes deployment at point")))
+
+;;; ─── Standalone parallel workload logs ────────────────────────
+
+;;;###autoload
+(defun kubed-ext-logs-parallel-for-workload (&optional context namespace)
+  "Stream parallel filtered logs from pods of any workload resource.
+
+Prompts for workload TYPE (deployment, statefulset, daemonset,
+replicaset, or job), resource NAME, filter pattern (error preset or
+free-form), --since, --follow, and --all-containers options.
+
+Enumerates the workload's pods via its label selector and starts up
+to `kubed-ext-log-parallel-limit' concurrent kubectl log processes,
+all writing to a shared buffer with each line prefixed by pod name.
+
+With prefix $$universal-argument], prompt for NAMESPACE.
+With double prefix $$universal-argument] $$universal-argument],
+also prompt for CONTEXT."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg)))
+     (list c n)))
+  (let* ((ctx  (or context (kubed-local-context)))
+         (ns   (or namespace (kubed--namespace ctx)))
+         (type (completing-read
+                "Workload type: "
+                '("deployments" "statefulsets" "daemonsets"
+                  "replicasets" "jobs")
+                nil t nil nil "deployments"))
+         (name (kubed-read-resource-name type "Parallel logs for"
+                                         nil nil ctx ns))
+         (sel  (kubed-ext--workload-pod-selector type name ctx ns)))
+    (unless sel
+      (user-error "Cannot determine pod selector for %s/%s" type name))
+    (let* ((filt   (kubed-ext--read-log-filter
+                    "Filter pattern" kubed-ext-log-error-pattern))
+           (since  (read-string
+                    (format-prompt "Since" kubed-ext-log-default-since)
+                    nil nil kubed-ext-log-default-since))
+           (follow (y-or-n-p "Follow (stream) logs? "))
+           (all-c  (y-or-n-p "All containers per pod? "))
+           (pods   (kubed-ext--pods-by-selector sel ctx ns))
+           (buf    (generate-new-buffer
+                    (format "*kubed-parallel-logs %s/%s@%s[%s]*"
+                            type name (or ns "default") ctx))))
+      (with-current-buffer buf (run-hooks 'kubed-logs-setup-hook))
+      (kubed-ext--parallel-logs-run pods ctx ns filt since follow all-c buf)
+      (display-buffer buf))))
+
+;;; ─── Keybindings ──────────────────────────────────────────────
+
+;; Deployment list buffer  ("E"/"H" mirror the pod list keys from § 23)
+(keymap-set kubed-deployments-mode-map "E" #'kubed-ext-deployments-logs-errors)
+(keymap-set kubed-deployments-mode-map "H" #'kubed-ext-deployments-logs-custom-filter)
+
+;; Global kubed prefix map  (C-c k w — mnemonic: Workload logs)
+(keymap-set kubed-prefix-map "w" #'kubed-ext-logs-parallel-for-workload)
+
+;;; ─── Extend transient extra suffixes ──────────────────────────
+
+;; Deployments: append log entries after the existing four suffixes.
+(let ((entry (assoc "deployments" kubed-ext-extra-transient-suffixes)))
+  (when entry
+    (setcdr entry
+            (apply #'vector
+                   (append
+                    (append (cdr entry) nil)
+                    (list
+                     '("le" "Error logs (stream)"
+                       kubed-ext-deployments-logs-errors)
+                     '("lf" "Filter logs (custom)"
+                       kubed-ext-deployments-logs-custom-filter)
+                     '("lp" "Parallel logs (all pods)"
+                       kubed-ext-deployments-logs-parallel)))))))
+
+;;; ═══════════════════════════════════════════════════════════════
+;;; § 23.  Setup
 ;;; ═══════════════════════════════════════════════════════════════
 
 (defun kubed-ext-setup ()
