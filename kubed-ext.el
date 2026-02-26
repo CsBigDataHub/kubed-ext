@@ -243,6 +243,42 @@ when an update is already in progress or the minibuffer is active."
     (message "Kubed auto-refresh disabled.")))
 
 ;;; ═══════════════════════════════════════════════════════════════
+;;; § 0f.  Upstream Bug Fix — kubed-update Column Offset Overrun
+;;; ═══════════════════════════════════════════════════════════════
+;;
+;; `kubed-update' calculates column offsets from the header line and
+;; applies them to every data row.  When a trailing column is absent
+;; (e.g. a pod with no IP, no node, or no deletion timestamp) the data
+;; row is shorter than the header, so the fixed offset exceeds the line
+;; length and triggers "Args out of range".
+;;
+;; The fix wraps the process sentinel that kubed-update registers so
+;; that every buffer-substring call is clamped to pos-eol.
+
+(defun kubed-ext--safe-update (orig-fn type context &optional namespace)
+  "Around advice for `kubed-update': clamp `buffer-substring' in the sentinel.
+ORIG-FN TYPE CONTEXT/NAMESPACE."
+  (cl-letf* ((orig-mp (symbol-function 'make-process))
+             ((symbol-function 'make-process)
+              (lambda (&rest args)
+                (let* ((orig-sentinel (plist-get args :sentinel))
+                       (safe-sentinel
+                        (lambda (proc status)
+                          (cl-letf* ((orig-bs (symbol-function 'buffer-substring))
+                                     ((symbol-function 'buffer-substring)
+                                      (lambda (start end)
+                                        (with-current-buffer (process-buffer proc)
+                                          (let ((limit (point-max)))
+                                            (funcall orig-bs
+                                                     (min start limit)
+                                                     (min end   limit)))))))
+                            (funcall orig-sentinel proc status)))))
+                  (apply orig-mp (plist-put args :sentinel safe-sentinel))))))
+    (funcall orig-fn type context namespace)))
+
+(advice-add 'kubed-update :around #'kubed-ext--safe-update)
+
+;;; ═══════════════════════════════════════════════════════════════
 ;;; § 1.  CRD Auto-Column Discovery
 ;;; ═══════════════════════════════════════════════════════════════
 
