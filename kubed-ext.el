@@ -1,5042 +1,5042 @@
-;;; Kubed-Ext.El --- Extensions For Kubed With Async Metrics -*- Lexical-Binding: T; -*-
+;;; kubed-ext.el --- Extensions for Kubed with Async Metrics -*- lexical-binding: t; -*-
 
 ;; Author: Chetan Koneru
 ;; Version: 0.4.0
-;; Url: Https://Github.Com/Csbigdatahub/Kubed-Ext
-;; Keywords: Tools, Kubernetes
-;; Package-Requires: ((Emacs "29.1") (Kubed "0.5.1") (Transient "0.4.0"))
+;; URL: https://github.com/CsBigDataHub/kubed-ext
+;; Keywords: tools, kubernetes
+;; Package-Requires: ((emacs "29.1") (kubed "0.5.1") (transient "0.4.0"))
 
 ;;; Commentary:
-;; A Comprehensive Extension Suite For Kubed, Transforming Emacs Into A
-;; Production-Grade Kubernetes Dashboard.
+;; A comprehensive extension suite for Kubed, transforming Emacs into a
+;; production-grade Kubernetes dashboard.
 
 ;;; Code:
 
-(Require 'Kubed)
-(Require 'Kubed-Transient)
-(Require 'Transient)
-(Require 'Cl-Lib)
-(Require 'Json)
+(require 'kubed)
+(require 'kubed-transient)
+(require 'transient)
+(require 'cl-lib)
+(require 'json)
 
-(Defgroup Kubed-Ext Nil
-  "Extensions For Kubed."
-  :Group 'Kubed)
+(defgroup kubed-ext nil
+  "Extensions for Kubed."
+  :group 'kubed)
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 0.  Autoload Fixes + Full-Screen List Buffers
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defalias 'Kubed-Ext-List-Ingresss      #'Kubed-List-Ingresses)
-(Defalias 'Kubed-Ext-List-Ingressclasss #'Kubed-List-Ingressclasses)
+(defalias 'kubed-ext-list-ingresss      #'kubed-list-ingresses)
+(defalias 'kubed-ext-list-ingressclasss #'kubed-list-ingressclasses)
 
-(Add-To-List 'Display-Buffer-Alist
-             '("\\`\\*Kubed [A-Z][A-Z0-9]*[@[]"
-               (Display-Buffer-Same-Window)))
-(Add-To-List 'Display-Buffer-Alist
-             '("\\`\\*Kubed-Top-"
-               (Display-Buffer-Same-Window)))
+(add-to-list 'display-buffer-alist
+             '("\\`\\*Kubed [a-z][a-z0-9]*[@[]"
+               (display-buffer-same-window)))
+(add-to-list 'display-buffer-alist
+             '("\\`\\*kubed-top-"
+               (display-buffer-same-window)))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 0a.  Utility Functions
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defsubst Kubed-Ext-None-P (S)
-  "Return Non-Nil If S Is Nil, Empty, Or A Kubectl Placeholder Value."
-  (Or (Null S)
-      (Not (Stringp S))
-      (String-Empty-P S)
-      (String= S "<None>")
-      (String= S "")
-      (String= S "Nil")
-      (String-Match-P "\\`[ \T]*\'" S)))
+(defsubst kubed-ext-none-p (s)
+  "Return non-nil if S is nil, empty, or a kubectl placeholder value."
+  (or (null s)
+      (not (stringp s))
+      (string-empty-p s)
+      (string= s "<none>")
+      (string= s "")
+      (string= s "nil")
+      (string-match-p "\\`[ \t]*\'" s)))
 
-(Defun Kubed-Ext--Resource-At-Event (Event)
-  "Return The Tabulated-List Resource Id At Event.
-Works For Mouse Clicks, Keyboard Invocations, And Context-Menu Events.
-For Mouse Events The Window And Buffer-Position Are Read From The Event
-Itself So Point Is Never Moved As A Side-Effect.  For Keyboard Events
-The Resource At The Current Point Position Is Returned.
-Returns Nil When No Resource Is Found."
-  (If (Mouse-Event-P Event)
-      (Let* ((Start  (Event-Start Event))
-             (Window (Posn-Window Start))
-             (Pt     (Posn-Point  Start)))
-            (When (And (Windowp Window) (Numberp Pt))
-                  (With-Current-Buffer (Window-Buffer Window)
-                                       (Tabulated-List-Get-Id Pt))))
-      ;; Keyboard / Non-Mouse Path — Use Current Point.
-      (Tabulated-List-Get-Id)))
+(defun kubed-ext--resource-at-event (event)
+  "Return the tabulated-list resource ID at EVENT.
+Works for mouse clicks, keyboard invocations, and context-menu events.
+For mouse events the window and buffer-position are read from the event
+itself so point is never moved as a side-effect.  For keyboard events
+the resource at the current point position is returned.
+Returns nil when no resource is found."
+  (if (mouse-event-p event)
+      (let* ((start  (event-start event))
+             (window (posn-window start))
+             (pt     (posn-point  start)))
+        (when (and (windowp window) (numberp pt))
+          (with-current-buffer (window-buffer window)
+            (tabulated-list-get-id pt))))
+    ;; Keyboard / non-mouse path — use current point.
+    (tabulated-list-get-id)))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 0b.  Defcustoms: Status Faces, Output Format, Shell
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defcustom Kubed-Ext-Status-Faces
-  '(("Running"                      . Success)
-    ("Succeeded"                    . Shadow)
-    ("Completed"                    . (:Foreground "Yellow"))
-    ("Pending"                      . Warning)
-    ("Containercreating"            . Warning)
-    ("Podinitializing"              . Warning)
-    ("Unknown"                      . Warning)
-    ("Terminating"                  . (:Foreground "Blue"))
-    ("Failed"                       . Error)
-    ("Error"                        . Error)
-    ("Oomkilled"                    . Error)
-    ("Crashloopbackoff"             . Error)
-    ("Imagepullbackoff"             . Error)
-    ("Errimagepull"                 . Error)
-    ("Createcontainerconfigerror"   . Error)
-    ("Invalidimagename"             . Error)
-    ("Evicted"                      . Error)
-    ("Runcontainererror"            . Error)
-    ("Starterror"                   . Error)
-    ("Ready"                        . Success)
-    ("Notready"                     . Error)
-    ("Active"                       . Success)
-    ("Bound"                        . Success)
-    ("Released"                     . Shadow)
-    ("Healthy"                      . Success))
-  "Association List Mapping Pod/Resource Status Strings To Faces.
-Customize This To Change Colors For Different Kubernetes Statuses."
-  :Type '(Alist :Key-Type String :Value-Type (Choice Face Sexp))
-  :Group 'Kubed-Ext)
+(defcustom kubed-ext-status-faces
+  '(("Running"                      . success)
+    ("Succeeded"                    . shadow)
+    ("Completed"                    . (:foreground "yellow"))
+    ("Pending"                      . warning)
+    ("ContainerCreating"            . warning)
+    ("PodInitializing"              . warning)
+    ("Unknown"                      . warning)
+    ("Terminating"                  . (:foreground "blue"))
+    ("Failed"                       . error)
+    ("Error"                        . error)
+    ("OOMKilled"                    . error)
+    ("CrashLoopBackOff"             . error)
+    ("ImagePullBackOff"             . error)
+    ("ErrImagePull"                 . error)
+    ("CreateContainerConfigError"   . error)
+    ("InvalidImageName"             . error)
+    ("Evicted"                      . error)
+    ("RunContainerError"            . error)
+    ("StartError"                   . error)
+    ("Ready"                        . success)
+    ("NotReady"                     . error)
+    ("Active"                       . success)
+    ("Bound"                        . success)
+    ("Released"                     . shadow)
+    ("Healthy"                      . success))
+  "Association list mapping pod/resource status strings to faces.
+Customize this to change colors for different Kubernetes statuses."
+  :type '(alist :key-type string :value-type (choice face sexp))
+  :group 'kubed-ext)
 
-(Defcustom Kubed-Ext-Output-Format "Yaml"
-  "Default Output Format For Resource Display Buffers (Yaml Or Json)."
-  :Type '(Choice (Const "Yaml") (Const "Json"))
-  :Group 'Kubed-Ext)
+(defcustom kubed-ext-output-format "yaml"
+  "Default output format for resource display buffers (yaml or json)."
+  :type '(choice (const "yaml") (const "json"))
+  :group 'kubed-ext)
 
-(Defcustom Kubed-Ext-Pod-Shell "/Bin/Sh"
-  "Shell To Run When Opening A Terminal In A Kubernetes Pod."
-  :Type 'String
-  :Group 'Kubed-Ext)
+(defcustom kubed-ext-pod-shell "/bin/sh"
+  "Shell to run when opening a terminal in a Kubernetes pod."
+  :type 'string
+  :group 'kubed-ext)
 
-(Defcustom Kubed-Ext-Production-Context-Regexp "\\Bprod\\B"
-  "Regexp Matched Against A Kubectl Context Name To Flag It As Production.
-When Matched The Mode Line Shows The Context In Red With A ☢ Prefix And
-Suffix.  The Default Pattern Matches The Word `Prod' But Not `Preprod'.
-Set To Nil To Disable Production Highlighting Entirely."
-  :Type '(Choice (Regexp :Tag "Regexp")
-                 (Const  :Tag "Disabled" Nil))
-  :Group 'Kubed-Ext)
+(defcustom kubed-ext-production-context-regexp "\\bprod\\b"
+  "Regexp matched against a kubectl context name to flag it as production.
+When matched the mode line shows the context in red with a ☢ prefix and
+suffix.  The default pattern matches the word `prod' but not `preprod'.
+Set to nil to disable production highlighting entirely."
+  :type '(choice (regexp :tag "Regexp")
+                 (const  :tag "Disabled" nil))
+  :group 'kubed-ext)
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 0c.  Buffer-Local Variables
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defvar-Local Kubed-Ext-Resource-Filter ""
-  "Substring Filter For Highlighting Matching Resources In List Buffers.")
+(defvar-local kubed-ext-resource-filter ""
+  "Substring filter for highlighting matching resources in list buffers.")
 
-(Defvar-Local Kubed-Ext--Header-Error Nil
-  "Current Error Message To Display, Or Nil If No Error.")
+(defvar-local kubed-ext--header-error nil
+  "Current error message to display, or nil if no error.")
 
-(Defvar-Local Kubed-Ext--Error-Overlay Nil
-  "Overlay Used To Display Error Message At Top Of Buffer.")
+(defvar-local kubed-ext--error-overlay nil
+  "Overlay used to display error message at top of buffer.")
 
-(Defvar-Local Kubed-Ext-List-Label-Selector Nil
-  "Active Label Selector For Server-Side Kubectl Filtering.")
+(defvar-local kubed-ext-list-label-selector nil
+  "Active label selector for server-side kubectl filtering.")
 
-;; External Package Variable Declarations (Suppress Byte-Compiler Warnings).
-(Defvar Vterm-Shell)
-(Defvar Vterm-Buffer-Name)
-(Defvar Eat-Buffer-Name)
-(Defvar Eshell-Buffer-Name)
+;; External package variable declarations (suppress byte-compiler warnings).
+(defvar vterm-shell)
+(defvar vterm-buffer-name)
+(defvar eat-buffer-name)
+(defvar eshell-buffer-name)
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 0d.  Namespace Prefetch Cache
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defvar Kubed-Ext--Namespace-Prefetch-Contexts (Make-Hash-Table :Test 'Equal)
-  "Contexts For Which Namespace Prefetch Has Been Triggered.")
+(defvar kubed-ext--namespace-prefetch-contexts (make-hash-table :test 'equal)
+  "Contexts for which namespace prefetch has been triggered.")
 
-(Defun Kubed-Ext-Prefetch-Namespaces (&Optional Context)
-  "Asynchronously Prefetch Namespace List For Context.
-Does Nothing If Namespaces Are Already Cached Or A Fetch Is In Progress.
-This Ensures `Kubed-Read-Namespace' Completions Appear Without Delay."
-  (Let ((Ctx (Or Context (Ignore-Errors (Kubed-Local-Context)))))
-       (When Ctx
-             (Condition-Case Nil
-                             (When (And (Not (Alist-Get 'Resources
-                                                        (Kubed--Alist "Namespaces" Ctx Nil)))
-                                        (Not (Process-Live-P
-                                              (Alist-Get 'Process
-                                                         (Kubed--Alist "Namespaces" Ctx Nil)))))
-                                   (Puthash Ctx T Kubed-Ext--Namespace-Prefetch-Contexts)
-                                   (Kubed-Update "Namespaces" Ctx Nil))
-                             (Error Nil)))))
+(defun kubed-ext-prefetch-namespaces (&optional context)
+  "Asynchronously prefetch namespace list for CONTEXT.
+Does nothing if namespaces are already cached or a fetch is in progress.
+This ensures `kubed-read-namespace' completions appear without delay."
+  (let ((ctx (or context (ignore-errors (kubed-local-context)))))
+    (when ctx
+      (condition-case nil
+          (when (and (not (alist-get 'resources
+                                     (kubed--alist "namespaces" ctx nil)))
+                     (not (process-live-p
+                           (alist-get 'process
+                                      (kubed--alist "namespaces" ctx nil)))))
+            (puthash ctx t kubed-ext--namespace-prefetch-contexts)
+            (kubed-update "namespaces" ctx nil))
+        (error nil)))))
 
-(Defun Kubed-Ext--Ensure-Namespaces-Ready (Context)
-  "Ensure Namespace List For Context Is Available, Waiting If Necessary.
-If A Fetch Is In Progress, Wait For It.  If No Fetch Has Started And No
-Cached Data Exists, Start One And Wait.  If Data Is Already Cached,
-Return Immediately."
-  (Let ((Ctx (Or Context (Kubed-Local-Context))))
-       (When Ctx
-             (Unless (Alist-Get 'Resources (Kubed--Alist "Namespaces" Ctx Nil))
-                     (Let ((Proc (Alist-Get 'Process
-                                            (Kubed--Alist "Namespaces" Ctx Nil))))
-                          ;; No Live Fetch In Progress — Start One.
-                          (Unless (And Proc (Process-Live-P Proc))
-                                  (Condition-Case Nil
-                                                  (Kubed-Update "Namespaces" Ctx Nil)
-                                                  (Error Nil))
-                                  (Setq Proc (Alist-Get 'Process
-                                                        (Kubed--Alist "Namespaces" Ctx Nil))))
-                          ;; Wait For The Running Fetch To Finish.
-                          (When (And Proc (Process-Live-P Proc))
-                                (Message "Loading Namespaces For `%S'..." Ctx)
-                                (While (Process-Live-P Proc)
-                                       (Accept-Process-Output Proc 1))))))))
+(defun kubed-ext--ensure-namespaces-ready (context)
+  "Ensure namespace list for CONTEXT is available, waiting if necessary.
+If a fetch is in progress, wait for it.  If no fetch has started and no
+cached data exists, start one and wait.  If data is already cached,
+return immediately."
+  (let ((ctx (or context (kubed-local-context))))
+    (when ctx
+      (unless (alist-get 'resources (kubed--alist "namespaces" ctx nil))
+        (let ((proc (alist-get 'process
+                               (kubed--alist "namespaces" ctx nil))))
+          ;; No live fetch in progress — start one.
+          (unless (and proc (process-live-p proc))
+            (condition-case nil
+                (kubed-update "namespaces" ctx nil)
+              (error nil))
+            (setq proc (alist-get 'process
+                                  (kubed--alist "namespaces" ctx nil))))
+          ;; Wait for the running fetch to finish.
+          (when (and proc (process-live-p proc))
+            (message "Loading namespaces for `%s'..." ctx)
+            (while (process-live-p proc)
+              (accept-process-output proc 1))))))))
 
-(Defun Kubed-Ext--Prefetch-Namespaces-Hook ()
-  "Prefetch Namespaces When A Kubed List Buffer Is Created."
-  (When (Bound-And-True-P Kubed-List-Context)
-        (Kubed-Ext-Prefetch-Namespaces Kubed-List-Context)))
+(defun kubed-ext--prefetch-namespaces-hook ()
+  "Prefetch namespaces when a kubed list buffer is created."
+  (when (bound-and-true-p kubed-list-context)
+    (kubed-ext-prefetch-namespaces kubed-list-context)))
 
-(Add-Hook 'Kubed-List-Mode-Hook #'Kubed-Ext--Prefetch-Namespaces-Hook)
+(add-hook 'kubed-list-mode-hook #'kubed-ext--prefetch-namespaces-hook)
 
-(Defun Kubed-Ext--Prefetch-After-Use-Context (&Rest _)
-  "Prefetch Namespaces After `Kubed-Use-Context' Change The Default Context."
-  (When (And (Consp Kubed-Default-Context-And-Namespace)
-             (Car Kubed-Default-Context-And-Namespace))
-        ;; Clear Prefetch Flag So The New Context Gets A Fresh Fetch.
-        (Remhash (Car Kubed-Default-Context-And-Namespace)
-                 Kubed-Ext--Namespace-Prefetch-Contexts)
-        (Kubed-Ext-Prefetch-Namespaces
-         (Car Kubed-Default-Context-And-Namespace))))
+(defun kubed-ext--prefetch-after-use-context (&rest _)
+  "Prefetch namespaces after `kubed-use-context' change the default context."
+  (when (and (consp kubed-default-context-and-namespace)
+             (car kubed-default-context-and-namespace))
+    ;; Clear prefetch flag so the new context gets a fresh fetch.
+    (remhash (car kubed-default-context-and-namespace)
+             kubed-ext--namespace-prefetch-contexts)
+    (kubed-ext-prefetch-namespaces
+     (car kubed-default-context-and-namespace))))
 
-(Advice-Add 'Kubed-Use-Context :After #'Kubed-Ext--Prefetch-After-Use-Context)
+(advice-add 'kubed-use-context :after #'kubed-ext--prefetch-after-use-context)
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 0e.  Auto-Refresh Visible List Buffers
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defcustom Kubed-Ext-Auto-Refresh-Interval '(15 . 30)
-  "Interval Range In Seconds For Auto-Refreshing Visible Kubed List Buffers.
+(defcustom kubed-ext-auto-refresh-interval '(15 . 30)
+  "Interval range in seconds for auto-refreshing visible kubed list buffers.
 
-A Cons Cell (Min . Max).  Each Cycle Picks A Random Delay Between Min
-And Max Seconds Before The Next Refresh.  Set To Nil To Disable Even
-When The Mode Is On."
-  :Type '(Choice (Const :Tag "Disabled" Nil)
-                 (Cons :Tag "Interval Range (Seconds)"
-                   (Natnum :Tag "Minimum")
-                   (Natnum :Tag "Maximum")))
-  :Group 'Kubed-Ext)
+A cons cell (MIN . MAX).  Each cycle picks a random delay between MIN
+and MAX seconds before the next refresh.  Set to nil to disable even
+when the mode is on."
+  :type '(choice (const :tag "Disabled" nil)
+                 (cons :tag "Interval range (seconds)"
+                   (natnum :tag "Minimum")
+                   (natnum :tag "Maximum")))
+  :group 'kubed-ext)
 
-(Defvar Kubed-Ext--Auto-Refresh-Timer Nil
-  "Timer For Auto-Refreshing Visible Kubed List Buffers.")
+(defvar kubed-ext--auto-refresh-timer nil
+  "Timer for auto-refreshing visible kubed list buffers.")
 
-(Defun Kubed-Ext--Auto-Refresh-Random-Delay ()
-  "Return A Random Delay In Seconds, Or Nil If Auto-Refresh Is Disabled."
-  (When (Consp Kubed-Ext-Auto-Refresh-Interval)
-        (Let ((Lo (Car Kubed-Ext-Auto-Refresh-Interval))
-              (Hi (Cdr Kubed-Ext-Auto-Refresh-Interval)))
-             (+ Lo (Random (Max 1 (1+ (- Hi Lo))))))))
+(defun kubed-ext--auto-refresh-random-delay ()
+  "Return a random delay in seconds, or nil if auto-refresh is disabled."
+  (when (consp kubed-ext-auto-refresh-interval)
+    (let ((lo (car kubed-ext-auto-refresh-interval))
+          (hi (cdr kubed-ext-auto-refresh-interval)))
+      (+ lo (random (max 1 (1+ (- hi lo))))))))
 
 
-(Defun Kubed-Ext--Auto-Refresh-Schedule ()
-  "Schedule The Next Auto-Refresh Tick With A Random Delay."
-  (Kubed-Ext--Auto-Refresh-Cancel-Timer)
-  (When-Let ((Delay (Kubed-Ext--Auto-Refresh-Random-Delay)))
-            (Setq Kubed-Ext--Auto-Refresh-Timer
-                  (Run-With-Timer Delay Nil #'Kubed-Ext--Auto-Refresh-Tick))))
+(defun kubed-ext--auto-refresh-schedule ()
+  "Schedule the next auto-refresh tick with a random delay."
+  (kubed-ext--auto-refresh-cancel-timer)
+  (when-let ((delay (kubed-ext--auto-refresh-random-delay)))
+    (setq kubed-ext--auto-refresh-timer
+          (run-with-timer delay nil #'kubed-ext--auto-refresh-tick))))
 
-(Defun Kubed-Ext--Auto-Refresh-Cancel-Timer ()
-  "Cancel The Pending Auto-Refresh Timer If Any."
-  (When (Timerp Kubed-Ext--Auto-Refresh-Timer)
-        (Cancel-Timer Kubed-Ext--Auto-Refresh-Timer)
-        (Setq Kubed-Ext--Auto-Refresh-Timer Nil)))
+(defun kubed-ext--auto-refresh-cancel-timer ()
+  "Cancel the pending auto-refresh timer if any."
+  (when (timerp kubed-ext--auto-refresh-timer)
+    (cancel-timer kubed-ext--auto-refresh-timer)
+    (setq kubed-ext--auto-refresh-timer nil)))
 
-;;;###Autoload
-(Define-Minor-Mode Kubed-Ext-Auto-Refresh-Mode
-  "Periodically Refresh Visible Kubed List Buffers.
+;;;###autoload
+(define-minor-mode kubed-ext-auto-refresh-mode
+  "Periodically refresh visible kubed list buffers.
 
-Refresh Interval Is Randomized Between The Bounds In
-`Kubed-Ext-Auto-Refresh-Interval' (Default 15-30 S).  Only Buffers
-Currently Shown In A Window Are Refreshed, And A Refresh Is Skipped
-When An Update Is Already In Progress Or The Minibuffer Is Active."
-  :Global T
-  :Lighter " Kref"
-  :Group 'Kubed-Ext
-  (If Kubed-Ext-Auto-Refresh-Mode
-      (Progn
-       (Kubed-Ext--Auto-Refresh-Schedule)
-       (Message "Kubed Auto-Refresh Enabled (%D-%Ds)."
-                (Car Kubed-Ext-Auto-Refresh-Interval)
-                (Cdr Kubed-Ext-Auto-Refresh-Interval)))
-      (Kubed-Ext--Auto-Refresh-Cancel-Timer)
-      (Message "Kubed Auto-Refresh Disabled.")))
+Refresh interval is randomized between the bounds in
+`kubed-ext-auto-refresh-interval' (default 15-30 s).  Only buffers
+currently shown in a window are refreshed, and a refresh is skipped
+when an update is already in progress or the minibuffer is active."
+  :global t
+  :lighter " KRef"
+  :group 'kubed-ext
+  (if kubed-ext-auto-refresh-mode
+      (progn
+        (kubed-ext--auto-refresh-schedule)
+        (message "Kubed auto-refresh enabled (%d-%ds)."
+                 (car kubed-ext-auto-refresh-interval)
+                 (cdr kubed-ext-auto-refresh-interval)))
+    (kubed-ext--auto-refresh-cancel-timer)
+    (message "Kubed auto-refresh disabled.")))
 
 ;;; ═══════════════════════════════════════════════════════════════
-;;; § 0f.  Upstream Bug Fix — Kubed-Update Column Offset Overrun
+;;; § 0f.  Upstream Bug Fix — kubed-update Column Offset Overrun
 ;;; ═══════════════════════════════════════════════════════════════
 ;;
-;; `Kubed-Update' Calculates Column Offsets From The Header Line And
-;; Applies Them To Every Data Row.  When A Trailing Column Is Absent
-;; (E.G. A Pod With No Ip, No Node, Or No Deletion Timestamp) The Data
-;; Row Is Shorter Than The Header, So The Fixed Offset Exceeds The Line
-;; Length And Triggers "Args Out Of Range".
+;; `kubed-update' calculates column offsets from the header line and
+;; applies them to every data row.  When a trailing column is absent
+;; (e.g. a pod with no IP, no node, or no deletion timestamp) the data
+;; row is shorter than the header, so the fixed offset exceeds the line
+;; length and triggers "Args out of range".
 ;;
-;; The Fix Wraps The Process Sentinel That Kubed-Update Registers So
-;; That Every Buffer-Substring Call Is Clamped To Pos-Eol.
+;; The fix wraps the process sentinel that kubed-update registers so
+;; that every buffer-substring call is clamped to pos-eol.
 
-(Defun Kubed-Ext--Safe-Update (Orig-Fn Type Context &Optional Namespace)
-  "Around Advice For `Kubed-Update': Clamp `Buffer-Substring' In The Sentinel.
-Orig-Fn Type Context/Namespace."
-  (Cl-Letf* ((Orig-Mp (Symbol-Function 'Make-Process))
-             ((Symbol-Function 'Make-Process)
-              (Lambda (&Rest Args)
-                      (Let* ((Orig-Sentinel (Plist-Get Args :Sentinel))
-                             (Safe-Sentinel
-                              (Lambda (Proc Status)
-                                      (Cl-Letf* ((Orig-Bs (Symbol-Function 'Buffer-Substring))
-                                                 ((Symbol-Function 'Buffer-Substring)
-                                                  (Lambda (Start End)
-                                                          (With-Current-Buffer (Process-Buffer Proc)
-                                                                               (Let ((Limit (Point-Max)))
-                                                                                    (Funcall Orig-Bs
-                                                                                             (Min Start Limit)
-                                                                                             (Min End   Limit)))))))
-                                                (Funcall Orig-Sentinel Proc Status)))))
-                            (Apply Orig-Mp (Plist-Put Args :Sentinel Safe-Sentinel))))))
-            (Funcall Orig-Fn Type Context Namespace)))
+(defun kubed-ext--safe-update (orig-fn type context &optional namespace)
+  "Around advice for `kubed-update': clamp `buffer-substring' in the sentinel.
+ORIG-FN TYPE CONTEXT/NAMESPACE."
+  (cl-letf* ((orig-mp (symbol-function 'make-process))
+             ((symbol-function 'make-process)
+              (lambda (&rest args)
+                (let* ((orig-sentinel (plist-get args :sentinel))
+                       (safe-sentinel
+                        (lambda (proc status)
+                          (cl-letf* ((orig-bs (symbol-function 'buffer-substring))
+                                     ((symbol-function 'buffer-substring)
+                                      (lambda (start end)
+                                        (with-current-buffer (process-buffer proc)
+                                          (let ((limit (point-max)))
+                                            (funcall orig-bs
+                                                     (min start limit)
+                                                     (min end   limit)))))))
+                            (funcall orig-sentinel proc status)))))
+                  (apply orig-mp (plist-put args :sentinel safe-sentinel))))))
+    (funcall orig-fn type context namespace)))
 
-(Advice-Add 'Kubed-Update :Around #'Kubed-Ext--Safe-Update)
-
-;;; ═══════════════════════════════════════════════════════════════
-;;; § 1.  Crd Auto-Column Discovery
-;;; ═══════════════════════════════════════════════════════════════
-
-(Defvar Kubed-Ext-Enriched-Resources (Make-Hash-Table :Test 'Equal)
-  "Track Resource Type+Context Pairs Already Enriched With Crd Columns.")
-
-(Defun Kubed-Ext--Crd-Printer-Columns (Resource-Plural Context)
-  "Fetch Additionalprintercolumns From Crd For Resource-Plural In Context."
-  (Condition-Case Err
-                  (Let* ((Ctx-Args (When Context (List "--Context" Context)))
-                         (Crd-Name
-                          (With-Temp-Buffer
-                           (When (Zerop (Apply #'Call-Process
-                                               Kubed-Kubectl-Program Nil '(T Nil) Nil
-                                               "Api-Resources" "--No-Headers" "-O" "Name"
-                                               Ctx-Args))
-                                 (Goto-Char (Point-Min))
-                                 (When (Re-Search-Forward
-                                        (Concat "^" (Regexp-Quote Resource-Plural) "\\.")
-                                        Nil T)
-                                       (String-Trim (Thing-At-Point 'Line T)))))))
-                        (When Crd-Name
-                              (Let ((Json-Str
-                                     (With-Temp-Buffer
-                                      (When (Zerop
-                                             (Apply #'Call-Process
-                                                    Kubed-Kubectl-Program Nil '(T Nil) Nil
-                                                    "Get" "Crd" Crd-Name "-O"
-                                                    "Jsonpath={.Spec.Versions[0].Additionalprintercolumns}"
-                                                    Ctx-Args))
-                                            (String-Trim (Buffer-String))))))
-                                   (When (And Json-Str
-                                              (Not (String-Empty-P Json-Str))
-                                              (Not (String= Json-Str "Null")))
-                                         (Let ((All-Cols (Json-Parse-String
-                                                          Json-Str
-                                                          :Array-Type 'List :Object-Type 'Alist)))
-                                              (Seq-Remove
-                                               (Lambda (C) (String= (Alist-Get 'Name C) "Age"))
-                                               All-Cols))))))
-                  (Error (Message "Kubed-Ext Crd Error: %S" Err) Nil)))
-
-(Defun Kubed-Ext-Enrich-Columns (Resource-Plural Context)
-  "Inject Crd Printer Columns Into Kubed For Resource-Plural In Context."
-  (When-Let ((Cols (Kubed-Ext--Crd-Printer-Columns Resource-Plural Context)))
-            (Setf (Alist-Get Resource-Plural Kubed--Columns Nil Nil #'String=)
-                  (Cons '("Name:.Metadata.Name")
-                        (Mapcar
-                         (Lambda (C)
-                                 (Cons (Format "%S:%S"
-                                               (Upcase (Replace-Regexp-In-String
-                                                        "[ /]" "_" (Alist-Get 'Name C)))
-                                               (Alist-Get 'Jsonpath C))
-                                       Nil))
-                         Cols)))
-            (Let ((Fmt-Var (Intern (Format "Kubed-%S-Columns" Resource-Plural))))
-                 (When (Boundp Fmt-Var)
-                       (Set Fmt-Var
-                            (Mapcar (Lambda (C)
-                                            (List (Alist-Get 'Name C)
-                                                  (Max (+ 2 (Length (Alist-Get 'Name C))) 14)
-                                                  T))
-                                    Cols))))
-            T))
-
-(Defun Kubed-Ext--Maybe-Enrich-Columns (&Rest _)
-  "Before-Advice: Lazily Discover Crd Columns On First List."
-  (When-Let ((Type Kubed-List-Type))
-            (Let ((Key (Cons Type (Or Kubed-List-Context ""))))
-                 (Unless (Gethash Key Kubed-Ext-Enriched-Resources)
-                         (Puthash Key T Kubed-Ext-Enriched-Resources)
-                         (Let ((Existing (Alist-Get Type Kubed--Columns Nil Nil #'String=)))
-                              (When (Or (Null Existing) (<= (Length Existing) 1))
-                                    (When (Kubed-Ext-Enrich-Columns Type Kubed-List-Context)
-                                          (Let ((Fmt-Var (Intern (Format "Kubed-%S-Columns" Type))))
-                                               (When (And (Boundp Fmt-Var) (Symbol-Value Fmt-Var))
-                                                     (Setq Tabulated-List-Format
-                                                           (Apply #'Vector
-                                                                  (Cons Kubed-Name-Column
-                                                                        (Symbol-Value Fmt-Var))))
-                                                     (Tabulated-List-Init-Header))))))))))
-
-(Advice-Add 'Kubed-List-Update :Before #'Kubed-Ext--Maybe-Enrich-Columns)
-
-(Defun Kubed-Ext-Refresh-Crd-Columns ()
-  "Force Re-Discovery Of Crd Columns After Switching Context."
-  (Interactive)
-  (Clrhash Kubed-Ext-Enriched-Resources)
-  (Message "Crd Column Cache Cleared."))
+(advice-add 'kubed-update :around #'kubed-ext--safe-update)
 
 ;;; ═══════════════════════════════════════════════════════════════
-;;; § 2.  Port-Forward With Auto-Complete
+;;; § 1.  CRD Auto-Column Discovery
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defconst Kubed-Ext--Dq (String 34)
-  "Double-Quote Character As A One-Char String.")
+(defvar kubed-ext-enriched-resources (make-hash-table :test 'equal)
+  "Track resource type+context pairs already enriched with CRD columns.")
 
-(Defconst Kubed-Ext--Jq-Tab
-  (Concat "{" Kubed-Ext--Dq "\\T" Kubed-Ext--Dq "}")
-  "Kubectl Jsonpath Tab Separator Token.")
+(defun kubed-ext--crd-printer-columns (resource-plural context)
+  "Fetch additionalPrinterColumns from CRD for RESOURCE-PLURAL in CONTEXT."
+  (condition-case err
+      (let* ((ctx-args (when context (list "--context" context)))
+             (crd-name
+              (with-temp-buffer
+                (when (zerop (apply #'call-process
+                                    kubed-kubectl-program nil '(t nil) nil
+                                    "api-resources" "--no-headers" "-o" "name"
+                                    ctx-args))
+                  (goto-char (point-min))
+                  (when (re-search-forward
+                         (concat "^" (regexp-quote resource-plural) "\\.")
+                         nil t)
+                    (string-trim (thing-at-point 'line t)))))))
+        (when crd-name
+          (let ((json-str
+                 (with-temp-buffer
+                   (when (zerop
+                          (apply #'call-process
+                                 kubed-kubectl-program nil '(t nil) nil
+                                 "get" "crd" crd-name "-o"
+                                 "jsonpath={.spec.versions[0].additionalPrinterColumns}"
+                                 ctx-args))
+                     (string-trim (buffer-string))))))
+            (when (and json-str
+                       (not (string-empty-p json-str))
+                       (not (string= json-str "null")))
+              (let ((all-cols (json-parse-string
+                               json-str
+                               :array-type 'list :object-type 'alist)))
+                (seq-remove
+                 (lambda (c) (string= (alist-get 'name c) "Age"))
+                 all-cols))))))
+    (error (message "Kubed-ext CRD error: %s" err) nil)))
 
-(Defconst Kubed-Ext--Jq-Nl
-  (Concat "{" Kubed-Ext--Dq "\\N" Kubed-Ext--Dq "}")
-  "Kubectl Jsonpath Newline Separator Token.")
+(defun kubed-ext-enrich-columns (resource-plural context)
+  "Inject CRD printer columns into kubed for RESOURCE-PLURAL in CONTEXT."
+  (when-let ((cols (kubed-ext--crd-printer-columns resource-plural context)))
+    (setf (alist-get resource-plural kubed--columns nil nil #'string=)
+          (cons '("NAME:.metadata.name")
+                (mapcar
+                 (lambda (c)
+                   (cons (format "%s:%s"
+                                 (upcase (replace-regexp-in-string
+                                          "[ /]" "_" (alist-get 'name c)))
+                                 (alist-get 'jsonPath c))
+                         nil))
+                 cols)))
+    (let ((fmt-var (intern (format "kubed-%s-columns" resource-plural))))
+      (when (boundp fmt-var)
+        (set fmt-var
+             (mapcar (lambda (c)
+                       (list (alist-get 'name c)
+                             (max (+ 2 (length (alist-get 'name c))) 14)
+                             t))
+                     cols))))
+    t))
 
-(Defun Kubed-Ext--Json-Patch (Key Value)
-  "Return Json String {Spec:{Key:Value}} For Kubectl Patch."
-  (Let ((Q Kubed-Ext--Dq))
-       (Concat "{" Q "Spec" Q ":{" Q Key Q ":" Value "}}")))
+(defun kubed-ext--maybe-enrich-columns (&rest _)
+  "Before-advice: lazily discover CRD columns on first list."
+  (when-let ((type kubed-list-type))
+    (let ((key (cons type (or kubed-list-context ""))))
+      (unless (gethash key kubed-ext-enriched-resources)
+        (puthash key t kubed-ext-enriched-resources)
+        (let ((existing (alist-get type kubed--columns nil nil #'string=)))
+          (when (or (null existing) (<= (length existing) 1))
+            (when (kubed-ext-enrich-columns type kubed-list-context)
+              (let ((fmt-var (intern (format "kubed-%s-columns" type))))
+                (when (and (boundp fmt-var) (symbol-value fmt-var))
+                  (setq tabulated-list-format
+                        (apply #'vector
+                               (cons kubed-name-column
+                                     (symbol-value fmt-var))))
+                  (tabulated-list-init-header))))))))))
 
-(Defun Kubed-Ext-Resource-Container-Ports (Type Name &Optional Context Namespace)
-  "Discover Container Ports For Resource Name Of Type In Context And Namespace."
-  (Let ((Jsonpath
-         (Pcase Type
-                ((Or "Pod" "Pods")
-                 ".Spec.Containers[*].Ports[*]")
-                ((Or "Deployment" "Deployments"
-                     "Statefulset" "Statefulsets"
-                     "Daemonset" "Daemonsets"
-                     "Replicaset" "Replicasets")
-                 ".Spec.Template.Spec.Containers[*].Ports[*]")
-                (_ Nil))))
-       (When Jsonpath
-             (Let ((Output
-                    (With-Temp-Buffer
-                     (Apply #'Call-Process
-                            Kubed-Kubectl-Program Nil '(T Nil) Nil
-                            "Get" Type Name "-O"
-                            (Concat "Jsonpath={Range " Jsonpath "}"
-                                    "{.Containerport}" Kubed-Ext--Jq-Tab
-                                    "{.Name}" Kubed-Ext--Jq-Tab
-                                    "{.Protocol}" Kubed-Ext--Jq-Nl
-                                    "{End}")
-                            (Append
-                             (When Namespace (List "-N" Namespace))
-                             (When Context (List "--Context" Context))))
-                     (Buffer-String))))
-                  (Delq Nil
-                        (Mapcar (Lambda (Line)
-                                        (Let ((Parts (Split-String Line "\T")))
-                                             (When (And (Car Parts)
-                                                        (Not (String-Empty-P (Car Parts))))
-                                                   (List (String-To-Number (Nth 0 Parts))
-                                                         (Or (Nth 1 Parts) "")
-                                                         (Or (Nth 2 Parts) "Tcp")))))
-                                (Split-String Output "\N" T)))))))
+(advice-add 'kubed-list-update :before #'kubed-ext--maybe-enrich-columns)
 
-(Defun Kubed-Ext-Service-Ports (Service &Optional Context Namespace)
-  "Discover Ports For Service In Context And Namespace."
-  (Let ((Output
-         (With-Temp-Buffer
-          (Apply #'Call-Process
-                 Kubed-Kubectl-Program Nil '(T Nil) Nil
-                 "Get" "Service" Service "-O"
-                 (Concat "Jsonpath={Range .Spec.Ports[*]}"
-                         "{.Port}" Kubed-Ext--Jq-Tab
-                         "{.Targetport}" Kubed-Ext--Jq-Tab
-                         "{.Name}" Kubed-Ext--Jq-Tab
-                         "{.Protocol}" Kubed-Ext--Jq-Nl
-                         "{End}")
-                 (Append
-                  (When Namespace (List "-N" Namespace))
-                  (When Context (List "--Context" Context))))
-          (Buffer-String))))
-       (Delq Nil
-             (Mapcar (Lambda (Line)
-                             (Let ((Parts (Split-String Line "\T")))
-                                  (When (And (>= (Length Parts) 4)
-                                             (Not (String-Empty-P (Car Parts))))
-                                        (List (String-To-Number (Nth 0 Parts))
-                                              (Nth 1 Parts)
-                                              (Nth 2 Parts)
-                                              (Nth 3 Parts)))))
-                     (Split-String Output "\N" T)))))
+(defun kubed-ext-refresh-crd-columns ()
+  "Force re-discovery of CRD columns after switching context."
+  (interactive)
+  (clrhash kubed-ext-enriched-resources)
+  (message "CRD column cache cleared."))
 
-(Defun Kubed-Ext--Format-Port-Candidate (Port-Num Name Protocol)
-  "Format A Port Completion Candidate With Port-Num, Name, And Protocol."
-  (Format "%D%S%S" Port-Num
-          (If (Or (Null Name) (String-Empty-P Name)) ""
-              (Format " (%S)" Name))
-          (If (Or (Null Protocol) (String= Protocol "Tcp")) ""
-              (Format " [%S]" Protocol))))
+;;; ═══════════════════════════════════════════════════════════════
+;;; § 2.  Port-Forward with Auto-Complete
+;;; ═══════════════════════════════════════════════════════════════
 
-(Defun Kubed-Ext-Read-Resource-Port (Type Name Prompt &Optional Context Namespace)
-  "Read Port From Container Ports Of Type/Name With Prompt In Context/Namespace."
-  (Let* ((Ports (Kubed-Ext-Resource-Container-Ports
-                 Type Name Context Namespace))
-         (Candidates
-          (Mapcar (Lambda (P)
-                          (Kubed-Ext--Format-Port-Candidate
-                           (Nth 0 P) (Nth 1 P) (Nth 2 P)))
-                  Ports)))
-        (String-To-Number
-         (If Candidates
-             (Completing-Read (Format-Prompt Prompt Nil) Candidates Nil Nil)
-             (Read-String (Format-Prompt Prompt Nil))))))
+(defconst kubed-ext--dq (string 34)
+  "Double-quote character as a one-char string.")
 
-(Defun Kubed-Ext-Read-Service-Port (Service Prompt &Optional Context Namespace)
-  "Read Port From Service Ports With Prompt In Context And Namespace."
-  (Let* ((Ports (Kubed-Ext-Service-Ports Service Context Namespace))
-         (Candidates
-          (Mapcar (Lambda (P)
-                          (Kubed-Ext--Format-Port-Candidate
-                           (Nth 0 P) (Nth 2 P) (Nth 3 P)))
-                  Ports)))
-        (String-To-Number
-         (If Candidates
-             (Completing-Read (Format-Prompt Prompt Nil) Candidates Nil Nil)
-             (Read-String (Format-Prompt Prompt Nil))))))
+(defconst kubed-ext--jq-tab
+  (concat "{" kubed-ext--dq "\\t" kubed-ext--dq "}")
+  "Kubectl jsonpath tab separator token.")
 
-(Defun Kubed-Ext-Forward-Port (Type Name Local-Port Remote-Port Context Namespace)
-  "Forward Local-Port To Remote-Port Of Type/Name In Context/Namespace."
-  (Let ((Res-Spec (Pcase Type
-                         ((Or "Pod" "Pods") Name)
-                         ((Or "Service" "Services") (Concat "Svc/" Name))
-                         (_ (Concat (Replace-Regexp-In-String "S\'" "" Type)
-                                    "/" Name))))
-        (Desc (Format "%S/%S %D:%D In %S[%S]"
-                      Type Name Local-Port Remote-Port
-                      (Or Namespace "Default") (Or Context "Current"))))
-       (Message "Forwarding Localhost:%D -> %S:%D..."
-                Local-Port Res-Spec Remote-Port)
-       (Push (Cons Desc
-                   (Apply #'Start-Process
-                          "*Kubed-Port-Forward*" Nil
-                          Kubed-Kubectl-Program "Port-Forward"
-                          Res-Spec (Format "%D:%D" Local-Port Remote-Port)
-                          (Append
-                           (When Namespace (List "-N" Namespace))
-                           (When Context (List "--Context" Context)))))
-             Kubed-Port-Forward-Process-Alist)
-       (Kubed-Ext-Refresh-Pf-Markers-In-Visible-Buffers)))
+(defconst kubed-ext--jq-nl
+  (concat "{" kubed-ext--dq "\\n" kubed-ext--dq "}")
+  "Kubectl jsonpath newline separator token.")
 
-(Defun Kubed-Ext-Forward-Port-To-Pod
-  (Pod Local-Port Remote-Port Context Namespace)
-  "Forward Local-Port To Remote-Port Of Pod Pod In Context/Namespace."
-  (Interactive
-   (Let* ((C (Kubed-Local-Context))
-          (C (If (Equal Current-Prefix-Arg '(16))
-                 (Kubed-Read-Context "Context" C) C))
-          (N (Kubed--Namespace C Current-Prefix-Arg))
-          (P (Kubed-Read-Pod "Forward Port To Pod" Nil Nil C N))
-          (R (Kubed-Ext-Read-Resource-Port "Pods" P "Remote Port" C N))
-          (L (Read-Number (Format "Local Port (Remote=%D): " R) R)))
-         (List P L R C N)))
-  (Kubed-Ext-Forward-Port "Pods" Pod Local-Port Remote-Port Context Namespace))
+(defun kubed-ext--json-patch (key value)
+  "Return JSON string {spec:{KEY:VALUE}} for kubectl patch."
+  (let ((q kubed-ext--dq))
+    (concat "{" q "spec" q ":{" q key q ":" value "}}")))
 
-(Defun Kubed-Ext-Pods-Forward-Port (Click)
-  "Forward Local Network Port To Remote Port Of Pod At Click Position."
-  (Interactive (List Last-Nonmenu-Event) Kubed-Pods-Mode)
-  (If-Let ((Pod (Kubed-Ext--Resource-At-Event Click)))
-          (Let* ((R (Kubed-Ext-Read-Resource-Port
-                     "Pods" Pod "Remote Port"
-                     Kubed-List-Context Kubed-List-Namespace))
-                 (L (Read-Number (Format "Local Port (Remote=%D): " R) R)))
-                (Kubed-Ext-Forward-Port "Pods" Pod L R
-                                        Kubed-List-Context Kubed-List-Namespace))
-          (User-Error "No Kubernetes Pod At Point")))
+(defun kubed-ext-resource-container-ports (type name &optional context namespace)
+  "Discover container ports for resource NAME of TYPE in CONTEXT and NAMESPACE."
+  (let ((jsonpath
+         (pcase type
+           ((or "pod" "pods")
+            ".spec.containers[*].ports[*]")
+           ((or "deployment" "deployments"
+                "statefulset" "statefulsets"
+                "daemonset" "daemonsets"
+                "replicaset" "replicasets")
+            ".spec.template.spec.containers[*].ports[*]")
+           (_ nil))))
+    (when jsonpath
+      (let ((output
+             (with-temp-buffer
+               (apply #'call-process
+                      kubed-kubectl-program nil '(t nil) nil
+                      "get" type name "-o"
+                      (concat "jsonpath={range " jsonpath "}"
+                              "{.containerPort}" kubed-ext--jq-tab
+                              "{.name}" kubed-ext--jq-tab
+                              "{.protocol}" kubed-ext--jq-nl
+                              "{end}")
+                      (append
+                       (when namespace (list "-n" namespace))
+                       (when context (list "--context" context))))
+               (buffer-string))))
+        (delq nil
+              (mapcar (lambda (line)
+                        (let ((parts (split-string line "\t")))
+                          (when (and (car parts)
+                                     (not (string-empty-p (car parts))))
+                            (list (string-to-number (nth 0 parts))
+                                  (or (nth 1 parts) "")
+                                  (or (nth 2 parts) "TCP")))))
+                      (split-string output "\n" t)))))))
 
-(Defun Kubed-Ext-Forward-Port-To-Service
-  (Service Local-Port Remote-Port Context Namespace)
-  "Forward Local-Port To Remote-Port Of Service Service In Context/Namespace."
-  (Interactive
-   (Let* ((C (Kubed-Local-Context))
-          (C (If (Equal Current-Prefix-Arg '(16))
-                 (Kubed-Read-Context "Context" C) C))
-          (N (Kubed--Namespace C Current-Prefix-Arg))
-          (S (Kubed-Read-Service "Forward Port To Service" Nil Nil C N))
-          (R (Kubed-Ext-Read-Service-Port S "Remote Port" C N))
-          (L (Read-Number (Format "Local Port (Remote=%D): " R) R)))
-         (List S L R C N)))
-  (Kubed-Ext-Forward-Port "Services" Service Local-Port Remote-Port
-                          Context Namespace))
+(defun kubed-ext-service-ports (service &optional context namespace)
+  "Discover ports for SERVICE in CONTEXT and NAMESPACE."
+  (let ((output
+         (with-temp-buffer
+           (apply #'call-process
+                  kubed-kubectl-program nil '(t nil) nil
+                  "get" "service" service "-o"
+                  (concat "jsonpath={range .spec.ports[*]}"
+                          "{.port}" kubed-ext--jq-tab
+                          "{.targetPort}" kubed-ext--jq-tab
+                          "{.name}" kubed-ext--jq-tab
+                          "{.protocol}" kubed-ext--jq-nl
+                          "{end}")
+                  (append
+                   (when namespace (list "-n" namespace))
+                   (when context (list "--context" context))))
+           (buffer-string))))
+    (delq nil
+          (mapcar (lambda (line)
+                    (let ((parts (split-string line "\t")))
+                      (when (and (>= (length parts) 4)
+                                 (not (string-empty-p (car parts))))
+                        (list (string-to-number (nth 0 parts))
+                              (nth 1 parts)
+                              (nth 2 parts)
+                              (nth 3 parts)))))
+                  (split-string output "\n" t)))))
 
-(Defun Kubed-Ext-Services-Forward-Port (Click)
-  "Forward Local Port To Kubernetes Service At Click Position."
-  (Interactive (List Last-Nonmenu-Event) Kubed-Services-Mode)
-  (If-Let ((Service (Kubed-Ext--Resource-At-Event Click)))
-          (Let* ((R (Kubed-Ext-Read-Service-Port
-                     Service "Remote Port"
-                     Kubed-List-Context Kubed-List-Namespace))
-                 (L (Read-Number (Format "Local Port (Remote=%D): " R) R)))
-                (Kubed-Ext-Forward-Port "Services" Service L R
-                                        Kubed-List-Context Kubed-List-Namespace))
-          (User-Error "No Kubernetes Service At Point")))
+(defun kubed-ext--format-port-candidate (port-num name protocol)
+  "Format a port completion candidate with PORT-NUM, NAME, and PROTOCOL."
+  (format "%d%s%s" port-num
+          (if (or (null name) (string-empty-p name)) ""
+            (format " (%s)" name))
+          (if (or (null protocol) (string= protocol "TCP")) ""
+            (format " [%s]" protocol))))
 
-(Defun Kubed-Ext-Forward-Port-To-Deployment
-  (Deployment Local-Port Remote-Port Context Namespace)
-  "Forward Local-Port To Remote-Port Of Deployment In Context/Namespace."
-  (Interactive
-   (Let* ((C (Kubed-Local-Context))
-          (C (If (Equal Current-Prefix-Arg '(16))
-                 (Kubed-Read-Context "Context" C) C))
-          (N (Kubed--Namespace C Current-Prefix-Arg))
-          (D (Kubed-Read-Deployment "Forward Port To Deployment" Nil Nil C N))
-          (R (Kubed-Ext-Read-Resource-Port "Deployments" D "Remote Port" C N))
-          (L (Read-Number (Format "Local Port (Remote=%D): " R) R)))
-         (List D L R C N)))
-  (Kubed-Ext-Forward-Port "Deployments" Deployment Local-Port Remote-Port
-                          Context Namespace))
+(defun kubed-ext-read-resource-port (type name prompt &optional context namespace)
+  "Read port from container ports of TYPE/NAME with PROMPT in CONTEXT/NAMESPACE."
+  (let* ((ports (kubed-ext-resource-container-ports
+                 type name context namespace))
+         (candidates
+          (mapcar (lambda (p)
+                    (kubed-ext--format-port-candidate
+                     (nth 0 p) (nth 1 p) (nth 2 p)))
+                  ports)))
+    (string-to-number
+     (if candidates
+         (completing-read (format-prompt prompt nil) candidates nil nil)
+       (read-string (format-prompt prompt nil))))))
 
-(Defun Kubed-Ext-Deployments-Forward-Port (Click)
-  "Forward Local Port To Kubernetes Deployment At Click Position."
-  (Interactive (List Last-Nonmenu-Event) Kubed-Deployments-Mode)
-  (If-Let ((Deployment (Kubed-Ext--Resource-At-Event Click)))
-          (Let* ((R (Kubed-Ext-Read-Resource-Port
-                     "Deployments" Deployment "Remote Port"
-                     Kubed-List-Context Kubed-List-Namespace))
-                 (L (Read-Number (Format "Local Port (Remote=%D): " R) R)))
-                (Kubed-Ext-Forward-Port "Deployments" Deployment L R
-                                        Kubed-List-Context Kubed-List-Namespace))
-          (User-Error "No Kubernetes Deployment At Point")))
+(defun kubed-ext-read-service-port (service prompt &optional context namespace)
+  "Read port from SERVICE ports with PROMPT in CONTEXT and NAMESPACE."
+  (let* ((ports (kubed-ext-service-ports service context namespace))
+         (candidates
+          (mapcar (lambda (p)
+                    (kubed-ext--format-port-candidate
+                     (nth 0 p) (nth 2 p) (nth 3 p)))
+                  ports)))
+    (string-to-number
+     (if candidates
+         (completing-read (format-prompt prompt nil) candidates nil nil)
+       (read-string (format-prompt prompt nil))))))
+
+(defun kubed-ext-forward-port (type name local-port remote-port context namespace)
+  "Forward LOCAL-PORT to REMOTE-PORT of TYPE/NAME in CONTEXT/NAMESPACE."
+  (let ((res-spec (pcase type
+                    ((or "pod" "pods") name)
+                    ((or "service" "services") (concat "svc/" name))
+                    (_ (concat (replace-regexp-in-string "s\'" "" type)
+                               "/" name))))
+        (desc (format "%s/%s %d:%d in %s[%s]"
+                      type name local-port remote-port
+                      (or namespace "default") (or context "current"))))
+    (message "Forwarding localhost:%d -> %s:%d..."
+             local-port res-spec remote-port)
+    (push (cons desc
+                (apply #'start-process
+                       "*kubed-port-forward*" nil
+                       kubed-kubectl-program "port-forward"
+                       res-spec (format "%d:%d" local-port remote-port)
+                       (append
+                        (when namespace (list "-n" namespace))
+                        (when context (list "--context" context)))))
+          kubed-port-forward-process-alist)
+    (kubed-ext-refresh-pf-markers-in-visible-buffers)))
+
+(defun kubed-ext-forward-port-to-pod
+    (pod local-port remote-port context namespace)
+  "Forward LOCAL-PORT to REMOTE-PORT of pod POD in CONTEXT/NAMESPACE."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg))
+          (p (kubed-read-pod "Forward port to pod" nil nil c n))
+          (r (kubed-ext-read-resource-port "pods" p "Remote port" c n))
+          (l (read-number (format "Local port (remote=%d): " r) r)))
+     (list p l r c n)))
+  (kubed-ext-forward-port "pods" pod local-port remote-port context namespace))
+
+(defun kubed-ext-pods-forward-port (click)
+  "Forward local network port to remote port of pod at CLICK position."
+  (interactive (list last-nonmenu-event) kubed-pods-mode)
+  (if-let ((pod (kubed-ext--resource-at-event click)))
+      (let* ((r (kubed-ext-read-resource-port
+                 "pods" pod "Remote port"
+                 kubed-list-context kubed-list-namespace))
+             (l (read-number (format "Local port (remote=%d): " r) r)))
+        (kubed-ext-forward-port "pods" pod l r
+                                kubed-list-context kubed-list-namespace))
+    (user-error "No Kubernetes pod at point")))
+
+(defun kubed-ext-forward-port-to-service
+    (service local-port remote-port context namespace)
+  "Forward LOCAL-PORT to REMOTE-PORT of service SERVICE in CONTEXT/NAMESPACE."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg))
+          (s (kubed-read-service "Forward port to service" nil nil c n))
+          (r (kubed-ext-read-service-port s "Remote port" c n))
+          (l (read-number (format "Local port (remote=%d): " r) r)))
+     (list s l r c n)))
+  (kubed-ext-forward-port "services" service local-port remote-port
+                          context namespace))
+
+(defun kubed-ext-services-forward-port (click)
+  "Forward local port to Kubernetes service at CLICK position."
+  (interactive (list last-nonmenu-event) kubed-services-mode)
+  (if-let ((service (kubed-ext--resource-at-event click)))
+      (let* ((r (kubed-ext-read-service-port
+                 service "Remote port"
+                 kubed-list-context kubed-list-namespace))
+             (l (read-number (format "Local port (remote=%d): " r) r)))
+        (kubed-ext-forward-port "services" service l r
+                                kubed-list-context kubed-list-namespace))
+    (user-error "No Kubernetes service at point")))
+
+(defun kubed-ext-forward-port-to-deployment
+    (deployment local-port remote-port context namespace)
+  "Forward LOCAL-PORT to REMOTE-PORT of DEPLOYMENT in CONTEXT/NAMESPACE."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg))
+          (d (kubed-read-deployment "Forward port to deployment" nil nil c n))
+          (r (kubed-ext-read-resource-port "deployments" d "Remote port" c n))
+          (l (read-number (format "Local port (remote=%d): " r) r)))
+     (list d l r c n)))
+  (kubed-ext-forward-port "deployments" deployment local-port remote-port
+                          context namespace))
+
+(defun kubed-ext-deployments-forward-port (click)
+  "Forward local port to Kubernetes deployment at CLICK position."
+  (interactive (list last-nonmenu-event) kubed-deployments-mode)
+  (if-let ((deployment (kubed-ext--resource-at-event click)))
+      (let* ((r (kubed-ext-read-resource-port
+                 "deployments" deployment "Remote port"
+                 kubed-list-context kubed-list-namespace))
+             (l (read-number (format "Local port (remote=%d): " r) r)))
+        (kubed-ext-forward-port "deployments" deployment l r
+                                kubed-list-context kubed-list-namespace))
+    (user-error "No Kubernetes deployment at point")))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 3.  Port-Forward Markers + Port-Forward List Buffer
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defface Kubed-Ext-Port-Forward-Face
-  '((((Background Dark))  :Background "#1a2a1a")
-    (((Background Light)) :Background "#E8f5e8"))
-  "Face For Resources With Active Port-Forwards.")
+(defface kubed-ext-port-forward-face
+  '((((background dark))  :background "#1a2a1a")
+    (((background light)) :background "#e8f5e8"))
+  "Face for resources with active port-forwards.")
 
-(Defun Kubed-Ext-Has-Port-Forward-P (Name Context Namespace)
-  "Return Non-Nil If Name Has Active Port-Forward In Namespace And Context."
-  (Seq-Some (Lambda (Pair)
-                    (And (Process-Live-P (Cdr Pair))
-                         (String-Match-P (Regexp-Quote Name) (Car Pair))
-                         (Or (Null Namespace)
-                             (String-Match-P (Regexp-Quote Namespace) (Car Pair)))
-                         (Or (Null Context)
-                             (String-Match-P (Regexp-Quote Context) (Car Pair)))))
-            Kubed-Port-Forward-Process-Alist))
+(defun kubed-ext-has-port-forward-p (name context namespace)
+  "Return non-nil if NAME has active port-forward in NAMESPACE and CONTEXT."
+  (seq-some (lambda (pair)
+              (and (process-live-p (cdr pair))
+                   (string-match-p (regexp-quote name) (car pair))
+                   (or (null namespace)
+                       (string-match-p (regexp-quote namespace) (car pair)))
+                   (or (null context)
+                       (string-match-p (regexp-quote context) (car pair)))))
+            kubed-port-forward-process-alist))
 
-(Defun Kubed-Ext-Mark-Port-Forwards (&Rest _)
-  "Highlight List Rows With Active Port-Forwards."
-  (When (Derived-Mode-P 'Kubed-List-Mode)
-        (Remove-Overlays (Point-Min) (Point-Max) 'Kubed-Pf T)
-        (When (Kubed-Port-Forward-Process-Alist)
-              (Save-Excursion
-               (Goto-Char (Point-Min))
-               (While (Not (Eobp))
-                      (When-Let ((Id (Tabulated-List-Get-Id)))
-                                (When (Kubed-Ext-Has-Port-Forward-P
-                                       Id Kubed-List-Context Kubed-List-Namespace)
-                                      (Let ((Ov (Make-Overlay (Line-Beginning-Position)
-                                                              (Line-End-Position))))
-                                           (Overlay-Put Ov 'Kubed-Pf T)
-                                           (Overlay-Put Ov 'Face 'Kubed-Ext-Port-Forward-Face)
-                                           (Overlay-Put Ov 'Help-Echo "Port-Forwarding Active"))))
-                      (Forward-Line))))))
+(defun kubed-ext-mark-port-forwards (&rest _)
+  "Highlight list rows with active port-forwards."
+  (when (derived-mode-p 'kubed-list-mode)
+    (remove-overlays (point-min) (point-max) 'kubed-pf t)
+    (when (kubed-port-forward-process-alist)
+      (save-excursion
+        (goto-char (point-min))
+        (while (not (eobp))
+          (when-let ((id (tabulated-list-get-id)))
+            (when (kubed-ext-has-port-forward-p
+                   id kubed-list-context kubed-list-namespace)
+              (let ((ov (make-overlay (line-beginning-position)
+                                      (line-end-position))))
+                (overlay-put ov 'kubed-pf t)
+                (overlay-put ov 'face 'kubed-ext-port-forward-face)
+                (overlay-put ov 'help-echo "Port-forwarding active"))))
+          (forward-line))))))
 
-(Advice-Add 'Kubed-List-Revert :After #'Kubed-Ext-Mark-Port-Forwards)
+(advice-add 'kubed-list-revert :after #'kubed-ext-mark-port-forwards)
 
-(Defun Kubed-Ext-Refresh-Pf-Markers-In-Visible-Buffers (&Rest _)
-  "Refresh Port-Forward Markers In All Visible Kubed List Buffers."
-  (Dolist (Win (Window-List))
-          (With-Current-Buffer (Window-Buffer Win)
-                               (When (Derived-Mode-P 'Kubed-List-Mode)
-                                     (Kubed-Ext-Mark-Port-Forwards)))))
+(defun kubed-ext-refresh-pf-markers-in-visible-buffers (&rest _)
+  "Refresh port-forward markers in all visible kubed list buffers."
+  (dolist (win (window-list))
+    (with-current-buffer (window-buffer win)
+      (when (derived-mode-p 'kubed-list-mode)
+        (kubed-ext-mark-port-forwards)))))
 
-(Advice-Add 'Kubed-Stop-Port-Forward :After
-            #'Kubed-Ext-Refresh-Pf-Markers-In-Visible-Buffers)
+(advice-add 'kubed-stop-port-forward :after
+            #'kubed-ext-refresh-pf-markers-in-visible-buffers)
 
-(Defun Kubed-Ext-Parse-Pf-Descriptor (Desc)
-  "Parse Port-Forward Descriptor Desc Into List.
-Desc Format: Type/Name Local:Remote In Namespace[Context]."
-  (If (String-Match
-       "$.+?$ $[0-9]+:[0-9]+$ In $.+?$$$$.+?$$$" Desc)
-      (List (Match-String 1 Desc) (Match-String 2 Desc)
-            (Match-String 3 Desc) (Match-String 4 Desc))
-      (List Desc "" "" "")))
+(defun kubed-ext-parse-pf-descriptor (desc)
+  "Parse port-forward descriptor DESC into list.
+DESC format: type/name local:remote in namespace[context]."
+  (if (string-match
+       "$.+?$ $[0-9]+:[0-9]+$ in $.+?$$$$.+?$$$" desc)
+      (list (match-string 1 desc) (match-string 2 desc)
+            (match-string 3 desc) (match-string 4 desc))
+    (list desc "" "" "")))
 
-(Defun Kubed-Ext-Port-Forward-Entries ()
-  "Return Entries For Port-Forward List Buffer."
-  (Mapcar (Lambda (Pair)
-                  (Let* ((Desc (Car Pair))
-                         (Parsed (Kubed-Ext-Parse-Pf-Descriptor Desc))
-                         (Status (If (Process-Live-P (Cdr Pair))
-                                     (Propertize "Active" 'Face 'Success)
-                                     (Propertize "Dead" 'Face 'Error))))
-                        (List Desc (Vector (Nth 0 Parsed) (Nth 1 Parsed)
-                                           (Nth 2 Parsed) (Nth 3 Parsed) Status))))
-          (Kubed-Port-Forward-Process-Alist)))
+(defun kubed-ext-port-forward-entries ()
+  "Return entries for port-forward list buffer."
+  (mapcar (lambda (pair)
+            (let* ((desc (car pair))
+                   (parsed (kubed-ext-parse-pf-descriptor desc))
+                   (status (if (process-live-p (cdr pair))
+                               (propertize "Active" 'face 'success)
+                             (propertize "Dead" 'face 'error))))
+              (list desc (vector (nth 0 parsed) (nth 1 parsed)
+                                 (nth 2 parsed) (nth 3 parsed) status))))
+          (kubed-port-forward-process-alist)))
 
-(Defun Kubed-Ext-Port-Forwards-Stop (Click)
-  "Stop Port-Forward At Click Position."
-  (Interactive (List Last-Nonmenu-Event) Kubed-Ext-Port-Forwards-Mode)
-  (If-Let ((Desc (Kubed-Ext--Resource-At-Event Click)))
-          (When (Y-Or-N-P (Format "Stop Port-Forward: %S?" Desc))
-                (Kubed-Stop-Port-Forward Desc)
-                (Tabulated-List-Print T))
-          (User-Error "No Port-Forward At Point")))
+(defun kubed-ext-port-forwards-stop (click)
+  "Stop port-forward at CLICK position."
+  (interactive (list last-nonmenu-event) kubed-ext-port-forwards-mode)
+  (if-let ((desc (kubed-ext--resource-at-event click)))
+      (when (y-or-n-p (format "Stop port-forward: %s?" desc))
+        (kubed-stop-port-forward desc)
+        (tabulated-list-print t))
+    (user-error "No port-forward at point")))
 
-(Defun Kubed-Ext-Port-Forwards-Stop-All ()
-  "Stop All Active Port-Forwards."
-  (Interactive Nil Kubed-Ext-Port-Forwards-Mode)
-  (When (Y-Or-N-P (Format "Stop All %D Port-Forwards?"
-                          (Length Kubed-Port-Forward-Process-Alist)))
-        (Dolist (Pair (Kubed-Port-Forward-Process-Alist))
-                (When (Process-Live-P (Cdr Pair))
-                      (Delete-Process (Cdr Pair))))
-        (Setq Kubed-Port-Forward-Process-Alist Nil)
-        (Tabulated-List-Print T)
-        (Kubed-Ext-Refresh-Pf-Markers-In-Visible-Buffers)
-        (Message "All Port-Forwards Stopped.")))
+(defun kubed-ext-port-forwards-stop-all ()
+  "Stop all active port-forwards."
+  (interactive nil kubed-ext-port-forwards-mode)
+  (when (y-or-n-p (format "Stop all %d port-forwards?"
+                          (length kubed-port-forward-process-alist)))
+    (dolist (pair (kubed-port-forward-process-alist))
+      (when (process-live-p (cdr pair))
+        (delete-process (cdr pair))))
+    (setq kubed-port-forward-process-alist nil)
+    (tabulated-list-print t)
+    (kubed-ext-refresh-pf-markers-in-visible-buffers)
+    (message "All port-forwards stopped.")))
 
-(Defun Kubed-Ext-Port-Forwards-Refresh ()
-  "Refresh Port-Forward List."
-  (Interactive Nil Kubed-Ext-Port-Forwards-Mode)
-  (Kubed-Port-Forward-Process-Alist)
-  (Tabulated-List-Print T))
+(defun kubed-ext-port-forwards-refresh ()
+  "Refresh port-forward list."
+  (interactive nil kubed-ext-port-forwards-mode)
+  (kubed-port-forward-process-alist)
+  (tabulated-list-print t))
 
-(Define-Derived-Mode Kubed-Ext-Port-Forwards-Mode Tabulated-List-Mode
-  "Kubed Pf"
-  "Major Mode For Listing Active Kubernetes Port-Forwards."
-  (Setq Tabulated-List-Format
-        [("Resource" 32 T) ("Ports" 14 T)
-         ("Namespace" 20 T) ("Context" 24 T) ("Status" 8 T)]
-        Tabulated-List-Padding 2
-        Tabulated-List-Entries #'Kubed-Ext-Port-Forward-Entries)
-  (Tabulated-List-Init-Header))
+(define-derived-mode kubed-ext-port-forwards-mode tabulated-list-mode
+  "Kubed PF"
+  "Major mode for listing active Kubernetes port-forwards."
+  (setq tabulated-list-format
+        [("Resource" 32 t) ("Ports" 14 t)
+         ("Namespace" 20 t) ("Context" 24 t) ("Status" 8 t)]
+        tabulated-list-padding 2
+        tabulated-list-entries #'kubed-ext-port-forward-entries)
+  (tabulated-list-init-header))
 
-(Keymap-Set Kubed-Ext-Port-Forwards-Mode-Map "D"
-            #'Kubed-Ext-Port-Forwards-Stop)
-(Keymap-Set Kubed-Ext-Port-Forwards-Mode-Map "K"
-            #'Kubed-Ext-Port-Forwards-Stop-All)
-(Keymap-Set Kubed-Ext-Port-Forwards-Mode-Map "G"
-            #'Kubed-Ext-Port-Forwards-Refresh)
-(Keymap-Set Kubed-Ext-Port-Forwards-Mode-Map "Q" #'Quit-Window)
+(keymap-set kubed-ext-port-forwards-mode-map "D"
+            #'kubed-ext-port-forwards-stop)
+(keymap-set kubed-ext-port-forwards-mode-map "K"
+            #'kubed-ext-port-forwards-stop-all)
+(keymap-set kubed-ext-port-forwards-mode-map "g"
+            #'kubed-ext-port-forwards-refresh)
+(keymap-set kubed-ext-port-forwards-mode-map "q" #'quit-window)
 
-(Defun Kubed-Ext-List-Port-Forwards ()
-  "Display Buffer Listing All Active Port-Forwards."
-  (Interactive)
-  (Let ((Buf (Get-Buffer-Create "*Kubed Port Forwards*")))
-       (With-Current-Buffer Buf
-                            (Kubed-Ext-Port-Forwards-Mode)
-                            (Tabulated-List-Print T))
-       (Switch-To-Buffer Buf)))
+(defun kubed-ext-list-port-forwards ()
+  "Display buffer listing all active port-forwards."
+  (interactive)
+  (let ((buf (get-buffer-create "*Kubed Port Forwards*")))
+    (with-current-buffer buf
+      (kubed-ext-port-forwards-mode)
+      (tabulated-list-print t))
+    (switch-to-buffer buf)))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 3a.  Error Overlay Header
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defun Kubed-Ext--Set-Header-Error (Msg)
-  "Set Error Msg As An Overlay At The Top Of The Current Buffer."
-  (Kubed-Ext--Clear-Header-Error)
-  (When (And Msg (Not (String-Empty-P (String-Trim Msg))))
-        (Setq Kubed-Ext--Header-Error (String-Trim Msg))
-        (When (> (Buffer-Size) 0)
-              (Let ((Ov (Make-Overlay (Point-Min) (Point-Min))))
-                   (Overlay-Put Ov 'Before-String
-                                (Propertize
-                                 (Format "⚠ %S  [Type `$' For Process Buffer]\N"
-                                         Kubed-Ext--Header-Error)
-                                 'Face 'Error))
-                   (Overlay-Put Ov 'Kubed-Ext-Error T)
-                   (Overlay-Put Ov 'Priority 100)
-                   (Setq Kubed-Ext--Error-Overlay Ov)))))
+(defun kubed-ext--set-header-error (msg)
+  "Set error MSG as an overlay at the top of the current buffer."
+  (kubed-ext--clear-header-error)
+  (when (and msg (not (string-empty-p (string-trim msg))))
+    (setq kubed-ext--header-error (string-trim msg))
+    (when (> (buffer-size) 0)
+      (let ((ov (make-overlay (point-min) (point-min))))
+        (overlay-put ov 'before-string
+                     (propertize
+                      (format "⚠ %s  [Type `$' for process buffer]\n"
+                              kubed-ext--header-error)
+                      'face 'error))
+        (overlay-put ov 'kubed-ext-error t)
+        (overlay-put ov 'priority 100)
+        (setq kubed-ext--error-overlay ov)))))
 
-(Defun Kubed-Ext--Clear-Header-Error ()
-  "Clear Any Error Overlay From The Current Buffer."
-  (When Kubed-Ext--Error-Overlay
-        (Delete-Overlay Kubed-Ext--Error-Overlay)
-        (Setq Kubed-Ext--Error-Overlay Nil))
-  (Setq Kubed-Ext--Header-Error Nil))
+(defun kubed-ext--clear-header-error ()
+  "Clear any error overlay from the current buffer."
+  (when kubed-ext--error-overlay
+    (delete-overlay kubed-ext--error-overlay)
+    (setq kubed-ext--error-overlay nil))
+  (setq kubed-ext--header-error nil))
 
-(Defun Kubed-Ext--Reapply-Overlays (&Rest _)
-  "Re-Apply Error Overlay And Filter Highlight After Buffer Revert."
-  (When (Derived-Mode-P 'Kubed-List-Mode)
-        (When Kubed-Ext--Header-Error
-              (Let ((Msg Kubed-Ext--Header-Error))
-                   (Setq Kubed-Ext--Error-Overlay Nil)
-                   (Kubed-Ext--Set-Header-Error Msg)))
-        (Kubed-Ext--Apply-Filter-Highlights)))
+(defun kubed-ext--reapply-overlays (&rest _)
+  "Re-apply error overlay and filter highlight after buffer revert."
+  (when (derived-mode-p 'kubed-list-mode)
+    (when kubed-ext--header-error
+      (let ((msg kubed-ext--header-error))
+        (setq kubed-ext--error-overlay nil)
+        (kubed-ext--set-header-error msg)))
+    (kubed-ext--apply-filter-highlights)))
 
-(Advice-Add 'Kubed-List-Revert :After #'Kubed-Ext--Reapply-Overlays)
+(advice-add 'kubed-list-revert :after #'kubed-ext--reapply-overlays)
 
-(Defun Kubed-Ext--Update-Error-Advice (Orig-Fn Type Context &Optional Namespace)
-  "Around Advice For `Kubed-Update' To Capture Errors As Header Overlays.
-Orig-Fn Is The Original Function, Type Context Namespace Are Its Args."
-  (Funcall Orig-Fn Type Context Namespace)
-  ;; Wrap The Sentinel Of The Process That Was Just Created.
-  (When-Let ((Proc (Alist-Get 'Process
-                              (Kubed--Alist Type Context Namespace))))
-            (When (Process-Live-P Proc)
-                  (Let ((Orig-Sentinel (Process-Sentinel Proc))
-                        (Err-Buf-Name (Format " *Kubed-Get-%S-Stderr*" Type)))
-                       (Set-Process-Sentinel
-                        Proc
-                        (Lambda (P Status)
-                                (Funcall Orig-Sentinel P Status)
-                                (Dolist (Buf (Buffer-List))
-                                        (When (Buffer-Live-P Buf)
-                                              (With-Current-Buffer Buf
-                                                                   (When (And (Derived-Mode-P 'Kubed-List-Mode)
-                                                                              (Equal Kubed-List-Type Type)
-                                                                              (Equal Kubed-List-Context Context)
-                                                                              (Equal Kubed-List-Namespace Namespace))
-                                                                         (If (String= Status "Exited Abnormally With Code 1\N")
-                                                                             (Let ((Err-Buf (Get-Buffer Err-Buf-Name)))
-                                                                                  (Kubed-Ext--Set-Header-Error
-                                                                                   (If (And Err-Buf (Buffer-Live-P Err-Buf))
-                                                                                       (With-Current-Buffer Err-Buf
-                                                                                                            (String-Trim (Buffer-String)))
-                                                                                       "Kubectl Command Failed")))
-                                                                             (Kubed-Ext--Clear-Header-Error))))))))))))
+(defun kubed-ext--update-error-advice (orig-fn type context &optional namespace)
+  "Around advice for `kubed-update' to capture errors as header overlays.
+ORIG-FN is the original function, TYPE CONTEXT NAMESPACE are its args."
+  (funcall orig-fn type context namespace)
+  ;; Wrap the sentinel of the process that was just created.
+  (when-let ((proc (alist-get 'process
+                              (kubed--alist type context namespace))))
+    (when (process-live-p proc)
+      (let ((orig-sentinel (process-sentinel proc))
+            (err-buf-name (format " *kubed-get-%s-stderr*" type)))
+        (set-process-sentinel
+         proc
+         (lambda (p status)
+           (funcall orig-sentinel p status)
+           (dolist (buf (buffer-list))
+             (when (buffer-live-p buf)
+               (with-current-buffer buf
+                 (when (and (derived-mode-p 'kubed-list-mode)
+                            (equal kubed-list-type type)
+                            (equal kubed-list-context context)
+                            (equal kubed-list-namespace namespace))
+                   (if (string= status "exited abnormally with code 1\n")
+                       (let ((err-buf (get-buffer err-buf-name)))
+                         (kubed-ext--set-header-error
+                          (if (and err-buf (buffer-live-p err-buf))
+                              (with-current-buffer err-buf
+                                (string-trim (buffer-string)))
+                            "kubectl command failed")))
+                     (kubed-ext--clear-header-error))))))))))))
 
-(Advice-Add 'Kubed-Update :Around #'Kubed-Ext--Update-Error-Advice)
+(advice-add 'kubed-update :around #'kubed-ext--update-error-advice)
 
 ;;; ═══════════════════════════════════════════════════════════════
-;;; § 3b.  Mark / Unmark System (Kubel-Style)
+;;; § 3b.  Mark / Unmark System (kubel-style)
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defun Kubed-Ext-Marked-Items ()
-  "Return List Of Resource Ids Marked With `*' In Current Buffer."
-  (Let (Items)
-       (Save-Excursion
-        (Goto-Char (Point-Min))
-        (While (Not (Eobp))
-               (When (Eq (Char-After) ?*)
-                     (When-Let ((Id (Tabulated-List-Get-Id)))
-                               (Push Id Items)))
-               (Forward-Line)))
-       (Nreverse Items)))
+(defun kubed-ext-marked-items ()
+  "Return list of resource IDs marked with `*' in current buffer."
+  (let (items)
+    (save-excursion
+      (goto-char (point-min))
+      (while (not (eobp))
+        (when (eq (char-after) ?*)
+          (when-let ((id (tabulated-list-get-id)))
+            (push id items)))
+        (forward-line)))
+    (nreverse items)))
 
-(Defun Kubed-Ext-Mark-Item ()
-  "Mark The Resource At Point With `*'."
-  (Interactive Nil Kubed-List-Mode)
-  (Tabulated-List-Put-Tag
-   (Propertize "*" 'Face 'Dired-Marked 'Help-Echo "Selected") T))
+(defun kubed-ext-mark-item ()
+  "Mark the resource at point with `*'."
+  (interactive nil kubed-list-mode)
+  (tabulated-list-put-tag
+   (propertize "*" 'face 'dired-marked 'help-echo "Selected") t))
 
-(Defun Kubed-Ext-Unmark-Item ()
-  "Unmark The Resource At Point."
-  (Interactive Nil Kubed-List-Mode)
-  (Tabulated-List-Put-Tag " " T))
+(defun kubed-ext-unmark-item ()
+  "Unmark the resource at point."
+  (interactive nil kubed-list-mode)
+  (tabulated-list-put-tag " " t))
 
-(Defun Kubed-Ext-Mark-All ()
-  "Mark All Visible Resources In The Current Buffer."
-  (Interactive Nil Kubed-List-Mode)
-  (Save-Excursion
-   (Goto-Char (Point-Min))
-   (While (Not (Eobp))
-          (When (Tabulated-List-Get-Id)
-                (Tabulated-List-Put-Tag
-                 (Propertize "*" 'Face 'Dired-Marked)))
-          (Forward-Line)))
-  (Message "Marked All Items."))
+(defun kubed-ext-mark-all ()
+  "Mark all visible resources in the current buffer."
+  (interactive nil kubed-list-mode)
+  (save-excursion
+    (goto-char (point-min))
+    (while (not (eobp))
+      (when (tabulated-list-get-id)
+        (tabulated-list-put-tag
+         (propertize "*" 'face 'dired-marked)))
+      (forward-line)))
+  (message "Marked all items."))
 
-(Defun Kubed-Ext-Unmark-All ()
-  "Unmark All Resources In The Current Buffer."
-  (Interactive Nil Kubed-List-Mode)
-  (Save-Excursion
-   (Goto-Char (Point-Min))
-   (While (Not (Eobp))
-          (When (Memq (Char-After) '(?* ?D))
-                (Tabulated-List-Put-Tag " "))
-          (Forward-Line)))
-  (Message "Unmarked All Items."))
+(defun kubed-ext-unmark-all ()
+  "Unmark all resources in the current buffer."
+  (interactive nil kubed-list-mode)
+  (save-excursion
+    (goto-char (point-min))
+    (while (not (eobp))
+      (when (memq (char-after) '(?* ?D))
+        (tabulated-list-put-tag " "))
+      (forward-line)))
+  (message "Unmarked all items."))
 
 ;;; ── Mark Persistence Across Refreshes ──────────────────────────────
 
-(Defvar-Local Kubed-Ext--Persisted-Mark-Ids Nil
-  "List Of Resource Ids That Were Marked Before The Last Buffer Refresh.
-Populated By `Kubed-Ext--Persist-Marks-Before-Revert' Immediately
-Before `Kubed-List-Revert' Wipes The Buffer, And Consumed By
-`Kubed-Ext--Restore-Persisted-Marks' After The Reprint Completes.
-Declared Permanent-Local So It Survives `Kill-All-Local-Variables'.")
+(defvar-local kubed-ext--persisted-mark-ids nil
+  "List of resource IDs that were marked before the last buffer refresh.
+Populated by `kubed-ext--persist-marks-before-revert' immediately
+before `kubed-list-revert' wipes the buffer, and consumed by
+`kubed-ext--restore-persisted-marks' after the reprint completes.
+Declared permanent-local so it survives `kill-all-local-variables'.")
 
-(Put 'Kubed-Ext--Persisted-Mark-Ids 'Permanent-Local T)
+(put 'kubed-ext--persisted-mark-ids 'permanent-local t)
 
-(Defun Kubed-Ext--Persist-Marks-Before-Revert (&Rest _)
-  "Save The Ids Of All Marked Rows Before `Kubed-List-Revert' Wipes Them.
-Installed As `:Before' Advice On `Kubed-List-Revert'."
-  (When (Derived-Mode-P 'Kubed-List-Mode)
-        (Setq Kubed-Ext--Persisted-Mark-Ids (Kubed-Ext-Marked-Items))))
+(defun kubed-ext--persist-marks-before-revert (&rest _)
+  "Save the IDs of all marked rows before `kubed-list-revert' wipes them.
+Installed as `:before' advice on `kubed-list-revert'."
+  (when (derived-mode-p 'kubed-list-mode)
+    (setq kubed-ext--persisted-mark-ids (kubed-ext-marked-items))))
 
-(Defun Kubed-Ext--Restore-Persisted-Marks (&Rest _)
-  "Re-Mark Any Rows Whose Ids Were Saved Before The Last Refresh.
-Installed As `:After' Advice On `Kubed-List-Revert'.
-Walks Every Visible Row; Any Whose Tabulated-List Id Appears In
-`Kubed-Ext--Persisted-Mark-Ids' Gets A Fresh `*' Tag With The
-Correct Face.  Rows That No Longer Exist After The Refresh Are
-Silently Skipped."
-  (When (And (Derived-Mode-P 'Kubed-List-Mode)
-             Kubed-Ext--Persisted-Mark-Ids)
-        (Let ((Ids Kubed-Ext--Persisted-Mark-Ids))
-             (Save-Excursion
-              (Goto-Char (Point-Min))
-              (While (Not (Eobp))
-                     (When-Let ((Id (Tabulated-List-Get-Id)))
-                               (When (Member Id Ids)
-                                     (Tabulated-List-Put-Tag
-                                      (Propertize "*"
-                                                  'Face       'Dired-Marked
-                                                  'Help-Echo  "Selected"))))
-                     (Forward-Line))))))
+(defun kubed-ext--restore-persisted-marks (&rest _)
+  "Re-mark any rows whose IDs were saved before the last refresh.
+Installed as `:after' advice on `kubed-list-revert'.
+Walks every visible row; any whose tabulated-list ID appears in
+`kubed-ext--persisted-mark-ids' gets a fresh `*' tag with the
+correct face.  Rows that no longer exist after the refresh are
+silently skipped."
+  (when (and (derived-mode-p 'kubed-list-mode)
+             kubed-ext--persisted-mark-ids)
+    (let ((ids kubed-ext--persisted-mark-ids))
+      (save-excursion
+        (goto-char (point-min))
+        (while (not (eobp))
+          (when-let ((id (tabulated-list-get-id)))
+            (when (member id ids)
+              (tabulated-list-put-tag
+               (propertize "*"
+                           'face       'dired-marked
+                           'help-echo  "Selected"))))
+          (forward-line))))))
 
-(Advice-Add 'Kubed-List-Revert :Before
-            #'Kubed-Ext--Persist-Marks-Before-Revert)
-(Advice-Add 'Kubed-List-Revert :After
-            #'Kubed-Ext--Restore-Persisted-Marks)
+(advice-add 'kubed-list-revert :before
+            #'kubed-ext--persist-marks-before-revert)
+(advice-add 'kubed-list-revert :after
+            #'kubed-ext--restore-persisted-marks)
 
 ;;; ═══════════════════════════════════════════════════════════════
-;;; § 3c.  Substring Filter With Highlight (Kubel-Style)
+;;; § 3c.  Substring Filter with Highlight (kubel-style)
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defun Kubed-Ext--Apply-Filter-Highlights ()
-  "Apply Filter Highlighting To Current Buffer.
-Matching Rows Stay Normal; Non-Matching Rows Get `Shadow' Face."
-  (When (Derived-Mode-P 'Kubed-List-Mode)
-        (Remove-Overlays (Point-Min) (Point-Max) 'Kubed-Ext-Filter T)
-        (When (And (Bound-And-True-P Kubed-Ext-Resource-Filter)
-                   (Not (String-Empty-P Kubed-Ext-Resource-Filter)))
-              (Save-Excursion
-               (Goto-Char (Point-Min))
-               (While (Not (Eobp))
-                      (When-Let ((Entry (Tabulated-List-Get-Entry)))
-                                (Let ((Line-Text (Mapconcat #'Identity
-                                                            (Append Entry Nil) " ")))
-                                     (Unless (String-Match-P Kubed-Ext-Resource-Filter Line-Text)
-                                             (Let ((Ov (Make-Overlay (Line-Beginning-Position)
-                                                                     (Line-End-Position))))
-                                                  (Overlay-Put Ov 'Kubed-Ext-Filter T)
-                                                  (Overlay-Put Ov 'Face 'Shadow)))))
-                      (Forward-Line))))))
+(defun kubed-ext--apply-filter-highlights ()
+  "Apply filter highlighting to current buffer.
+Matching rows stay normal; non-matching rows get `shadow' face."
+  (when (derived-mode-p 'kubed-list-mode)
+    (remove-overlays (point-min) (point-max) 'kubed-ext-filter t)
+    (when (and (bound-and-true-p kubed-ext-resource-filter)
+               (not (string-empty-p kubed-ext-resource-filter)))
+      (save-excursion
+        (goto-char (point-min))
+        (while (not (eobp))
+          (when-let ((entry (tabulated-list-get-entry)))
+            (let ((line-text (mapconcat #'identity
+                                        (append entry nil) " ")))
+              (unless (string-match-p kubed-ext-resource-filter line-text)
+                (let ((ov (make-overlay (line-beginning-position)
+                                        (line-end-position))))
+                  (overlay-put ov 'kubed-ext-filter t)
+                  (overlay-put ov 'face 'shadow)))))
+          (forward-line))))))
 
-(Defun Kubed-Ext-Set-Filter (Filter)
-  "Set Substring Filter For Highlighting Resources.
-Empty String Clears The Filter."
-  (Interactive
-   (List (Read-String (Format-Prompt "Filter" "Clear")
-                      Kubed-Ext-Resource-Filter))
-   Kubed-List-Mode)
-  (Setq-Local Kubed-Ext-Resource-Filter (Or Filter ""))
-  (Kubed-Ext--Apply-Filter-Highlights)
-  (Force-Mode-Line-Update)
-  (If (String-Empty-P Kubed-Ext-Resource-Filter)
-      (Message "Filter Cleared.")
-      (Message "Filter: %S" Kubed-Ext-Resource-Filter)))
+(defun kubed-ext-set-filter (filter)
+  "Set substring FILTER for highlighting resources.
+Empty string clears the filter."
+  (interactive
+   (list (read-string (format-prompt "Filter" "clear")
+                      kubed-ext-resource-filter))
+   kubed-list-mode)
+  (setq-local kubed-ext-resource-filter (or filter ""))
+  (kubed-ext--apply-filter-highlights)
+  (force-mode-line-update)
+  (if (string-empty-p kubed-ext-resource-filter)
+      (message "Filter cleared.")
+    (message "Filter: %s" kubed-ext-resource-filter)))
 
-(Defun Kubed-Ext-Jump-To-Next-Highlight ()
-  "Jump To The Next Resource Matching `Kubed-Ext-Resource-Filter'."
-  (Interactive Nil Kubed-List-Mode)
-  (Unless (And Kubed-Ext-Resource-Filter
-               (Not (String-Empty-P Kubed-Ext-Resource-Filter)))
-          (User-Error "No Filter Set (Use `F' To Set One)"))
-  (Let ((Found Nil) (Start (Point)))
-       (End-Of-Line)
-       (While (And (Not Found) (Not (Eobp)))
-              (Forward-Line)
-              (When-Let ((Entry (Tabulated-List-Get-Entry)))
-                        (Let ((Text (Mapconcat #'Identity (Append Entry Nil) " ")))
-                             (When (String-Match-P Kubed-Ext-Resource-Filter Text)
-                                   (Setq Found T)))))
-       (Unless Found
-               (Goto-Char (Point-Min))
-               (While (And (Not Found) (< (Point) Start))
-                      (When-Let ((Entry (Tabulated-List-Get-Entry)))
-                                (Let ((Text (Mapconcat #'Identity (Append Entry Nil) " ")))
-                                     (When (String-Match-P Kubed-Ext-Resource-Filter Text)
-                                           (Setq Found T))))
-                      (Unless Found (Forward-Line))))
-       (If Found
-           (Beginning-Of-Line)
-           (Goto-Char Start)
-           (Message "No Match For `%S'" Kubed-Ext-Resource-Filter))))
+(defun kubed-ext-jump-to-next-highlight ()
+  "Jump to the next resource matching `kubed-ext-resource-filter'."
+  (interactive nil kubed-list-mode)
+  (unless (and kubed-ext-resource-filter
+               (not (string-empty-p kubed-ext-resource-filter)))
+    (user-error "No filter set (use `f' to set one)"))
+  (let ((found nil) (start (point)))
+    (end-of-line)
+    (while (and (not found) (not (eobp)))
+      (forward-line)
+      (when-let ((entry (tabulated-list-get-entry)))
+        (let ((text (mapconcat #'identity (append entry nil) " ")))
+          (when (string-match-p kubed-ext-resource-filter text)
+            (setq found t)))))
+    (unless found
+      (goto-char (point-min))
+      (while (and (not found) (< (point) start))
+        (when-let ((entry (tabulated-list-get-entry)))
+          (let ((text (mapconcat #'identity (append entry nil) " ")))
+            (when (string-match-p kubed-ext-resource-filter text)
+              (setq found t))))
+        (unless found (forward-line))))
+    (if found
+        (beginning-of-line)
+      (goto-char start)
+      (message "No match for `%s'" kubed-ext-resource-filter))))
 
-(Defun Kubed-Ext-Jump-To-Previous-Highlight ()
-  "Jump To The Previous Resource Matching `Kubed-Ext-Resource-Filter'."
-  (Interactive Nil Kubed-List-Mode)
-  (Unless (And Kubed-Ext-Resource-Filter
-               (Not (String-Empty-P Kubed-Ext-Resource-Filter)))
-          (User-Error "No Filter Set (Use `F' To Set One)"))
-  (Let ((Found Nil) (Start (Point)))
-       (Beginning-Of-Line)
-       (While (And (Not Found) (Not (Bobp)))
-              (Forward-Line -1)
-              (When-Let ((Entry (Tabulated-List-Get-Entry)))
-                        (Let ((Text (Mapconcat #'Identity (Append Entry Nil) " ")))
-                             (When (String-Match-P Kubed-Ext-Resource-Filter Text)
-                                   (Setq Found T)))))
-       (Unless Found
-               (Goto-Char (Point-Max))
-               (While (And (Not Found) (> (Point) Start))
-                      (Forward-Line -1)
-                      (When-Let ((Entry (Tabulated-List-Get-Entry)))
-                                (Let ((Text (Mapconcat #'Identity (Append Entry Nil) " ")))
-                                     (When (String-Match-P Kubed-Ext-Resource-Filter Text)
-                                           (Setq Found T))))))
-       (If Found
-           (Beginning-Of-Line)
-           (Goto-Char Start)
-           (Message "No Match For `%S'" Kubed-Ext-Resource-Filter))))
+(defun kubed-ext-jump-to-previous-highlight ()
+  "Jump to the previous resource matching `kubed-ext-resource-filter'."
+  (interactive nil kubed-list-mode)
+  (unless (and kubed-ext-resource-filter
+               (not (string-empty-p kubed-ext-resource-filter)))
+    (user-error "No filter set (use `f' to set one)"))
+  (let ((found nil) (start (point)))
+    (beginning-of-line)
+    (while (and (not found) (not (bobp)))
+      (forward-line -1)
+      (when-let ((entry (tabulated-list-get-entry)))
+        (let ((text (mapconcat #'identity (append entry nil) " ")))
+          (when (string-match-p kubed-ext-resource-filter text)
+            (setq found t)))))
+    (unless found
+      (goto-char (point-max))
+      (while (and (not found) (> (point) start))
+        (forward-line -1)
+        (when-let ((entry (tabulated-list-get-entry)))
+          (let ((text (mapconcat #'identity (append entry nil) " ")))
+            (when (string-match-p kubed-ext-resource-filter text)
+              (setq found t))))))
+    (if found
+        (beginning-of-line)
+      (goto-char start)
+      (message "No match for `%s'" kubed-ext-resource-filter))))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 3d.  Wide View + Output Format Toggle
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defun Kubed-Ext--Parse-Kubectl-Table (Text)
-  "Parse Text From Kubectl Output Into (Headers . Rows).
-Headers Is A List Of Strings, Rows Is A List Of Lists Of Strings."
-  (Let* ((Lines (Split-String Text "\N" T))
-         (Header-Line (Car Lines))
-         (Data-Lines (Cdr Lines))
-         (Starts Nil)
-         (Pos 0))
-        (Push 0 Starts)
-        (While (String-Match "\\S-+$\\S-+$\\S-" Header-Line Pos)
-               (Let ((Gap-End (Match-End 1)))
-                    (Push Gap-End Starts)
-                    (Setq Pos Gap-End)))
-        (Setq Starts (Nreverse Starts))
-        (Let* ((Parse-Line
-                (Lambda (Line)
-                        (Let ((Cols Nil)
-                              (Offsets Starts))
-                             (While Offsets
-                                    (Let* ((Beg (Car Offsets))
-                                           (End (If (Cdr Offsets) (Cadr Offsets) (Length Line)))
-                                           (End (Min End (Length Line)))
-                                           (Str (If (>= Beg (Length Line)) ""
-                                                    (String-Trim
-                                                     (Substring Line Beg End)))))
-                                          (Push Str Cols))
-                                    (Setq Offsets (Cdr Offsets)))
-                             (Nreverse Cols))))
-               (Headers (Funcall Parse-Line Header-Line))
-               (Rows (Delq Nil
-                           (Mapcar (Lambda (Line)
-                                           (When (Not (String-Empty-P
-                                                       (String-Trim Line)))
-                                                 (Funcall Parse-Line Line)))
-                                   Data-Lines))))
-              (Cons Headers Rows))))
+(defun kubed-ext--parse-kubectl-table (text)
+  "Parse TEXT from kubectl output into (HEADERS . ROWS).
+HEADERS is a list of strings, ROWS is a list of lists of strings."
+  (let* ((lines (split-string text "\n" t))
+         (header-line (car lines))
+         (data-lines (cdr lines))
+         (starts nil)
+         (pos 0))
+    (push 0 starts)
+    (while (string-match "\\S-+$\\s-+$\\S-" header-line pos)
+      (let ((gap-end (match-end 1)))
+        (push gap-end starts)
+        (setq pos gap-end)))
+    (setq starts (nreverse starts))
+    (let* ((parse-line
+            (lambda (line)
+              (let ((cols nil)
+                    (offsets starts))
+                (while offsets
+                  (let* ((beg (car offsets))
+                         (end (if (cdr offsets) (cadr offsets) (length line)))
+                         (end (min end (length line)))
+                         (str (if (>= beg (length line)) ""
+                                (string-trim
+                                 (substring line beg end)))))
+                    (push str cols))
+                  (setq offsets (cdr offsets)))
+                (nreverse cols))))
+           (headers (funcall parse-line header-line))
+           (rows (delq nil
+                       (mapcar (lambda (line)
+                                 (when (not (string-empty-p
+                                             (string-trim line)))
+                                   (funcall parse-line line)))
+                               data-lines))))
+      (cons headers rows))))
 
-(Defvar-Local Kubed-Ext-Wide--Type      Nil "Resource Type Shown In This Wide View Buffer.")
-(Defvar-Local Kubed-Ext-Wide--Context   Nil "`Kubectl' Context Used In This Wide View Buffer.")
-(Defvar-Local Kubed-Ext-Wide--Namespace Nil "Namespace Used In This Wide View Buffer.")
-(Defvar-Local Kubed-Ext-Wide--Name Nil "Resource Name Shown In This Wide View Buffer, Or Nil For All.")
+(defvar-local kubed-ext-wide--type      nil "Resource type shown in this wide view buffer.")
+(defvar-local kubed-ext-wide--context   nil "`kubectl' context used in this wide view buffer.")
+(defvar-local kubed-ext-wide--namespace nil "Namespace used in this wide view buffer.")
+(defvar-local kubed-ext-wide--name nil "Resource name shown in this wide view buffer, or nil for all.")
 
-(Dolist (Sym '(Kubed-Ext-Wide--Type Kubed-Ext-Wide--Context Kubed-Ext-Wide--Namespace Kubed-Ext-Wide--Name))
-        (Put Sym 'Permanent-Local T))
+(dolist (sym '(kubed-ext-wide--type kubed-ext-wide--context kubed-ext-wide--namespace kubed-ext-wide--name))
+  (put sym 'permanent-local t))
 
-(Defun Kubed-Ext--Colorize-Wide-Cell (Header Value)
-  "Return Value Propertized With A Face Based On Column Header Name."
-  (Let ((H (Upcase (String-Trim Header))))
-       (Cond
-        ((Or (String= H "Status") (String= H "Phase"))
-         (Let ((Face (Cdr (Assoc Value Kubed-Ext-Status-Faces))))
-              (If Face (Propertize Value 'Face Face) Value)))
-        ((String= H "Ready")
-         (If (String-Match "$[0-9]+$/$[0-9]+$" Value)
-             (Let* ((R    (String-To-Number (Match-String 1 Value)))
-                    (Tot  (String-To-Number (Match-String 2 Value)))
-                    (Face (Cond ((And (= R 0) (= Tot 0)) 'Shadow)
-                                ((= R Tot)               'Success)
-                                ((= R 0)                 'Error)
-                                (T                       'Warning))))
-                   (Propertize Value 'Face Face))
-             Value))
-        ((String= H "Restarts")
-         (Let* ((N    (String-To-Number Value))
-                (Face (Cond ((= N 0) Nil)
-                            ((< N 5) 'Warning)
-                            (T       'Error))))
-               (If Face (Propertize Value 'Face Face) Value)))
-        (T Value))))
+(defun kubed-ext--colorize-wide-cell (header value)
+  "Return VALUE propertized with a face based on column HEADER name."
+  (let ((h (upcase (string-trim header))))
+    (cond
+     ((or (string= h "STATUS") (string= h "PHASE"))
+      (let ((face (cdr (assoc value kubed-ext-status-faces))))
+        (if face (propertize value 'face face) value)))
+     ((string= h "READY")
+      (if (string-match "$[0-9]+$/$[0-9]+$" value)
+          (let* ((r    (string-to-number (match-string 1 value)))
+                 (tot  (string-to-number (match-string 2 value)))
+                 (face (cond ((and (= r 0) (= tot 0)) 'shadow)
+                             ((= r tot)               'success)
+                             ((= r 0)                 'error)
+                             (t                       'warning))))
+            (propertize value 'face face))
+        value))
+     ((string= h "RESTARTS")
+      (let* ((n    (string-to-number value))
+             (face (cond ((= n 0) nil)
+                         ((< n 5) 'warning)
+                         (t       'error))))
+        (if face (propertize value 'face face) value)))
+     (t value))))
 
-;; Note: Callees Defined Before The Caller To Satisfy The Byte-Compiler.
+;; NOTE: Callees defined BEFORE the caller to satisfy the byte-compiler.
 
-(Defun Kubed-Ext--Wide-Row-Primary-P ()
-  "Return Non-Nil If Point Is On A Primary Wide-View Row.
+(defun kubed-ext--wide-row-primary-p ()
+  "Return non-nil if point is on a primary wide-view row.
 
-In The Multi-Row Deployments Wide View, Continuation Rows Use An Empty
-Name Column.  We Treat Rows With A Non-Empty Name Column As Primary."
-  (When-Let ((Ent (Tabulated-List-Get-Entry)))
-            (Let ((Name (Aref Ent 0)))
-                 (And (Stringp Name)
-                      (Not (String-Empty-P (String-Trim Name)))))))
+In the multi-row deployments wide view, continuation rows use an empty
+Name column.  We treat rows with a non-empty Name column as primary."
+  (when-let ((ent (tabulated-list-get-entry)))
+    (let ((name (aref ent 0)))
+      (and (stringp name)
+           (not (string-empty-p (string-trim name)))))))
 
-(Defun Kubed-Ext--Wide-Populate-Kubectl-Wide (Type Ctx Ns &Optional Name)
-  "Populate Current Buffer Using Raw `Kubectl Get -O Wide' For Type, Ctx, Ns.
-Optional Name Limits Output To A Single Named Resource."
-  (Let* ((Raw     (With-Temp-Buffer
-                   (Apply #'Call-Process Kubed-Kubectl-Program Nil T Nil
-                          `("Get" ,Type ,@(When Name (List Name))
-                            "-O" "Wide"
-                            ,@(When Ns  `("-N"        ,Ns))
-                            ,@(When Ctx `("--Context" ,Ctx))))
-                   (Buffer-String)))
-         (Parsed (Kubed-Ext--Parse-Kubectl-Table Raw))
-         (Headers (Car Parsed))
-         (Rows (Cdr Parsed)))
-        (Unless Headers
-                (User-Error "`Kubectl' Returned No Output For %S" Type))
-        (Let* ((Content-Widths
-                (Cl-Loop For H In Headers
-                         For I From 0
-                         Collect (Apply #'Max
-                                        (Length H)
-                                        4
-                                        (Mapcar (Lambda (Row)
-                                                        (Length (Or (Nth I Row) "")))
-                                                Rows))))
-               (Min-Widths
-                (Cl-Loop For H In Headers
-                         For I From 0
-                         Collect (Max 6 (Min (Nth I Content-Widths)
-                                             (Max (Length H) 6)))))
-               (Available
-                (Max 20 (- (Window-Body-Width (Selected-Window)) 2)))
-               (Padding 2)
-               (Total (Lambda (Widths)
-                              (+ (Apply #'+ Widths)
-                                 (* Padding (Max 0 (1- (Length Widths)))))))
-               (Widths (Copy-Sequence Content-Widths)))
-              (While (> (Funcall Total Widths) Available)
-                     (Let* ((Idx (Cl-Position (Apply #'Max Widths) Widths))
-                            (W (Nth Idx Widths))
-                            (Minw (Nth Idx Min-Widths)))
-                           (If (<= W Minw)
-                               (Setq Widths Nil)
-                               (Setf (Nth Idx Widths) (1- W)))))
-              (Unless Widths
-                      (Setq Widths Min-Widths))
-              (Setq Tabulated-List-Format
-                    (Apply #'Vector
-                           (Cl-Loop For H In Headers
-                                    For W In Widths
-                                    Collect (List H W T)))))
-        (Setq Tabulated-List-Entries
-              (Mapcar (Lambda (Row)
-                              (List (Or (Car Row) "")
-                                    (Apply #'Vector
-                                           (Cl-Loop For H In Headers
-                                                    For I From 0
-                                                    Collect (Kubed-Ext--Colorize-Wide-Cell
-                                                             H (Or (Nth I Row) ""))))))
-                      Rows))
-        (Setq Tabulated-List-Padding 2)
-        (Tabulated-List-Init-Header)
-        (Tabulated-List-Print T)))
+(defun kubed-ext--wide-populate-kubectl-wide (type ctx ns &optional name)
+  "Populate current buffer using raw `kubectl get -o wide' for TYPE, CTX, NS.
+Optional NAME limits output to a single named resource."
+  (let* ((raw     (with-temp-buffer
+                    (apply #'call-process kubed-kubectl-program nil t nil
+                           `("get" ,type ,@(when name (list name))
+                             "-o" "wide"
+                             ,@(when ns  `("-n"        ,ns))
+                             ,@(when ctx `("--context" ,ctx))))
+                    (buffer-string)))
+         (parsed (kubed-ext--parse-kubectl-table raw))
+         (headers (car parsed))
+         (rows (cdr parsed)))
+    (unless headers
+      (user-error "`kubectl' returned no output for %s" type))
+    (let* ((content-widths
+            (cl-loop for h in headers
+                     for i from 0
+                     collect (apply #'max
+                                    (length h)
+                                    4
+                                    (mapcar (lambda (row)
+                                              (length (or (nth i row) "")))
+                                            rows))))
+           (min-widths
+            (cl-loop for h in headers
+                     for i from 0
+                     collect (max 6 (min (nth i content-widths)
+                                         (max (length h) 6)))))
+           (available
+            (max 20 (- (window-body-width (selected-window)) 2)))
+           (padding 2)
+           (total (lambda (widths)
+                    (+ (apply #'+ widths)
+                       (* padding (max 0 (1- (length widths)))))))
+           (widths (copy-sequence content-widths)))
+      (while (> (funcall total widths) available)
+        (let* ((idx (cl-position (apply #'max widths) widths))
+               (w (nth idx widths))
+               (minw (nth idx min-widths)))
+          (if (<= w minw)
+              (setq widths nil)
+            (setf (nth idx widths) (1- w)))))
+      (unless widths
+        (setq widths min-widths))
+      (setq tabulated-list-format
+            (apply #'vector
+                   (cl-loop for h in headers
+                            for w in widths
+                            collect (list h w t)))))
+    (setq tabulated-list-entries
+          (mapcar (lambda (row)
+                    (list (or (car row) "")
+                          (apply #'vector
+                                 (cl-loop for h in headers
+                                          for i from 0
+                                          collect (kubed-ext--colorize-wide-cell
+                                                   h (or (nth i row) ""))))))
+                  rows))
+    (setq tabulated-list-padding 2)
+    (tabulated-list-init-header)
+    (tabulated-list-print t)))
 
-(Defun Kubed-Ext--Wide-Populate-Deployments (Ctx Ns &Optional Name)
-  "Populate A Multi-Row, Intuitive Wide View For Deployments.
+(defun kubed-ext--wide-populate-deployments (ctx ns &optional name)
+  "Populate a multi-row, intuitive wide view for Deployments.
 
-Ctx Is The Kubectl Context, Ns Is The Namespace.
-Optional Name Limits Output To A Single Named Deployment."
-  (Let* ((Json-Str
-          (With-Temp-Buffer
-           (Apply #'Call-Process Kubed-Kubectl-Program Nil T Nil
-                  (Append (List "Get" "Deployments")
-                          (When Name (List Name))
-                          (List "-O" "Json")
-                          (When Ns (List "-N" Ns))
-                          (When Ctx (List "--Context" Ctx))))
-           (Buffer-String)))
-         (Obj (Json-Parse-String Json-Str :Object-Type 'Alist :Array-Type 'List))
-         (Items (If Name
-                    (If (Alist-Get 'Items Obj)
-                        (Alist-Get 'Items Obj)
-                        (List Obj))
-                    (Or (Alist-Get 'Items Obj) '())))
-         (Entries Nil)
-         (Seen-Detail (Make-Hash-Table :Test 'Equal)))
-        (Setq Tabulated-List-Padding 2)
-        (Setq Tabulated-List-Format
-              (Vector
-               (List "Name" 34 T)
-               (List "Ready" 10 T)
-               (List "Up-To-Date" 12 T)
-               (List "Available" 12 T)
-               (List "Age" 10 T)
-               (List "Detail" 70 T)))
-        (Dolist (It Items)
-                (Let* ((Meta (Alist-Get 'Metadata It))
-                       (Spec (Alist-Get 'Spec It))
-                       (Status (Alist-Get 'Status It))
-                       (Dep-Name (Or (Alist-Get 'Name Meta) ""))
-                       (Labels (Alist-Get 'Labels Meta))
-                       (Selector (Alist-Get 'Selector Spec))
-                       (Match-Labels (Alist-Get 'Matchlabels Selector))
-                       (Replicas (Number-To-String (Or (Alist-Get 'Replicas Spec) 0)))
-                       (Ready (Number-To-String (Or (Alist-Get 'Readyreplicas Status) 0)))
-                       (Updated (Number-To-String (Or (Alist-Get 'Updatedreplicas Status) 0)))
-                       (Available (Number-To-String (Or (Alist-Get 'Availablereplicas Status) 0)))
-                       (Creation (Or (Alist-Get 'Creationtimestamp Meta) ""))
-                       (Age (Kubed-Ext--Format-Age Creation))
-                       (Ready-Str (Kubed-Ext--Format-Ready-Total Ready Replicas))
-                       (Updated-Str (Kubed-Ext--Format-Deployment-Count Updated Replicas))
-                       (Avail-Str (Kubed-Ext--Format-Deployment-Count Available Replicas))
-                       (Tmpl (Alist-Get 'Template Spec))
-                       (Podspec (And Tmpl (Alist-Get 'Spec Tmpl)))
-                       (Containers (And Podspec (Alist-Get 'Containers Podspec))))
-                      (Let* ((Pairs
-                              (Mapcar (Lambda (C)
-                                              (Let ((Cname (Or (Alist-Get 'Name C) ""))
-                                                    (Img (Or (Alist-Get 'Image C) "")))
-                                                   (Cons Cname Img)))
-                                      (Or Containers '())))
-                             (Summary
-                              (If (Null Pairs)
-                                  ""
-                                  (Mapconcat
-                                   (Lambda (P)
-                                           (Let ((Cname (Car P))
-                                                 (Img (Cdr P))
-                                                 (Img-Face 'Font-Lock-Constant-Face))
-                                                (Concat
-                                                 (Propertize Cname 'Face 'Shadow)
-                                                 (Propertize " → " 'Face 'Shadow)
-                                                 (Propertize Img 'Face Img-Face))))
-                                   Pairs
-                                   (Propertize " | " 'Face 'Shadow)))))
-                            (Push (List Dep-Name
-                                        (Vector Dep-Name Ready-Str Updated-Str Avail-Str Age Summary))
-                                  Entries))
-                      (Cl-Flet
-                       ((Push-Detail
-                         (Detail)
-                         (When (And (Stringp Detail) (Not (String-Empty-P (String-Trim Detail))))
-                               (Let ((K (Cons Dep-Name Detail)))
-                                    (Unless (Gethash K Seen-Detail)
-                                            (Puthash K T Seen-Detail)
-                                            (Push (List Dep-Name
-                                                        (Vector "" "" "" "" ""
-                                                                (Propertize Detail 'Face 'Shadow)))
-                                                  Entries))))))
-                       (Dolist (C (Or Containers '()))
-                               (Let* ((Cname (Or (Alist-Get 'Name C) ""))
-                                      (Img (Or (Alist-Get 'Image C) ""))
-                                      (Img-Face 'Font-Lock-Constant-Face)
-                                      (Detail (Concat "Container: " Cname "  Image: " Img)))
-                                     (Let ((K (Cons Dep-Name Detail)))
-                                          (Unless (Gethash K Seen-Detail)
-                                                  (Puthash K T Seen-Detail)
-                                                  (Push (List Dep-Name
-                                                              (Vector "" "" "" "" ""
-                                                                      (Concat
-                                                                       (Propertize "Container: " 'Face 'Shadow)
-                                                                       (Propertize Cname 'Face 'Shadow)
-                                                                       (Propertize "  Image: " 'Face 'Shadow)
-                                                                       (Propertize Img 'Face Img-Face))))
-                                                        Entries)))))
-                       (When (And Match-Labels (Listp Match-Labels))
-                             (Dolist (Pair Match-Labels)
-                                     (Push-Detail (Format "Selector: %S=%S" (Car Pair) (Cdr Pair)))))
-                       (When (And Labels (Listp Labels))
-                             (Dolist (Pair Labels)
-                                     (Push-Detail (Format "Label: %S=%S" (Car Pair) (Cdr Pair))))))))
-        (Setq Tabulated-List-Entries (Nreverse Entries))
-        (Tabulated-List-Init-Header)
-        (Tabulated-List-Print T)))
+CTX is the kubectl context, NS is the namespace.
+Optional NAME limits output to a single named deployment."
+  (let* ((json-str
+          (with-temp-buffer
+            (apply #'call-process kubed-kubectl-program nil t nil
+                   (append (list "get" "deployments")
+                           (when name (list name))
+                           (list "-o" "json")
+                           (when ns (list "-n" ns))
+                           (when ctx (list "--context" ctx))))
+            (buffer-string)))
+         (obj (json-parse-string json-str :object-type 'alist :array-type 'list))
+         (items (if name
+                    (if (alist-get 'items obj)
+                        (alist-get 'items obj)
+                      (list obj))
+                  (or (alist-get 'items obj) '())))
+         (entries nil)
+         (seen-detail (make-hash-table :test 'equal)))
+    (setq tabulated-list-padding 2)
+    (setq tabulated-list-format
+          (vector
+           (list "Name" 34 t)
+           (list "Ready" 10 t)
+           (list "Up-to-date" 12 t)
+           (list "Available" 12 t)
+           (list "Age" 10 t)
+           (list "Detail" 70 t)))
+    (dolist (it items)
+      (let* ((meta (alist-get 'metadata it))
+             (spec (alist-get 'spec it))
+             (status (alist-get 'status it))
+             (dep-name (or (alist-get 'name meta) ""))
+             (labels (alist-get 'labels meta))
+             (selector (alist-get 'selector spec))
+             (match-labels (alist-get 'matchLabels selector))
+             (replicas (number-to-string (or (alist-get 'replicas spec) 0)))
+             (ready (number-to-string (or (alist-get 'readyReplicas status) 0)))
+             (updated (number-to-string (or (alist-get 'updatedReplicas status) 0)))
+             (available (number-to-string (or (alist-get 'availableReplicas status) 0)))
+             (creation (or (alist-get 'creationTimestamp meta) ""))
+             (age (kubed-ext--format-age creation))
+             (ready-str (kubed-ext--format-ready-total ready replicas))
+             (updated-str (kubed-ext--format-deployment-count updated replicas))
+             (avail-str (kubed-ext--format-deployment-count available replicas))
+             (tmpl (alist-get 'template spec))
+             (podspec (and tmpl (alist-get 'spec tmpl)))
+             (containers (and podspec (alist-get 'containers podspec))))
+        (let* ((pairs
+                (mapcar (lambda (c)
+                          (let ((cname (or (alist-get 'name c) ""))
+                                (img (or (alist-get 'image c) "")))
+                            (cons cname img)))
+                        (or containers '())))
+               (summary
+                (if (null pairs)
+                    ""
+                  (mapconcat
+                   (lambda (p)
+                     (let ((cname (car p))
+                           (img (cdr p))
+                           (img-face 'font-lock-constant-face))
+                       (concat
+                        (propertize cname 'face 'shadow)
+                        (propertize " → " 'face 'shadow)
+                        (propertize img 'face img-face))))
+                   pairs
+                   (propertize " | " 'face 'shadow)))))
+          (push (list dep-name
+                      (vector dep-name ready-str updated-str avail-str age summary))
+                entries))
+        (cl-flet
+            ((push-detail
+              (detail)
+              (when (and (stringp detail) (not (string-empty-p (string-trim detail))))
+                (let ((k (cons dep-name detail)))
+                  (unless (gethash k seen-detail)
+                    (puthash k t seen-detail)
+                    (push (list dep-name
+                                (vector "" "" "" "" ""
+                                        (propertize detail 'face 'shadow)))
+                          entries))))))
+          (dolist (c (or containers '()))
+            (let* ((cname (or (alist-get 'name c) ""))
+                   (img (or (alist-get 'image c) ""))
+                   (img-face 'font-lock-constant-face)
+                   (detail (concat "container: " cname "  image: " img)))
+              (let ((k (cons dep-name detail)))
+                (unless (gethash k seen-detail)
+                  (puthash k t seen-detail)
+                  (push (list dep-name
+                              (vector "" "" "" "" ""
+                                      (concat
+                                       (propertize "container: " 'face 'shadow)
+                                       (propertize cname 'face 'shadow)
+                                       (propertize "  image: " 'face 'shadow)
+                                       (propertize img 'face img-face))))
+                        entries)))))
+          (when (and match-labels (listp match-labels))
+            (dolist (pair match-labels)
+              (push-detail (format "selector: %s=%s" (car pair) (cdr pair)))))
+          (when (and labels (listp labels))
+            (dolist (pair labels)
+              (push-detail (format "label: %s=%s" (car pair) (cdr pair))))))))
+    (setq tabulated-list-entries (nreverse entries))
+    (tabulated-list-init-header)
+    (tabulated-list-print t)))
 
-(Defun Kubed-Ext--Wide-Populate (Type Ctx Ns &Optional Name)
-  "Fill The Current Buffer With A Wide-Format Table For Type In Ctx/Ns.
+(defun kubed-ext--wide-populate (type ctx ns &optional name)
+  "Fill the current buffer with a wide-format table for TYPE in CTX/NS.
 
-Optional Argument Name Limits Output To A Single Named Resource.
+Optional argument NAME limits output to a single named resource.
 
-For Most Types, This Shells Out To:
-  Kubectl Get Type -O Wide
+For most types, this shells out to:
+  kubectl get TYPE -o wide
 
-For Deployments, We Render A More Intuitive Multi-Row View Based On Json.
+For deployments, we render a more intuitive multi-row view based on JSON.
 
-This Runs `Kubectl' Synchronously."
-  (Setq Kubed-Ext-Wide--Type      Type
-        Kubed-Ext-Wide--Context   Ctx
-        Kubed-Ext-Wide--Namespace Ns
-        Kubed-Ext-Wide--Name      Name)
-  (If (String= Type "Deployments")
-      (Kubed-Ext--Wide-Populate-Deployments Ctx Ns Name)
-      (Kubed-Ext--Wide-Populate-Kubectl-Wide Type Ctx Ns Name)))
+This runs `kubectl' synchronously."
+  (setq kubed-ext-wide--type      type
+        kubed-ext-wide--context   ctx
+        kubed-ext-wide--namespace ns
+        kubed-ext-wide--name      name)
+  (if (string= type "deployments")
+      (kubed-ext--wide-populate-deployments ctx ns name)
+    (kubed-ext--wide-populate-kubectl-wide type ctx ns name)))
 
-(Defun Kubed-Ext-List-Wide ()
-  "Display The Current Resource List In Kubectl Wide Format With Color Coding.
-When Point Is On A Resource, Show Only That Resource."
-  (Interactive Nil Kubed-List-Mode)
-  (Let* ((Type Kubed-List-Type)
-         (Ctx  Kubed-List-Context)
-         (Ns   Kubed-List-Namespace)
-         (Name (Tabulated-List-Get-Id))
-         (Buf  (Get-Buffer-Create
-                (Format "*Kubed Wide %S/%S/%S%S*"
-                        Type (Or Ns "Cluster") (Or Ctx "Current")
-                        (If Name (Concat "/" Name) "")))))
-        (Pop-To-Buffer Buf)
-        (Kubed-Ext-Wide-Mode)
-        (Let ((Inhibit-Read-Only T))
-             (Kubed-Ext--Wide-Populate Type Ctx Ns Name))))
+(defun kubed-ext-list-wide ()
+  "Display the current resource list in kubectl wide format with color coding.
+When point is on a resource, show only that resource."
+  (interactive nil kubed-list-mode)
+  (let* ((type kubed-list-type)
+         (ctx  kubed-list-context)
+         (ns   kubed-list-namespace)
+         (name (tabulated-list-get-id))
+         (buf  (get-buffer-create
+                (format "*Kubed wide %s/%s/%s%s*"
+                        type (or ns "cluster") (or ctx "current")
+                        (if name (concat "/" name) "")))))
+    (pop-to-buffer buf)
+    (kubed-ext-wide-mode)
+    (let ((inhibit-read-only t))
+      (kubed-ext--wide-populate type ctx ns name))))
 
-(Defun Kubed-Ext-Wide-Describe-Resource ()
-  "Describe The Kubernetes Resource At Point In The Wide View Buffer."
-  (Interactive Nil Kubed-Ext-Wide-Mode)
-  (Unless (Kubed-Ext--Wide-Row-Primary-P)
-          (User-Error "No Primary Resource Row At Point"))
-  (If-Let ((Name (Tabulated-List-Get-Id)))
-          (Let* ((Type Kubed-Ext-Wide--Type)
-                 (Ns   Kubed-Ext-Wide--Namespace)
-                 (Ctx  Kubed-Ext-Wide--Context))
-                (Unless Type
-                        (User-Error "No Resource Type Context In This Buffer"))
-                (Let ((Buf (Get-Buffer-Create
-                            (Format "*Kubed Describe %S/%S/%S/%S*"
-                                    Type Name
-                                    (Or Ns "Default")
-                                    (Or Ctx "Current")))))
-                     (With-Current-Buffer Buf
-                                          (Let ((Inhibit-Read-Only T))
-                                               (Erase-Buffer)
-                                               (Apply #'Call-Process Kubed-Kubectl-Program Nil T Nil
-                                                      (Append (List "Describe" Type Name)
-                                                              (When Ns (List "-N" Ns))
-                                                              (When Ctx (List "--Context" Ctx))))
-                                               (Goto-Char (Point-Min))
-                                               (Special-Mode)))
-                     (Display-Buffer Buf)))
-          (User-Error "No Kubernetes Resource At Point")))
+(defun kubed-ext-wide-describe-resource ()
+  "Describe the Kubernetes resource at point in the wide view buffer."
+  (interactive nil kubed-ext-wide-mode)
+  (unless (kubed-ext--wide-row-primary-p)
+    (user-error "No primary resource row at point"))
+  (if-let ((name (tabulated-list-get-id)))
+      (let* ((type kubed-ext-wide--type)
+             (ns   kubed-ext-wide--namespace)
+             (ctx  kubed-ext-wide--context))
+        (unless type
+          (user-error "No resource type context in this buffer"))
+        (let ((buf (get-buffer-create
+                    (format "*Kubed describe %s/%s/%s/%s*"
+                            type name
+                            (or ns "default")
+                            (or ctx "current")))))
+          (with-current-buffer buf
+            (let ((inhibit-read-only t))
+              (erase-buffer)
+              (apply #'call-process kubed-kubectl-program nil t nil
+                     (append (list "describe" type name)
+                             (when ns (list "-n" ns))
+                             (when ctx (list "--context" ctx))))
+              (goto-char (point-min))
+              (special-mode)))
+          (display-buffer buf)))
+    (user-error "No Kubernetes resource at point")))
 
-(Defun Kubed-Ext-Wide-Fit-Column (N)
-  "Fit Width Of Nth Table Column To Its Content In Wide View.
-If N Is Negative, Fit All Columns.  Interactively, N Is The Column
-Number At Point, Or The Numeric Prefix Argument If You Provide One."
-  (Interactive
-   (List (If Current-Prefix-Arg
-             (Prefix-Numeric-Value Current-Prefix-Arg)
-             (Kubed-List-Column-Number-At-Point)))
-   Kubed-Ext-Wide-Mode)
-  (Kubed-List-Fit-Column-Width-To-Content N))
+(defun kubed-ext-wide-fit-column (n)
+  "Fit width of Nth table column to its content in wide view.
+If N is negative, fit all columns.  Interactively, N is the column
+number at point, or the numeric prefix argument if you provide one."
+  (interactive
+   (list (if current-prefix-arg
+             (prefix-numeric-value current-prefix-arg)
+           (kubed-list-column-number-at-point)))
+   kubed-ext-wide-mode)
+  (kubed-list-fit-column-width-to-content n))
 
-(Define-Derived-Mode Kubed-Ext-Wide-Mode Tabulated-List-Mode "Kubed Wide"
-  "Major Mode For Displaying Kubectl Wide Output With Color Coding.
-\\{Kubed-Ext-Wide-Mode-Map}"
-  (Setq Truncate-Lines T)
-  (Setq-Local Word-Wrap Nil)
-  (Setq-Local Truncate-String-Ellipsis (Propertize "…" 'Face 'Shadow))
-  (Keymap-Set Kubed-Ext-Wide-Mode-Map "G"   #'Kubed-Ext-List-Wide-Refresh)
-  (Keymap-Set Kubed-Ext-Wide-Mode-Map "Q"   #'Quit-Window)
-  (Keymap-Set Kubed-Ext-Wide-Mode-Map "B"   #'Kubed-Ext-Switch-Buffer)
-  (Keymap-Set Kubed-Ext-Wide-Mode-Map "<"   #'Kubed-Ext-Wide-Fit-Column)
-  (Keymap-Set Kubed-Ext-Wide-Mode-Map "|"   #'Kubed-Ext-Wide-Fit-Column)
-  (Keymap-Set Kubed-Ext-Wide-Mode-Map "}"   #'Tabulated-List-Widen-Current-Column)
-  (Keymap-Set Kubed-Ext-Wide-Mode-Map "{"   #'Tabulated-List-Narrow-Current-Column)
-  (Keymap-Set Kubed-Ext-Wide-Mode-Map "?"   #'Kubed-Ext-Transient-Menu)
-  (Keymap-Set Kubed-Ext-Wide-Mode-Map "D"   #'Kubed-Ext-Wide-Describe-Resource)
-  (Keymap-Set Kubed-Ext-Wide-Mode-Map "Ret" #'Kubed-Ext-Wide-Describe-Resource))
+(define-derived-mode kubed-ext-wide-mode tabulated-list-mode "Kubed Wide"
+  "Major mode for displaying kubectl wide output with color coding.
+\\{kubed-ext-wide-mode-map}"
+  (setq truncate-lines t)
+  (setq-local word-wrap nil)
+  (setq-local truncate-string-ellipsis (propertize "…" 'face 'shadow))
+  (keymap-set kubed-ext-wide-mode-map "g"   #'kubed-ext-list-wide-refresh)
+  (keymap-set kubed-ext-wide-mode-map "q"   #'quit-window)
+  (keymap-set kubed-ext-wide-mode-map "b"   #'kubed-ext-switch-buffer)
+  (keymap-set kubed-ext-wide-mode-map "<"   #'kubed-ext-wide-fit-column)
+  (keymap-set kubed-ext-wide-mode-map "|"   #'kubed-ext-wide-fit-column)
+  (keymap-set kubed-ext-wide-mode-map "}"   #'tabulated-list-widen-current-column)
+  (keymap-set kubed-ext-wide-mode-map "{"   #'tabulated-list-narrow-current-column)
+  (keymap-set kubed-ext-wide-mode-map "?"   #'kubed-ext-transient-menu)
+  (keymap-set kubed-ext-wide-mode-map "d"   #'kubed-ext-wide-describe-resource)
+  (keymap-set kubed-ext-wide-mode-map "RET" #'kubed-ext-wide-describe-resource))
 
-(Defun Kubed-Ext-List-Wide-Refresh ()
-  "Refresh The Wide View Buffer By Re-Running Kubectl."
-  (Interactive Nil Kubed-Ext-Wide-Mode)
-  (Unless Kubed-Ext-Wide--Type
-          (User-Error "No Resource Context; Open Wide View From A Resource List Buffer"))
-  (Message "Refreshing %S Wide View..." Kubed-Ext-Wide--Type)
-  (Let ((Inhibit-Read-Only T))
-       (Kubed-Ext--Wide-Populate
-        Kubed-Ext-Wide--Type
-        Kubed-Ext-Wide--Context
-        Kubed-Ext-Wide--Namespace
-        Kubed-Ext-Wide--Name)))
+(defun kubed-ext-list-wide-refresh ()
+  "Refresh the wide view buffer by re-running kubectl."
+  (interactive nil kubed-ext-wide-mode)
+  (unless kubed-ext-wide--type
+    (user-error "No resource context; open wide view from a resource list buffer"))
+  (message "Refreshing %s wide view..." kubed-ext-wide--type)
+  (let ((inhibit-read-only t))
+    (kubed-ext--wide-populate
+     kubed-ext-wide--type
+     kubed-ext-wide--context
+     kubed-ext-wide--namespace
+     kubed-ext-wide--name)))
 
-(Defun Kubed-Ext-Toggle-Output-Format ()
-  "Toggle Resource Display Format Between Yaml And Json And Revert."
-  (Interactive)
-  (Setq Kubed-Ext-Output-Format
-        (If (String= Kubed-Ext-Output-Format "Yaml") "Json" "Yaml"))
-  (When (Bound-And-True-P Kubed-Display-Resource-Mode)
-        (Revert-Buffer))
-  (Message "Output Format: %S" Kubed-Ext-Output-Format))
+(defun kubed-ext-toggle-output-format ()
+  "Toggle resource display format between YAML and JSON and revert."
+  (interactive)
+  (setq kubed-ext-output-format
+        (if (string= kubed-ext-output-format "yaml") "json" "yaml"))
+  (when (bound-and-true-p kubed-display-resource-mode)
+    (revert-buffer))
+  (message "Output format: %s" kubed-ext-output-format))
 
-(Defun Kubed-Ext-Set-Output-Format ()
-  "Prompt For And Set The Output Format For Resource Display."
-  (Interactive)
-  (Setq Kubed-Ext-Output-Format
-        (Completing-Read "Output Format: " '("Yaml" "Json") Nil T
-                         Nil Nil Kubed-Ext-Output-Format))
-  (When (Bound-And-True-P Kubed-Display-Resource-Mode)
-        (Revert-Buffer))
-  (Message "Output Format Set To %S." Kubed-Ext-Output-Format))
+(defun kubed-ext-set-output-format ()
+  "Prompt for and set the output format for resource display."
+  (interactive)
+  (setq kubed-ext-output-format
+        (completing-read "Output format: " '("yaml" "json") nil t
+                         nil nil kubed-ext-output-format))
+  (when (bound-and-true-p kubed-display-resource-mode)
+    (revert-buffer))
+  (message "Output format set to %s." kubed-ext-output-format))
 
-(Defun Kubed-Ext--Display-Revert-Format (Orig-Fn &Rest Args)
-  "Around Advice For `Kubed-Display-Resource-Revert' For Configurable Format.
-Orig-Fn Is The Original Function, Args Its Arguments."
-  (If (String= Kubed-Ext-Output-Format "Yaml")
-      (Apply Orig-Fn Args)
-      (Seq-Let (Type Name Context Namespace)
-               Kubed-Display-Resource-Info
-               (Let ((Inhibit-Read-Only T)
-                     (Target (Current-Buffer)))
-                    (Buffer-Disable-Undo)
-                    (With-Temp-Buffer
-                     (Unless (Zerop
-                              (Apply #'Call-Process
-                                     Kubed-Kubectl-Program Nil T Nil "Get"
-                                     Type (Concat "--Output=" Kubed-Ext-Output-Format)
-                                     Name
-                                     (Append (When Namespace (List "-N" Namespace))
-                                             (When Context (List "--Context" Context)))))
-                             (Error "Failed To Display Kubernetes Resource `%S'" Name))
-                     (Let ((Source (Current-Buffer)))
-                          (With-Current-Buffer Target
-                                               (Replace-Buffer-Contents Source)
-                                               (Set-Buffer-Modified-P Nil)
-                                               (Buffer-Enable-Undo))))))))
+(defun kubed-ext--display-revert-format (orig-fn &rest args)
+  "Around advice for `kubed-display-resource-revert' for configurable format.
+ORIG-FN is the original function, ARGS its arguments."
+  (if (string= kubed-ext-output-format "yaml")
+      (apply orig-fn args)
+    (seq-let (type name context namespace)
+        kubed-display-resource-info
+      (let ((inhibit-read-only t)
+            (target (current-buffer)))
+        (buffer-disable-undo)
+        (with-temp-buffer
+          (unless (zerop
+                   (apply #'call-process
+                          kubed-kubectl-program nil t nil "get"
+                          type (concat "--output=" kubed-ext-output-format)
+                          name
+                          (append (when namespace (list "-n" namespace))
+                                  (when context (list "--context" context)))))
+            (error "Failed to display Kubernetes resource `%s'" name))
+          (let ((source (current-buffer)))
+            (with-current-buffer target
+              (replace-buffer-contents source)
+              (set-buffer-modified-p nil)
+              (buffer-enable-undo))))))))
 
-(Advice-Add 'Kubed-Display-Resource-Revert :Around
-            #'Kubed-Ext--Display-Revert-Format)
+(advice-add 'kubed-display-resource-revert :around
+            #'kubed-ext--display-revert-format)
 
 ;;; ═══════════════════════════════════════════════════════════════
-;;; § 3e.  Batch Operations On Marked Items
+;;; § 3e.  Batch Operations on Marked Items
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defun Kubed-Ext-Delete-Marked ()
-  "Delete All Resources Marked With `*'."
-  (Interactive Nil Kubed-List-Mode)
-  (Let ((Items (Kubed-Ext-Marked-Items)))
-       (Unless Items
-               (User-Error "No Resources Marked With `*'"))
-       (When (Y-Or-N-P (Format "Delete %D Marked %S?"
-                               (Length Items) Kubed-List-Type))
-             (Kubed-Delete-Resources Kubed-List-Type Items
-                                     Kubed-List-Context Kubed-List-Namespace)
-             (Kubed-List-Update T))))
+(defun kubed-ext-delete-marked ()
+  "Delete all resources marked with `*'."
+  (interactive nil kubed-list-mode)
+  (let ((items (kubed-ext-marked-items)))
+    (unless items
+      (user-error "No resources marked with `*'"))
+    (when (y-or-n-p (format "Delete %d marked %s?"
+                            (length items) kubed-list-type))
+      (kubed-delete-resources kubed-list-type items
+                              kubed-list-context kubed-list-namespace)
+      (kubed-list-update t))))
 
-(Defun Kubed-Ext-Logs-Marked ()
-  "Show Logs For All Pods Marked With `*'."
-  (Interactive Nil Kubed-List-Mode)
-  (Let ((Items (Kubed-Ext-Marked-Items)))
-       (Unless Items
-               (User-Error "No Resources Marked With `*'"))
-       (Dolist (Pod Items)
-               (Kubed-Logs Kubed-List-Type Pod Kubed-List-Context Kubed-List-Namespace
-                           T T Nil Nil Nil Nil Nil))))
+(defun kubed-ext-logs-marked ()
+  "Show logs for all pods marked with `*'."
+  (interactive nil kubed-list-mode)
+  (let ((items (kubed-ext-marked-items)))
+    (unless items
+      (user-error "No resources marked with `*'"))
+    (dolist (pod items)
+      (kubed-logs kubed-list-type pod kubed-list-context kubed-list-namespace
+                  t t nil nil nil nil nil))))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 4.  Strimzi Operation Helpers
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defun Kubed-Ext-Strimzi-Pause-Reconciliation
-  (Type Name &Optional Context Namespace)
-  "Pause Strimzi Reconciliation For Resource Name Of Type In Context."
-  (Interactive
-   (Let* ((C (Kubed-Local-Context))
-          (C (If (Equal Current-Prefix-Arg '(16))
-                 (Kubed-Read-Context "Context" C) C))
-          (N (Kubed--Namespace C Current-Prefix-Arg))
-          (Type (Completing-Read "Resource Type: "
-                                 '("Kafka" "Kafkaconnect" "Kafkabridge"
-                                   "Kafkamirrormaker2" "Kafkamirrormaker")
-                                 Nil T))
-          (Name (Kubed-Read-Resource-Name
-                 (Concat Type "S") "Pause Reconciliation For" Nil Nil C N)))
-         (List Type Name C N)))
-  (Let ((Context (Or Context (Kubed-Local-Context)))
-        (Namespace (Or Namespace
-                       (Kubed--Namespace (Or Context
-                                             (Kubed-Local-Context))))))
-       (Unless (Zerop
-                (Apply #'Call-Process
-                       Kubed-Kubectl-Program Nil Nil Nil
-                       "Annotate" Type Name
-                       "Strimzi.Io/Pause-Reconciliation=True" "--Overwrite"
-                       (Append
-                        (When Namespace (List "-N" Namespace))
-                        (When Context (List "--Context" Context)))))
-               (User-Error "Failed To Pause Reconciliation For %S/%S" Type Name))
-       (Message "Paused Reconciliation For %S/%S." Type Name)))
+(defun kubed-ext-strimzi-pause-reconciliation
+    (type name &optional context namespace)
+  "Pause Strimzi reconciliation for resource NAME of TYPE in CONTEXT."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg))
+          (type (completing-read "Resource type: "
+                                 '("kafka" "kafkaconnect" "kafkabridge"
+                                   "kafkamirrormaker2" "kafkamirrormaker")
+                                 nil t))
+          (name (kubed-read-resource-name
+                 (concat type "s") "Pause reconciliation for" nil nil c n)))
+     (list type name c n)))
+  (let ((context (or context (kubed-local-context)))
+        (namespace (or namespace
+                       (kubed--namespace (or context
+                                             (kubed-local-context))))))
+    (unless (zerop
+             (apply #'call-process
+                    kubed-kubectl-program nil nil nil
+                    "annotate" type name
+                    "strimzi.io/pause-reconciliation=true" "--overwrite"
+                    (append
+                     (when namespace (list "-n" namespace))
+                     (when context (list "--context" context)))))
+      (user-error "Failed to pause reconciliation for %s/%s" type name))
+    (message "Paused reconciliation for %s/%s." type name)))
 
-(Defun Kubed-Ext-Strimzi-Resume-Reconciliation
-  (Type Name &Optional Context Namespace)
-  "Resume Strimzi Reconciliation For Resource Name Of Type In Context."
-  (Interactive
-   (Let* ((C (Kubed-Local-Context))
-          (C (If (Equal Current-Prefix-Arg '(16))
-                 (Kubed-Read-Context "Context" C) C))
-          (N (Kubed--Namespace C Current-Prefix-Arg))
-          (Type (Completing-Read "Resource Type: "
-                                 '("Kafka" "Kafkaconnect" "Kafkabridge"
-                                   "Kafkamirrormaker2" "Kafkamirrormaker")
-                                 Nil T))
-          (Name (Kubed-Read-Resource-Name
-                 (Concat Type "S") "Resume Reconciliation For" Nil Nil C N)))
-         (List Type Name C N)))
-  (Let ((Context (Or Context (Kubed-Local-Context)))
-        (Namespace (Or Namespace
-                       (Kubed--Namespace (Or Context
-                                             (Kubed-Local-Context))))))
-       (Unless (Zerop
-                (Apply #'Call-Process
-                       Kubed-Kubectl-Program Nil Nil Nil
-                       "Annotate" Type Name
-                       "Strimzi.Io/Pause-Reconciliation-"
-                       (Append
-                        (When Namespace (List "-N" Namespace))
-                        (When Context (List "--Context" Context)))))
-               (User-Error "Failed To Resume Reconciliation For %S/%S" Type Name))
-       (Message "Resumed Reconciliation For %S/%S." Type Name)))
+(defun kubed-ext-strimzi-resume-reconciliation
+    (type name &optional context namespace)
+  "Resume Strimzi reconciliation for resource NAME of TYPE in CONTEXT."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg))
+          (type (completing-read "Resource type: "
+                                 '("kafka" "kafkaconnect" "kafkabridge"
+                                   "kafkamirrormaker2" "kafkamirrormaker")
+                                 nil t))
+          (name (kubed-read-resource-name
+                 (concat type "s") "Resume reconciliation for" nil nil c n)))
+     (list type name c n)))
+  (let ((context (or context (kubed-local-context)))
+        (namespace (or namespace
+                       (kubed--namespace (or context
+                                             (kubed-local-context))))))
+    (unless (zerop
+             (apply #'call-process
+                    kubed-kubectl-program nil nil nil
+                    "annotate" type name
+                    "strimzi.io/pause-reconciliation-"
+                    (append
+                     (when namespace (list "-n" namespace))
+                     (when context (list "--context" context)))))
+      (user-error "Failed to resume reconciliation for %s/%s" type name))
+    (message "Resumed reconciliation for %s/%s." type name)))
 
-(Defun Kubed-Ext-Strimzi-Restart-Connector
-  (Name &Optional Context Namespace)
-  "Trigger Restart Of Strimzi Kafkaconnector Name In Context/Namespace."
-  (Interactive
-   (Let* ((C (Kubed-Local-Context))
-          (C (If (Equal Current-Prefix-Arg '(16))
-                 (Kubed-Read-Context "Context" C) C))
-          (N (Kubed--Namespace C Current-Prefix-Arg)))
-         (List (Kubed-Read-Resource-Name
-                "Kafkaconnectors" "Restart Connector" Nil Nil C N)
-               C N)))
-  (Let ((Context (Or Context (Kubed-Local-Context)))
-        (Namespace (Or Namespace
-                       (Kubed--Namespace (Or Context
-                                             (Kubed-Local-Context))))))
-       (Unless (Zerop
-                (Apply #'Call-Process
-                       Kubed-Kubectl-Program Nil Nil Nil
-                       "Annotate" "Kafkaconnector" Name
-                       "Strimzi.Io/Restart=True" "--Overwrite"
-                       (Append
-                        (When Namespace (List "-N" Namespace))
-                        (When Context (List "--Context" Context)))))
-               (User-Error "Failed To Restart Connector %S" Name))
-       (Message "Triggered Restart Of Connector %S." Name)))
+(defun kubed-ext-strimzi-restart-connector
+    (name &optional context namespace)
+  "Trigger restart of Strimzi KafkaConnector NAME in CONTEXT/NAMESPACE."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg)))
+     (list (kubed-read-resource-name
+            "kafkaconnectors" "Restart connector" nil nil c n)
+           c n)))
+  (let ((context (or context (kubed-local-context)))
+        (namespace (or namespace
+                       (kubed--namespace (or context
+                                             (kubed-local-context))))))
+    (unless (zerop
+             (apply #'call-process
+                    kubed-kubectl-program nil nil nil
+                    "annotate" "kafkaconnector" name
+                    "strimzi.io/restart=true" "--overwrite"
+                    (append
+                     (when namespace (list "-n" namespace))
+                     (when context (list "--context" context)))))
+      (user-error "Failed to restart connector %s" name))
+    (message "Triggered restart of connector %s." name)))
 
-(Defun Kubed-Ext-Scale-Kafkaconnect
-  (Name Replicas &Optional Context Namespace)
-  "Scale Strimzi Kafkaconnect Name To Replicas In Context/Namespace."
-  (Interactive
-   (Let* ((C (Kubed-Local-Context))
-          (C (If (Equal Current-Prefix-Arg '(16))
-                 (Kubed-Read-Context "Context" C) C))
-          (N (Kubed--Namespace C Current-Prefix-Arg)))
-         (List (Kubed-Read-Resource-Name
-                "Kafkaconnects" "Scale Kafkaconnect" Nil Nil C N)
-               (Read-Number "Number Of Replicas: ")
-               C N)))
-  (Let* ((Context (Or Context (Kubed-Local-Context)))
-         (Namespace (Or Namespace (Kubed--Namespace Context))))
-        (Kubed-Patch "Kafkaconnects" Name
-                     (Kubed-Ext--Json-Patch "Replicas" (Number-To-String Replicas))
-                     Context Namespace "Merge")
-        (Message "Scaled Kafkaconnect %S To %D Replicas." Name Replicas)
-        (Kubed-Update "Kafkaconnects" Context Namespace)))
+(defun kubed-ext-scale-kafkaconnect
+    (name replicas &optional context namespace)
+  "Scale Strimzi KafkaConnect NAME to REPLICAS in CONTEXT/NAMESPACE."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg)))
+     (list (kubed-read-resource-name
+            "kafkaconnects" "Scale KafkaConnect" nil nil c n)
+           (read-number "Number of replicas: ")
+           c n)))
+  (let* ((context (or context (kubed-local-context)))
+         (namespace (or namespace (kubed--namespace context))))
+    (kubed-patch "kafkaconnects" name
+                 (kubed-ext--json-patch "replicas" (number-to-string replicas))
+                 context namespace "merge")
+    (message "Scaled KafkaConnect %s to %d replicas." name replicas)
+    (kubed-update "kafkaconnects" context namespace)))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 5.  Column Helpers, Metrics, Pod/Deployment Formatting
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defun Kubed-Ext-Append-Columns (Resource-Plural Fetch-Columns Display-Columns)
-  "Append Extra Fetch-Columns And Display-Columns To Resource-Plural."
-  (Let ((Existing (Alist-Get Resource-Plural Kubed--Columns Nil Nil #'String=))
-        (Fmt-Var (Intern (Format "Kubed-%S-Columns" Resource-Plural))))
-       (Setf (Alist-Get Resource-Plural Kubed--Columns Nil Nil #'String=)
-             (Append Existing Fetch-Columns))
-       (When (Boundp Fmt-Var)
-             (Set Fmt-Var (Append (Symbol-Value Fmt-Var) Display-Columns)))))
+(defun kubed-ext-append-columns (resource-plural fetch-columns display-columns)
+  "Append extra FETCH-COLUMNS and DISPLAY-COLUMNS to RESOURCE-PLURAL."
+  (let ((existing (alist-get resource-plural kubed--columns nil nil #'string=))
+        (fmt-var (intern (format "kubed-%s-columns" resource-plural))))
+    (setf (alist-get resource-plural kubed--columns nil nil #'string=)
+          (append existing fetch-columns))
+    (when (boundp fmt-var)
+      (set fmt-var (append (symbol-value fmt-var) display-columns)))))
 
-(Defun Kubed-Ext-Set-Columns (Resource-Plural Fetch-Columns Display-Columns)
-  "Replace Columns For Resource-Plural With Fetch-Columns And Display-Columns."
-  (Setf (Alist-Get Resource-Plural Kubed--Columns Nil Nil #'String=)
-        (Cons '("Name:.Metadata.Name") Fetch-Columns))
-  (Let ((Fmt-Var (Intern (Format "Kubed-%S-Columns" Resource-Plural))))
-       (When (Boundp Fmt-Var)
-             (Set Fmt-Var Display-Columns))))
+(defun kubed-ext-set-columns (resource-plural fetch-columns display-columns)
+  "Replace columns for RESOURCE-PLURAL with FETCH-COLUMNS and DISPLAY-COLUMNS."
+  (setf (alist-get resource-plural kubed--columns nil nil #'string=)
+        (cons '("NAME:.metadata.name") fetch-columns))
+  (let ((fmt-var (intern (format "kubed-%s-columns" resource-plural))))
+    (when (boundp fmt-var)
+      (set fmt-var display-columns))))
 
-(Defun Kubed-Ext-Parse-Cpu (S)
-  "Parse Kubernetes Cpu Quantity S To Millicores (Number)."
-  (Cond
-   ((Kubed-Ext-None-P S) 0)
-   ((String-Suffix-P "M" S)  (String-To-Number S))
-   ((String-Suffix-P "N" S)  (/ (String-To-Number S) 1000000.0))
-   ((String-Suffix-P "U" S)  (/ (String-To-Number S) 1000.0))
-   (T (* 1000.0 (String-To-Number S)))))
+(defun kubed-ext-parse-cpu (s)
+  "Parse Kubernetes CPU quantity S to millicores (number)."
+  (cond
+   ((kubed-ext-none-p s) 0)
+   ((string-suffix-p "m" s)  (string-to-number s))
+   ((string-suffix-p "n" s)  (/ (string-to-number s) 1000000.0))
+   ((string-suffix-p "u" s)  (/ (string-to-number s) 1000.0))
+   (t (* 1000.0 (string-to-number s)))))
 
-(Defun Kubed-Ext-Parse-Mem (S)
-  "Parse Kubernetes Memory Quantity S To Mib (Number)."
-  (Cond
-   ((Kubed-Ext-None-P S) 0)
-   ((String-Suffix-P "Ti" S) (* 1048576.0 (String-To-Number S)))
-   ((String-Suffix-P "Gi" S) (* 1024.0    (String-To-Number S)))
-   ((String-Suffix-P "Mi" S) (String-To-Number S))
-   ((String-Suffix-P "Ki" S) (/ (String-To-Number S) 1024.0))
-   (T (/ (String-To-Number S) 1048576.0))))
+(defun kubed-ext-parse-mem (s)
+  "Parse Kubernetes memory quantity S to MiB (number)."
+  (cond
+   ((kubed-ext-none-p s) 0)
+   ((string-suffix-p "Ti" s) (* 1048576.0 (string-to-number s)))
+   ((string-suffix-p "Gi" s) (* 1024.0    (string-to-number s)))
+   ((string-suffix-p "Mi" s) (string-to-number s))
+   ((string-suffix-p "Ki" s) (/ (string-to-number s) 1024.0))
+   (t (/ (string-to-number s) 1048576.0))))
 
-(Defun Kubed-Ext-Sum-Cpu (S)
-  "Sum Comma-Separated Cpu Values In S."
-  (If (Kubed-Ext-None-P S) 0
-      (Apply #'+ (Mapcar #'Kubed-Ext-Parse-Cpu
-                         (Split-String S "," T "[ \T]")))))
+(defun kubed-ext-sum-cpu (s)
+  "Sum comma-separated CPU values in S."
+  (if (kubed-ext-none-p s) 0
+    (apply #'+ (mapcar #'kubed-ext-parse-cpu
+                       (split-string s "," t "[ \t]")))))
 
-(Defun Kubed-Ext-Sum-Mem (S)
-  "Sum Comma-Separated Memory Values In S."
-  (If (Kubed-Ext-None-P S) 0
-      (Apply #'+ (Mapcar #'Kubed-Ext-Parse-Mem
-                         (Split-String S "," T "[ \T]")))))
+(defun kubed-ext-sum-mem (s)
+  "Sum comma-separated memory values in S."
+  (if (kubed-ext-none-p s) 0
+    (apply #'+ (mapcar #'kubed-ext-parse-mem
+                       (split-string s "," t "[ \t]")))))
 
-(Defun Kubed-Ext-Format-Cpu (Millicores)
-  "Format Millicores As Human-Readable Cpu String."
-  (Let ((Str (Cond
-              ((<= Millicores 0) "0")
-              ((>= Millicores 1000) (Format "%.1f" (/ Millicores 1000.0)))
-              (T (Format "%Dm" (Round Millicores))))))
-       (Propertize Str 'Kubed-Sort-Value Millicores)))
+(defun kubed-ext-format-cpu (millicores)
+  "Format MILLICORES as human-readable CPU string."
+  (let ((str (cond
+              ((<= millicores 0) "0")
+              ((>= millicores 1000) (format "%.1f" (/ millicores 1000.0)))
+              (t (format "%dm" (round millicores))))))
+    (propertize str 'kubed-sort-value millicores)))
 
-(Defun Kubed-Ext-Format-Mem (Mib)
-  "Format Mib As Human-Readable Memory String."
-  (Let ((Str (Cond
-              ((<= Mib 0) "0")
-              ((>= Mib 1024) (Format "%.1fgi" (/ Mib 1024.0)))
-              (T (Format "%.0fmi" Mib)))))
-       (Propertize Str 'Kubed-Sort-Value Mib)))
+(defun kubed-ext-format-mem (mib)
+  "Format MIB as human-readable memory string."
+  (let ((str (cond
+              ((<= mib 0) "0")
+              ((>= mib 1024) (format "%.1fGi" (/ mib 1024.0)))
+              (t (format "%.0fMi" mib)))))
+    (propertize str 'kubed-sort-value mib)))
 
-(Defun Kubed-Ext-Format-Pct (Used Total)
-  "Format Percentage Used/Total With Color Coding."
-  (If (<= Total 0)
-      (Propertize "N/A" 'Face 'Shadow 'Kubed-Sort-Value -1)
-      (Let* ((Pct (/ (* 100.0 Used) Total))
-             (Str (Format "%.0f%%" Pct)))
-            (Propertize Str
-                        'Face (Cond ((>= Pct 90) 'Error)
-                                    ((>= Pct 70) 'Warning)
-                                    (T 'Success))
-                        'Kubed-Sort-Value Pct))))
+(defun kubed-ext-format-pct (used total)
+  "Format percentage USED/TOTAL with color coding."
+  (if (<= total 0)
+      (propertize "n/a" 'face 'shadow 'kubed-sort-value -1)
+    (let* ((pct (/ (* 100.0 used) total))
+           (str (format "%.0f%%" pct)))
+      (propertize str
+                  'face (cond ((>= pct 90) 'error)
+                              ((>= pct 70) 'warning)
+                              (t 'success))
+                  'kubed-sort-value pct))))
 
-(Defun Kubed-Ext-Top-Numeric-Sorter (Col-Idx)
-  "Return A Sort Predicate Comparing Column Col-Idx By `Kubed-Sort-Value'."
-  (Lambda (A B)
-          (Let ((Va (Get-Text-Property 0 'Kubed-Sort-Value (Aref (Cadr A) Col-Idx)))
-                (Vb (Get-Text-Property 0 'Kubed-Sort-Value (Aref (Cadr B) Col-Idx))))
-               (< (Or Va 0) (Or Vb 0)))))
+(defun kubed-ext-top-numeric-sorter (col-idx)
+  "Return a sort predicate comparing column COL-IDX by `kubed-sort-value'."
+  (lambda (a b)
+    (let ((va (get-text-property 0 'kubed-sort-value (aref (cadr a) col-idx)))
+          (vb (get-text-property 0 'kubed-sort-value (aref (cadr b) col-idx))))
+      (< (or va 0) (or vb 0)))))
 
 ;; ── Kubernetes Timestamp ──
 
-(Defun Kubed-Ext--Parse-K8s-Timestamp (S)
-  "Parse Kubernetes Rfc3339/Iso8601 Timestamp S To An Emacs Time Value.
+(defun kubed-ext--parse-k8s-timestamp (s)
+  "Parse Kubernetes RFC3339/ISO8601 timestamp S to an Emacs time value.
 
-Supports The Common Kubernetes Forms:
-- Yyyy-Mm-Ddthh:Mm:Ssz
-- Yyyy-Mm-Ddthh:Mm:Ss.Sssz
-- Yyyy-Mm-Ddthh:Mm:Ss±Hh:Mm
+Supports the common Kubernetes forms:
+- YYYY-MM-DDTHH:MM:SSZ
+- YYYY-MM-DDTHH:MM:SS.sssZ
+- YYYY-MM-DDTHH:MM:SS±HH:MM
 
-Return Nil If S Cannot Be Parsed."
-  (When (And (Stringp S)
-             (Not (String-Empty-P S))
-             ;; Quick Guard: Must Start With Yyyy-Mm-Ddthh:Mm:Ss
-             (String-Match-P
+Return nil if S cannot be parsed."
+  (when (and (stringp s)
+             (not (string-empty-p s))
+             ;; Quick guard: must start with YYYY-MM-DDTHH:MM:SS
+             (string-match-p
               "\\`[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}T[0-9]\\{2\\}:[0-9]\\{2\\}:[0-9]\\{2\\}"
-              S))
-        (Condition-Case Nil
-                        (Parse-Iso8601-Time-String S)
-                        (Error Nil))))
+              s))
+    (condition-case nil
+        (parse-iso8601-time-string s)
+      (error nil))))
 
-(Defun Kubed-Ext--Format-Age (Timestamp)
-  "Convert Timestamp To Human-Readable Relative Age Like Kubectl.
+(defun kubed-ext--format-age (timestamp)
+  "Convert TIMESTAMP to human-readable relative age like kubectl.
 
-If Timestamp Already Carries A `Kubed-Sort-Value' Text Property (I.E. It
-Was Already Formatted By A Previous Call), Return It Unchanged.
-Returns `N/A' For Nil, Empty, Or Placeholder Values Like `<None>'."
-  (Cond
-   ;; Nil, Empty, Or Kubectl Placeholder.
-   ((Kubed-Ext-None-P Timestamp)
-    (Propertize "N/A" 'Face 'Shadow 'Kubed-Sort-Value 0))
-   ;; Already Formatted — Return As-Is (Idempotency Guard).
-   ((And (Stringp Timestamp)
-         (Get-Text-Property 0 'Kubed-Sort-Value Timestamp))
-    Timestamp)
-   ;; Try To Parse As Iso 8601 Timestamp.
-   (T
-    (Let ((Parsed (Kubed-Ext--Parse-K8s-Timestamp Timestamp)))
-         (If (Null Parsed)
-             ;; Not A Recognizable Timestamp — Pass Through.
-             (Propertize (If (Stringp Timestamp) Timestamp
-                             (Format "%S" Timestamp))
-                         'Kubed-Sort-Value 0)
-             (Let* ((Secs (Max 0 (Floor (Float-Time (Time-Subtract Nil Parsed)))))
-                    (Total-Minutes (/ Secs 60))
-                    (Hours (/ Secs 3600))
-                    (Days (/ Secs 86400))
-                    (Years (/ Days 365))
-                    (Str (Cond
-                          ((< Secs 120)
-                           (Format "%Ds" Secs))
-                          ((< Total-Minutes 10)
-                           (Let ((S (Mod Secs 60)))
-                                (If (= S 0) (Format "%Dm" Total-Minutes)
-                                    (Format "%Dm%Ds" Total-Minutes S))))
-                          ((< Hours 3)
-                           (Format "%Dm" Total-Minutes))
-                          ((< Hours 8)
-                           (Let ((M (Mod Total-Minutes 60)))
-                                (If (= M 0) (Format "%Dh" Hours)
-                                    (Format "%Dh%Dm" Hours M))))
-                          ((< Hours 48)
-                           (Format "%Dh" Hours))
-                          ((< Days 8)
-                           (Let ((H (Mod Hours 24)))
-                                (If (= H 0) (Format "%Dd" Days)
-                                    (Format "%Dd%Dh" Days H))))
-                          ((< Years 2)
-                           (Format "%Dd" Days))
-                          ((< Years 8)
-                           (Format "%Dy%Dd" Years (Mod Days 365)))
-                          (T (Format "%Dy" Years)))))
-                   (Propertize Str 'Kubed-Sort-Value (Float Secs))))))))
+If TIMESTAMP already carries a `kubed-sort-value' text property (i.e. it
+was already formatted by a previous call), return it unchanged.
+Returns `n/a' for nil, empty, or placeholder values like `<none>'."
+  (cond
+   ;; Nil, empty, or kubectl placeholder.
+   ((kubed-ext-none-p timestamp)
+    (propertize "n/a" 'face 'shadow 'kubed-sort-value 0))
+   ;; Already formatted — return as-is (idempotency guard).
+   ((and (stringp timestamp)
+         (get-text-property 0 'kubed-sort-value timestamp))
+    timestamp)
+   ;; Try to parse as ISO 8601 timestamp.
+   (t
+    (let ((parsed (kubed-ext--parse-k8s-timestamp timestamp)))
+      (if (null parsed)
+          ;; Not a recognizable timestamp — pass through.
+          (propertize (if (stringp timestamp) timestamp
+                        (format "%s" timestamp))
+                      'kubed-sort-value 0)
+        (let* ((secs (max 0 (floor (float-time (time-subtract nil parsed)))))
+               (total-minutes (/ secs 60))
+               (hours (/ secs 3600))
+               (days (/ secs 86400))
+               (years (/ days 365))
+               (str (cond
+                     ((< secs 120)
+                      (format "%ds" secs))
+                     ((< total-minutes 10)
+                      (let ((s (mod secs 60)))
+                        (if (= s 0) (format "%dm" total-minutes)
+                          (format "%dm%ds" total-minutes s))))
+                     ((< hours 3)
+                      (format "%dm" total-minutes))
+                     ((< hours 8)
+                      (let ((m (mod total-minutes 60)))
+                        (if (= m 0) (format "%dh" hours)
+                          (format "%dh%dm" hours m))))
+                     ((< hours 48)
+                      (format "%dh" hours))
+                     ((< days 8)
+                      (let ((h (mod hours 24)))
+                        (if (= h 0) (format "%dd" days)
+                          (format "%dd%dh" days h))))
+                     ((< years 2)
+                      (format "%dd" days))
+                     ((< years 8)
+                      (format "%dy%dd" years (mod days 365)))
+                     (t (format "%dy" years)))))
+          (propertize str 'kubed-sort-value (float secs))))))))
 
-;; ── Pod Status Computation (Kubel-Style) ──
+;; ── Pod Status Computation (kubel-style) ──
 
-(Defun Kubed-Ext--Compute-Pod-Status (Phase Waiting Terminated Deletion)
-  "Compute Kubel-Style Pod Status From Phase, Waiting, Terminated, Deletion.
-Returns A Propertized String With Face From `Kubed-Ext-Status-Faces'.
-Deletion Is Detected By Positive Timestamp Match."
-  (Let* ((Waiting-Reason (Unless (Kubed-Ext-None-P Waiting)
-                                 (Car (Split-String Waiting ","))))
-         (Terminated-Reason (Unless (Kubed-Ext-None-P Terminated)
-                                    (Car (Split-String Terminated ","))))
-         (Deleting (And (Stringp Deletion)
-                        (String-Match-P
+(defun kubed-ext--compute-pod-status (phase waiting terminated deletion)
+  "Compute kubel-style pod status from PHASE, WAITING, TERMINATED, DELETION.
+Returns a propertized string with face from `kubed-ext-status-faces'.
+Deletion is detected by positive timestamp match."
+  (let* ((waiting-reason (unless (kubed-ext-none-p waiting)
+                           (car (split-string waiting ","))))
+         (terminated-reason (unless (kubed-ext-none-p terminated)
+                              (car (split-string terminated ","))))
+         (deleting (and (stringp deletion)
+                        (string-match-p
                          "\\`[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}T"
-                         Deletion)))
-         (Status (Cond
-                  (Deleting "Terminating")
-                  (Waiting-Reason Waiting-Reason)
-                  (Terminated-Reason Terminated-Reason)
-                  (T (Or Phase "Unknown"))))
-         (Face (Cdr (Assoc Status Kubed-Ext-Status-Faces))))
-        (If Face (Propertize Status 'Face Face) Status)))
+                         deletion)))
+         (status (cond
+                  (deleting "Terminating")
+                  (waiting-reason waiting-reason)
+                  (terminated-reason terminated-reason)
+                  (t (or phase "Unknown"))))
+         (face (cdr (assoc status kubed-ext-status-faces))))
+    (if face (propertize status 'face face) status)))
 
-(Defun Kubed-Ext--Format-Pod-Ready (Ready-Count Total-Count)
-  "Format Ready-Count/Total-Count As Kubel-Style `X/Y' With Color."
-  (Let* ((R (String-To-Number (Or Ready-Count "0")))
-         (Tot (String-To-Number (Or Total-Count "0")))
-         (Str (Format "%D/%D" R Tot))
-         (Face (Cond
-                ((And (= R 0) (= Tot 0)) 'Shadow)
-                ((= R Tot)                'Success)
-                ((> R 0)                  'Warning)
-                (T                        'Error))))
-        (Propertize Str 'Face Face 'Kubed-Sort-Value R)))
+(defun kubed-ext--format-pod-ready (ready-count total-count)
+  "Format READY-COUNT/TOTAL-COUNT as kubel-style `x/y' with color."
+  (let* ((r (string-to-number (or ready-count "0")))
+         (tot (string-to-number (or total-count "0")))
+         (str (format "%d/%d" r tot))
+         (face (cond
+                ((and (= r 0) (= tot 0)) 'shadow)
+                ((= r tot)                'success)
+                ((> r 0)                  'warning)
+                (t                        'error))))
+    (propertize str 'face face 'kubed-sort-value r)))
 
-(Defun Kubed-Ext--Format-Pod-Restarts (Count)
-  "Format Pod Restart Count With Color Coding."
-  (Let* ((Str (Number-To-String Count))
-         (Face (Cond
-                ((= Count 0) Nil)
-                ((< Count 5) 'Warning)
-                (T 'Error))))
-        (If Face
-            (Propertize Str 'Face Face 'Kubed-Sort-Value Count)
-            (Propertize Str 'Kubed-Sort-Value Count))))
+(defun kubed-ext--format-pod-restarts (count)
+  "Format pod restart COUNT with color coding."
+  (let* ((str (number-to-string count))
+         (face (cond
+                ((= count 0) nil)
+                ((< count 5) 'warning)
+                (t 'error))))
+    (if face
+        (propertize str 'face face 'kubed-sort-value count)
+      (propertize str 'kubed-sort-value count))))
 
 ;; ── Deployment Formatting ──
 
-(Defun Kubed-Ext--Format-Ready-Total (Ready Replicas)
-  "Format Ready/Replicas As Ready/Total With Color Coding."
-  (Let* ((R (String-To-Number (Or Ready "0")))
-         (Tot (String-To-Number (Or Replicas "0")))
-         (Str (Format "%D/%D" R Tot))
-         (Face (Cond
-                ((And (= R 0) (= Tot 0)) 'Shadow)
-                ((= R Tot)                'Success)
-                ((> R 0)                  'Warning)
-                (T                        'Error))))
-        (Propertize Str 'Face Face 'Kubed-Sort-Value R)))
+(defun kubed-ext--format-ready-total (ready replicas)
+  "Format READY/REPLICAS as ready/total with color coding."
+  (let* ((r (string-to-number (or ready "0")))
+         (tot (string-to-number (or replicas "0")))
+         (str (format "%d/%d" r tot))
+         (face (cond
+                ((and (= r 0) (= tot 0)) 'shadow)
+                ((= r tot)                'success)
+                ((> r 0)                  'warning)
+                (t                        'error))))
+    (propertize str 'face face 'kubed-sort-value r)))
 
-(Defun Kubed-Ext--Format-Deployment-Count (Count Replicas)
-  "Format Deployment Count Relative To Replicas With Color Coding."
-  (Let* ((C (String-To-Number (Or Count "0")))
-         (Tot (String-To-Number (Or Replicas "0")))
-         (Str (Number-To-String C))
-         (Face (Cond
-                ((And (= C 0) (= Tot 0)) 'Shadow)
-                ((>= C Tot)               'Success)
-                ((> C 0)                  'Warning)
-                (T                        'Error))))
-        (Propertize Str 'Face Face 'Kubed-Sort-Value C)))
+(defun kubed-ext--format-deployment-count (count replicas)
+  "Format deployment COUNT relative to REPLICAS with color coding."
+  (let* ((c (string-to-number (or count "0")))
+         (tot (string-to-number (or replicas "0")))
+         (str (number-to-string c))
+         (face (cond
+                ((and (= c 0) (= tot 0)) 'shadow)
+                ((>= c tot)               'success)
+                ((> c 0)                  'warning)
+                (t                        'error))))
+    (propertize str 'face face 'kubed-sort-value c)))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 6.  Enhance Upstream Resource Columns + Mode Hooks
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Kubed-Ext-Set-Columns
- "Pods"
- (List
-  '("Phase:.Status.Phase")
-  '("Ready_Names:.Status.Containerstatuses[?(@.Ready==True)].Name")
-  '("All_Names:.Status.Containerstatuses[*].Name")
-  '("Starttime:.Status.Starttime")
-  '("Restarts:.Status.Containerstatuses[*].Restartcount")
-  '("Ip:.Status.Podip")
-  '("Node:.Spec.Nodename")
-  '("Waiting:.Status.Containerstatuses[*].State.Waiting.Reason")
-  '("Terminated:.Status.Containerstatuses[*].State.Terminated.Reason")
-  '("Deletion:.Metadata.Deletiontimestamp"))
- Nil)
+(kubed-ext-set-columns
+ "pods"
+ (list
+  '("PHASE:.status.phase")
+  '("READY_NAMES:.status.containerStatuses[?(@.ready==true)].name")
+  '("ALL_NAMES:.status.containerStatuses[*].name")
+  '("STARTTIME:.status.startTime")
+  '("RESTARTS:.status.containerStatuses[*].restartCount")
+  '("IP:.status.podIP")
+  '("NODE:.spec.nodeName")
+  '("WAITING:.status.containerStatuses[*].state.waiting.reason")
+  '("TERMINATED:.status.containerStatuses[*].state.terminated.reason")
+  '("DELETION:.metadata.deletionTimestamp"))
+ nil)
 
-(Defun Kubed-Ext--Count-Csv-Items (S)
-  "Count Comma-Separated Items In S.  Empty/None=0, Single Item=1."
-  (Cond
-   ((Kubed-Ext-None-P S)             0)
-   ((String-Empty-P (String-Trim S)) 0)
-   (T (1+ (Seq-Count (Lambda (C) (= C ?,)) S)))))
+(defun kubed-ext--count-csv-items (s)
+  "Count comma-separated items in S.  Empty/none=0, single item=1."
+  (cond
+   ((kubed-ext-none-p s)             0)
+   ((string-empty-p (string-trim s)) 0)
+   (t (1+ (seq-count (lambda (c) (= c ?,)) s)))))
 
-(Defun Kubed-Ext--Pod-Entries ()
-  "Custom Entries For Pods With Kubel-Style Status And Color Coding.
-Reads 11-Element Fetch Vectors And Produces 7-Column Display Vectors:
-Name, Ready(X/Y), Status, Restarts, Age, Ip, Node."
-  (Let* ((Raw  (Alist-Get 'Resources (Kubed--Alist Kubed-List-Type
-                                                   Kubed-List-Context
-                                                   Kubed-List-Namespace)))
-         (Pred (Kubed-List-Interpret-Filter))
-         (Result Nil))
-        (Dolist (Entry Raw)
-                (Let* ((Vec (Cadr Entry))
-                       (New-Entry
-                        (If (And (Vectorp Vec) (>= (Length Vec) 11))
-                            (Let* ((Ready-Names  (Aref Vec 2))
-                                   (All-Names    (Aref Vec 3))
-                                   (Restart-Raw  (Aref Vec 5))
-                                   (Ready-Count  (Kubed-Ext--Count-Csv-Items Ready-Names))
-                                   (Total-Count  (Kubed-Ext--Count-Csv-Items All-Names))
-                                   (Restart-N    (If (Kubed-Ext-None-P Restart-Raw) 0
-                                                     (Apply #'+
-                                                            (Mapcar #'String-To-Number
-                                                                    (Split-String
-                                                                     Restart-Raw "," T " "))))))
-                                  (List (Car Entry)
-                                        (Vector
-                                         (Aref Vec 0)
-                                         (Kubed-Ext--Format-Pod-Ready
-                                          (Number-To-String Ready-Count)
-                                          (Number-To-String Total-Count))
-                                         (Kubed-Ext--Compute-Pod-Status
-                                          (Aref Vec 1) (Aref Vec 8) (Aref Vec 9) (Aref Vec 10))
-                                         (Kubed-Ext--Format-Pod-Restarts Restart-N)
-                                         (Kubed-Ext--Format-Age (Aref Vec 4))
-                                         (If (Kubed-Ext-None-P (Aref Vec 6)) "" (Aref Vec 6))
-                                         (If (Kubed-Ext-None-P (Aref Vec 7)) "" (Aref Vec 7)))))
-                            Entry)))
-                      (When (Funcall Pred New-Entry)
-                            (Push New-Entry Result))))
-        (Nreverse Result)))
+(defun kubed-ext--pod-entries ()
+  "Custom entries for pods with kubel-style status and color coding.
+Reads 11-element fetch vectors and produces 7-column display vectors:
+Name, Ready(x/y), Status, Restarts, Age, IP, Node."
+  (let* ((raw  (alist-get 'resources (kubed--alist kubed-list-type
+                                                   kubed-list-context
+                                                   kubed-list-namespace)))
+         (pred (kubed-list-interpret-filter))
+         (result nil))
+    (dolist (entry raw)
+      (let* ((vec (cadr entry))
+             (new-entry
+              (if (and (vectorp vec) (>= (length vec) 11))
+                  (let* ((ready-names  (aref vec 2))
+                         (all-names    (aref vec 3))
+                         (restart-raw  (aref vec 5))
+                         (ready-count  (kubed-ext--count-csv-items ready-names))
+                         (total-count  (kubed-ext--count-csv-items all-names))
+                         (restart-n    (if (kubed-ext-none-p restart-raw) 0
+                                         (apply #'+
+                                                (mapcar #'string-to-number
+                                                        (split-string
+                                                         restart-raw "," t " "))))))
+                    (list (car entry)
+                          (vector
+                           (aref vec 0)
+                           (kubed-ext--format-pod-ready
+                            (number-to-string ready-count)
+                            (number-to-string total-count))
+                           (kubed-ext--compute-pod-status
+                            (aref vec 1) (aref vec 8) (aref vec 9) (aref vec 10))
+                           (kubed-ext--format-pod-restarts restart-n)
+                           (kubed-ext--format-age (aref vec 4))
+                           (if (kubed-ext-none-p (aref vec 6)) "" (aref vec 6))
+                           (if (kubed-ext-none-p (aref vec 7)) "" (aref vec 7)))))
+                entry)))
+        (when (funcall pred new-entry)
+          (push new-entry result))))
+    (nreverse result)))
 
-(Defun Kubed-Ext--Pod-Mode-Setup ()
-  "Set Up Pod List With Kubel-Style Ready, Status, Restarts, Age Columns."
-  (Setq-Local Tabulated-List-Format
-              (Vector
-               Kubed-Name-Column
-               (List "Ready" 7 (Kubed-Ext-Top-Numeric-Sorter 1))
-               (List "Status" 22 T)
-               (List "Restarts" 9
-                     (Kubed-Ext-Top-Numeric-Sorter 3) :Right-Align T)
-               (List "Age" 10 (Kubed-Ext-Top-Numeric-Sorter 4))
-               (List "Ip" 16 T)
-               (List "Node" 32 T)))
-  (Setq-Local Tabulated-List-Entries #'Kubed-Ext--Pod-Entries)
-  (Tabulated-List-Init-Header))
+(defun kubed-ext--pod-mode-setup ()
+  "Set up pod list with kubel-style Ready, Status, Restarts, Age columns."
+  (setq-local tabulated-list-format
+              (vector
+               kubed-name-column
+               (list "Ready" 7 (kubed-ext-top-numeric-sorter 1))
+               (list "Status" 22 t)
+               (list "Restarts" 9
+                     (kubed-ext-top-numeric-sorter 3) :right-align t)
+               (list "Age" 10 (kubed-ext-top-numeric-sorter 4))
+               (list "IP" 16 t)
+               (list "Node" 32 t)))
+  (setq-local tabulated-list-entries #'kubed-ext--pod-entries)
+  (tabulated-list-init-header))
 
-(Add-Hook 'Kubed-Pods-Mode-Hook #'Kubed-Ext--Pod-Mode-Setup)
+(add-hook 'kubed-pods-mode-hook #'kubed-ext--pod-mode-setup)
 
-(Kubed-Ext-Append-Columns
- "Services"
- (List
-  (Cons "Selector:.Spec.Selector"
-        (Lambda (S)
-                (Cond
-                 ((Kubed-Ext-None-P S) "")
-                 ((String-Prefix-P "Map[" S) (Substring S 4 -1))
-                 (T S)))))
- (List (List "Selector" 40 T)))
+(kubed-ext-append-columns
+ "services"
+ (list
+  (cons "SELECTOR:.spec.selector"
+        (lambda (s)
+          (cond
+           ((kubed-ext-none-p s) "")
+           ((string-prefix-p "map[" s) (substring s 4 -1))
+           (t s)))))
+ (list (list "Selector" 40 t)))
 
-(Kubed-Ext-Set-Columns
- "Ingresses"
- (List
-  '("Class:.Spec.Ingressclassname")
-  '("Hosts:.Spec.Rules[*].Host")
-  (Cons "Address:.Status.Loadbalancer.Ingress[0]"
-        (Lambda (S)
-                (Cond
-                 ((Kubed-Ext-None-P S) "")
-                 ((String-Match "Ip:$[^] :]+$" S) (Match-String 1 S))
-                 ((String-Match "Hostname:$[^] :]+$" S) (Match-String 1 S))
-                 (T S))))
-  (Cons "Ports:.Spec.Tls[0].Hosts"
-        (Lambda (S)
-                (If (Kubed-Ext-None-P S) "80" "80, 443")))
-  (Cons "Age:.Metadata.Creationtimestamp" #'Kubed-Ext--Format-Age))
- (List
-  (List "Class" 20 T)
-  (List "Hosts" 40 T)
-  (List "Address" 40 T)
-  (List "Ports" 10 T)
-  (List "Age" 20 T)))
+(kubed-ext-set-columns
+ "ingresses"
+ (list
+  '("CLASS:.spec.ingressClassName")
+  '("HOSTS:.spec.rules[*].host")
+  (cons "ADDRESS:.status.loadBalancer.ingress[0]"
+        (lambda (s)
+          (cond
+           ((kubed-ext-none-p s) "")
+           ((string-match "ip:$[^] :]+$" s) (match-string 1 s))
+           ((string-match "hostname:$[^] :]+$" s) (match-string 1 s))
+           (t s))))
+  (cons "PORTS:.spec.tls[0].hosts"
+        (lambda (s)
+          (if (kubed-ext-none-p s) "80" "80, 443")))
+  (cons "AGE:.metadata.creationTimestamp" #'kubed-ext--format-age))
+ (list
+  (list "Class" 20 t)
+  (list "Hosts" 40 t)
+  (list "Address" 40 t)
+  (list "Ports" 10 t)
+  (list "Age" 20 t)))
 
-(Kubed-Ext-Set-Columns
- "Persistentvolumes"
- (List
-  '("Capacity:.Spec.Capacity.Storage")
-  '("Access-Modes:.Spec.Accessmodes[*]")
-  '("Reclaim:.Spec.Persistentvolumereclaimpolicy")
-  (Cons "Status:.Status.Phase"
-        (Lambda (Ph)
-                (Let ((Face (Cdr (Assoc Ph Kubed-Ext-Status-Faces))))
-                     (If Face (Propertize Ph 'Face Face) Ph))))
-  '("Claim-Ns:.Spec.Claimref.Namespace")
-  '("Claim-Name:.Spec.Claimref.Name")
-  '("Storageclass:.Spec.Storageclassname"))
- (List
-  (List "Capacity" 10 T)
-  (List "Access-Modes" 18 T)
-  (List "Reclaim" 14 T)
-  (List "Status" 10 T)
-  (List "Claim-Ns" 16 T)
-  (List "Claim-Name" 28 T)
-  (List "Storageclass" 20 T)))
+(kubed-ext-set-columns
+ "persistentvolumes"
+ (list
+  '("CAPACITY:.spec.capacity.storage")
+  '("ACCESS-MODES:.spec.accessModes[*]")
+  '("RECLAIM:.spec.persistentVolumeReclaimPolicy")
+  (cons "STATUS:.status.phase"
+        (lambda (ph)
+          (let ((face (cdr (assoc ph kubed-ext-status-faces))))
+            (if face (propertize ph 'face face) ph))))
+  '("CLAIM-NS:.spec.claimRef.namespace")
+  '("CLAIM-NAME:.spec.claimRef.name")
+  '("STORAGECLASS:.spec.storageClassName"))
+ (list
+  (list "Capacity" 10 t)
+  (list "Access-modes" 18 t)
+  (list "Reclaim" 14 t)
+  (list "Status" 10 t)
+  (list "Claim-ns" 16 t)
+  (list "Claim-name" 28 t)
+  (list "Storageclass" 20 t)))
 
-(Defun Kubed-Ext--Deployment-Entries ()
-  "Custom Entries For Deployments With Kubel-Style Ready And Age."
-  (Let* ((Raw (Alist-Get 'Resources (Kubed--Alist Kubed-List-Type
-                                                  Kubed-List-Context
-                                                  Kubed-List-Namespace)))
-         (Pred (Kubed-List-Interpret-Filter))
-         (Result Nil))
-        (Dolist (Entry Raw)
-                (Let* ((Vec (Cadr Entry))
-                       (New-Entry
-                        (If (And (Vectorp Vec) (>= (Length Vec) 6))
-                            (List (Car Entry)
-                                  (Vector
-                                   (Aref Vec 0)
-                                   (Kubed-Ext--Format-Ready-Total
-                                    (Let ((V (Aref Vec 1)))
-                                         (If (Kubed-Ext-None-P V) "0" V))
-                                    (Let ((V (Aref Vec 4)))
-                                         (If (Kubed-Ext-None-P V) "0" V)))
-                                   (Kubed-Ext--Format-Deployment-Count
-                                    (Let ((V (Aref Vec 2)))
-                                         (If (Kubed-Ext-None-P V) "0" V))
-                                    (Let ((V (Aref Vec 4)))
-                                         (If (Kubed-Ext-None-P V) "0" V)))
-                                   (Kubed-Ext--Format-Deployment-Count
-                                    (Let ((V (Aref Vec 3)))
-                                         (If (Kubed-Ext-None-P V) "0" V))
-                                    (Let ((V (Aref Vec 4)))
-                                         (If (Kubed-Ext-None-P V) "0" V)))
-                                   (Kubed-Ext--Format-Age (Aref Vec 5))))
-                            Entry)))
-                      (When (Funcall Pred New-Entry)
-                            (Push New-Entry Result))))
-        (Nreverse Result)))
+(defun kubed-ext--deployment-entries ()
+  "Custom entries for deployments with kubel-style Ready and Age."
+  (let* ((raw (alist-get 'resources (kubed--alist kubed-list-type
+                                                  kubed-list-context
+                                                  kubed-list-namespace)))
+         (pred (kubed-list-interpret-filter))
+         (result nil))
+    (dolist (entry raw)
+      (let* ((vec (cadr entry))
+             (new-entry
+              (if (and (vectorp vec) (>= (length vec) 6))
+                  (list (car entry)
+                        (vector
+                         (aref vec 0)
+                         (kubed-ext--format-ready-total
+                          (let ((v (aref vec 1)))
+                            (if (kubed-ext-none-p v) "0" v))
+                          (let ((v (aref vec 4)))
+                            (if (kubed-ext-none-p v) "0" v)))
+                         (kubed-ext--format-deployment-count
+                          (let ((v (aref vec 2)))
+                            (if (kubed-ext-none-p v) "0" v))
+                          (let ((v (aref vec 4)))
+                            (if (kubed-ext-none-p v) "0" v)))
+                         (kubed-ext--format-deployment-count
+                          (let ((v (aref vec 3)))
+                            (if (kubed-ext-none-p v) "0" v))
+                          (let ((v (aref vec 4)))
+                            (if (kubed-ext-none-p v) "0" v)))
+                         (kubed-ext--format-age (aref vec 5))))
+                entry)))
+        (when (funcall pred new-entry)
+          (push new-entry result))))
+    (nreverse result)))
 
-(Defun Kubed-Ext--Deployment-Mode-Setup ()
-  "Set Up Deployment List With Kubel-Style Ready And Age Columns."
-  (Setq-Local Tabulated-List-Format
-              (Vector
-               Kubed-Name-Column
-               (List "Ready" 10 (Kubed-Ext-Top-Numeric-Sorter 1))
-               (List "Up-To-Date" 12
-                     (Kubed-Ext-Top-Numeric-Sorter 2) :Right-Align T)
-               (List "Available" 12
-                     (Kubed-Ext-Top-Numeric-Sorter 3) :Right-Align T)
-               (List "Age" 12 (Kubed-Ext-Top-Numeric-Sorter 4))))
-  (Setq-Local Tabulated-List-Entries #'Kubed-Ext--Deployment-Entries)
-  (Tabulated-List-Init-Header))
+(defun kubed-ext--deployment-mode-setup ()
+  "Set up deployment list with kubel-style Ready and Age columns."
+  (setq-local tabulated-list-format
+              (vector
+               kubed-name-column
+               (list "Ready" 10 (kubed-ext-top-numeric-sorter 1))
+               (list "Up-to-date" 12
+                     (kubed-ext-top-numeric-sorter 2) :right-align t)
+               (list "Available" 12
+                     (kubed-ext-top-numeric-sorter 3) :right-align t)
+               (list "Age" 12 (kubed-ext-top-numeric-sorter 4))))
+  (setq-local tabulated-list-entries #'kubed-ext--deployment-entries)
+  (tabulated-list-init-header))
 
-(Add-Hook 'Kubed-Deployments-Mode-Hook #'Kubed-Ext--Deployment-Mode-Setup)
+(add-hook 'kubed-deployments-mode-hook #'kubed-ext--deployment-mode-setup)
 
 ;;; ═══════════════════════════════════════════════════════════════
-;;; § 7.  New Built-In Resources
+;;; § 7.  New Built-in Resources
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Eval '(Kubed-Define-Resource Node
-                              ((Status ".Status.Conditions[-1:].Status" 10
-                                       Nil
-                                       (Lambda (S)
-                                               (Cond
-                                                ((String= S "True")    (Propertize "Ready"    'Face 'Success))
-                                                ((String= S "False")   (Propertize "Notready" 'Face 'Error))
-                                                ((String= S "Unknown") (Propertize "Unknown"  'Face 'Warning))
-                                                (T S))))
-                               (Roles ".Metadata.Labels" 16
-                                      Nil
-                                      (Lambda (S)
-                                              (Let ((Roles Nil) (Pos 0))
-                                                   (While (String-Match
-                                                           "Node-Role\\.Kubernetes\\.Io/$[^:=, ]+$"
-                                                           S Pos)
-                                                          (Push (Match-String 1 S) Roles)
-                                                          (Setq Pos (Match-End 0)))
-                                                   (If Roles (String-Join (Nreverse Roles) ",") ""))))
-                               (Taints ".Spec.Taints[*].Key" 7
-                                       (Lambda (L R)
-                                               (< (String-To-Number L) (String-To-Number R)))
-                                       (Lambda (S)
-                                               (If (Or (String-Empty-P S) (String= S "")) "0"
-                                                   (Number-To-String
-                                                    (1+ (Seq-Count (Lambda (C) (= C ?,)) S)))))
-                                       :Right-Align T)
-                               (Version ".Status.Nodeinfo.Kubeletversion" 14)
-                               (Cpu-Alloc ".Status.Allocatable.Cpu" 6
-                                          (Lambda (L R)
-                                                  (< (String-To-Number L) (String-To-Number R)))
-                                          Nil :Right-Align T)
-                               (Mem-Alloc ".Status.Allocatable.Memory" 8
-                                          Nil
-                                          (Lambda (S)
-                                                  (Let ((Mib (Kubed-Ext-Parse-Mem S)))
-                                                       (If (>= Mib 1024)
-                                                           (Format "%.1fgi" (/ Mib 1024.0))
-                                                           (Format "%.0fmi" Mib))))
-                                          :Right-Align T)
-                               (Internal-Ip ".Status.Addresses[0].Address" 16)
-                               (Creationtimestamp ".Metadata.Creationtimestamp" 20))
-                              :Namespaced Nil
-                              (Top "T" "Show Resource Metrics For"
-                                   (Let* ((Ctx Kubed-List-Context)
-                                          (Top-Out (With-Temp-Buffer
-                                                    (Call-Process Kubed-Kubectl-Program Nil T Nil
-                                                                  "Top" "Node" Node
-                                                                  "--No-Headers" "--Context" Ctx)
-                                                    (Buffer-String)))
-                                          (Top-F (Split-String (String-Trim Top-Out) Nil T))
-                                          (Cpu-Used (Kubed-Ext-Parse-Cpu (Nth 1 Top-F)))
-                                          (Mem-Used (Kubed-Ext-Parse-Mem (Nth 3 Top-F)))
-                                          (Alloc-Out (With-Temp-Buffer
-                                                      (Call-Process
-                                                       Kubed-Kubectl-Program Nil T Nil
-                                                       "Get" "Node" Node "--No-Headers"
-                                                       "--Context" Ctx "-O"
-                                                       "Custom-Columns=Cpu:.Status.Allocatable.Cpu,Mem:.Status.Allocatable.Memory")
-                                                      (Buffer-String)))
-                                          (Alloc-F (Split-String (String-Trim Alloc-Out) Nil T))
-                                          (Cpu-A (Kubed-Ext-Parse-Cpu (Nth 0 Alloc-F)))
-                                          (Mem-A (Kubed-Ext-Parse-Mem (Nth 1 Alloc-F)))
-                                          (Buf (Get-Buffer-Create
-                                                (Format "*Kubed-Top Node/%S[%S]*" Node Ctx))))
-                                         (With-Current-Buffer Buf
-                                                              (Let ((Inhibit-Read-Only T))
-                                                                   (Erase-Buffer)
-                                                                   (Insert (Propertize (Format "Node Metrics: %S\N" Node)
-                                                                                       'Face 'Bold))
-                                                                   (Insert (Make-String 60 ?-) "\N\N")
-                                                                   (Insert (Format "  Cpu:  %S Used  /  %S Allocatable  (%S)\N"
-                                                                                   (Kubed-Ext-Format-Cpu Cpu-Used)
-                                                                                   (Kubed-Ext-Format-Cpu Cpu-A)
-                                                                                   (Kubed-Ext-Format-Pct Cpu-Used Cpu-A)))
-                                                                   (Insert (Format "  Mem:  %S Used  /  %S Allocatable  (%S)\N"
-                                                                                   (Kubed-Ext-Format-Mem Mem-Used)
-                                                                                   (Kubed-Ext-Format-Mem Mem-A)
-                                                                                   (Kubed-Ext-Format-Pct Mem-Used Mem-A)))
-                                                                   (Goto-Char (Point-Min))
-                                                                   (Special-Mode)))
-                                         (Display-Buffer Buf))))
-      T)
+(eval '(kubed-define-resource node
+           ((status ".status.conditions[-1:].status" 10
+                    nil
+                    (lambda (s)
+                      (cond
+                       ((string= s "True")    (propertize "Ready"    'face 'success))
+                       ((string= s "False")   (propertize "NotReady" 'face 'error))
+                       ((string= s "Unknown") (propertize "Unknown"  'face 'warning))
+                       (t s))))
+            (roles ".metadata.labels" 16
+                   nil
+                   (lambda (s)
+                     (let ((roles nil) (pos 0))
+                       (while (string-match
+                               "node-role\\.kubernetes\\.io/$[^:=, ]+$"
+                               s pos)
+                         (push (match-string 1 s) roles)
+                         (setq pos (match-end 0)))
+                       (if roles (string-join (nreverse roles) ",") ""))))
+            (taints ".spec.taints[*].key" 7
+                    (lambda (l r)
+                      (< (string-to-number l) (string-to-number r)))
+                    (lambda (s)
+                      (if (or (string-empty-p s) (string= s "")) "0"
+                        (number-to-string
+                         (1+ (seq-count (lambda (c) (= c ?,)) s)))))
+                    :right-align t)
+            (version ".status.nodeInfo.kubeletVersion" 14)
+            (cpu-alloc ".status.allocatable.cpu" 6
+                       (lambda (l r)
+                         (< (string-to-number l) (string-to-number r)))
+                       nil :right-align t)
+            (mem-alloc ".status.allocatable.memory" 8
+                       nil
+                       (lambda (s)
+                         (let ((mib (kubed-ext-parse-mem s)))
+                           (if (>= mib 1024)
+                               (format "%.1fGi" (/ mib 1024.0))
+                             (format "%.0fMi" mib))))
+                       :right-align t)
+            (internal-ip ".status.addresses[0].address" 16)
+            (creationtimestamp ".metadata.creationTimestamp" 20))
+         :namespaced nil
+         (top "T" "Show resource metrics for"
+              (let* ((ctx kubed-list-context)
+                     (top-out (with-temp-buffer
+                                (call-process kubed-kubectl-program nil t nil
+                                              "top" "node" node
+                                              "--no-headers" "--context" ctx)
+                                (buffer-string)))
+                     (top-f (split-string (string-trim top-out) nil t))
+                     (cpu-used (kubed-ext-parse-cpu (nth 1 top-f)))
+                     (mem-used (kubed-ext-parse-mem (nth 3 top-f)))
+                     (alloc-out (with-temp-buffer
+                                  (call-process
+                                   kubed-kubectl-program nil t nil
+                                   "get" "node" node "--no-headers"
+                                   "--context" ctx "-o"
+                                   "custom-columns=CPU:.status.allocatable.cpu,MEM:.status.allocatable.memory")
+                                  (buffer-string)))
+                     (alloc-f (split-string (string-trim alloc-out) nil t))
+                     (cpu-a (kubed-ext-parse-cpu (nth 0 alloc-f)))
+                     (mem-a (kubed-ext-parse-mem (nth 1 alloc-f)))
+                     (buf (get-buffer-create
+                           (format "*kubed-top node/%s[%s]*" node ctx))))
+                (with-current-buffer buf
+                  (let ((inhibit-read-only t))
+                    (erase-buffer)
+                    (insert (propertize (format "Node Metrics: %s\n" node)
+                                        'face 'bold))
+                    (insert (make-string 60 ?-) "\n\n")
+                    (insert (format "  CPU:  %s used  /  %s allocatable  (%s)\n"
+                                    (kubed-ext-format-cpu cpu-used)
+                                    (kubed-ext-format-cpu cpu-a)
+                                    (kubed-ext-format-pct cpu-used cpu-a)))
+                    (insert (format "  MEM:  %s used  /  %s allocatable  (%s)\n"
+                                    (kubed-ext-format-mem mem-used)
+                                    (kubed-ext-format-mem mem-a)
+                                    (kubed-ext-format-pct mem-used mem-a)))
+                    (goto-char (point-min))
+                    (special-mode)))
+                (display-buffer buf))))
+      t)
 
-(Eval '(Kubed-Define-Resource Persistentvolumeclaim
-                              ((Status ".Status.Phase" 10 Nil
-                                       (Lambda (Ph)
-                                               (Propertize Ph 'Face
-                                                           (Pcase Ph
-                                                                  ("Bound"   'Success)
-                                                                  ("Pending" 'Warning)
-                                                                  ("Lost"    'Error)
-                                                                  (_         'Default)))))
-                               (Volume ".Spec.Volumename" 36)
-                               (Capacity ".Status.Capacity.Storage" 10)
-                               (Access-Modes ".Spec.Accessmodes[*]" 18)
-                               (Storageclass ".Spec.Storageclassname" 20)))
-      T)
+(eval '(kubed-define-resource persistentvolumeclaim
+           ((status ".status.phase" 10 nil
+                    (lambda (ph)
+                      (propertize ph 'face
+                                  (pcase ph
+                                    ("Bound"   'success)
+                                    ("Pending" 'warning)
+                                    ("Lost"    'error)
+                                    (_         'default)))))
+            (volume ".spec.volumeName" 36)
+            (capacity ".status.capacity.storage" 10)
+            (access-modes ".spec.accessModes[*]" 18)
+            (storageclass ".spec.storageClassName" 20)))
+      t)
 
-(Eval '(Kubed-Define-Resource Configmap
-                              ((Creationtimestamp ".Metadata.Creationtimestamp" 20)))
-      T)
+(eval '(kubed-define-resource configmap
+           ((creationtimestamp ".metadata.creationTimestamp" 20)))
+      t)
 
-(Eval '(Kubed-Define-Resource Event
-                              ((Type ".Type" 8 Nil
-                                     (Lambda (S)
-                                             (Propertize S 'Face
-                                                         (Pcase S
-                                                                ("Normal"  'Success)
-                                                                ("Warning" 'Warning)
-                                                                (_         'Default)))))
-                               (Reason ".Reason" 20)
-                               (Object-Kind ".Involvedobject.Kind" 12)
-                               (Object-Name ".Involvedobject.Name" 28)
-                               (Count ".Count" 6
-                                      (Lambda (L R)
-                                              (< (String-To-Number L) (String-To-Number R)))
-                                      Nil :Right-Align T)
-                               (Message ".Message" 50)
-                               (Last-Seen ".Lasttimestamp" 20)))
-      T)
+(eval '(kubed-define-resource event
+           ((type ".type" 8 nil
+                  (lambda (s)
+                    (propertize s 'face
+                                (pcase s
+                                  ("Normal"  'success)
+                                  ("Warning" 'warning)
+                                  (_         'default)))))
+            (reason ".reason" 20)
+            (object-kind ".involvedObject.kind" 12)
+            (object-name ".involvedObject.name" 28)
+            (count ".count" 6
+                   (lambda (l r)
+                     (< (string-to-number l) (string-to-number r)))
+                   nil :right-align t)
+            (message ".message" 50)
+            (last-seen ".lastTimestamp" 20)))
+      t)
 
-(Eval '(Kubed-Define-Resource Networkpolicy
-                              ((Pod-Selector ".Spec.Podselector.Matchlabels" 50 Nil
-                                             (Lambda (S)
-                                                     (Cond
-                                                      ((Or (String-Empty-P S) (String= S ""))
-                                                       "(All Pods)")
-                                                      ((String-Prefix-P "Map[" S) (Substring S 4 -1))
-                                                      (T S))))
-                               (Policy-Types ".Spec.Policytypes[*]" 18)
-                               (Creationtimestamp ".Metadata.Creationtimestamp" 20))
-                              :Plural Networkpolicies)
-      T)
+(eval '(kubed-define-resource networkpolicy
+           ((pod-selector ".spec.podSelector.matchLabels" 50 nil
+                          (lambda (s)
+                            (cond
+                             ((or (string-empty-p s) (string= s ""))
+                              "(all pods)")
+                             ((string-prefix-p "map[" s) (substring s 4 -1))
+                             (t s))))
+            (policy-types ".spec.policyTypes[*]" 18)
+            (creationtimestamp ".metadata.creationTimestamp" 20))
+         :plural networkpolicies)
+      t)
 
-(Eval '(Kubed-Define-Resource Horizontalpodautoscaler
-                              ((Reference ".Spec.Scaletargetref.Name" 28)
-                               (Ref-Kind ".Spec.Scaletargetref.Kind" 14)
-                               (Min-Pods ".Spec.Minreplicas" 8
-                                         (Lambda (L R)
-                                                 (< (String-To-Number L) (String-To-Number R)))
-                                         Nil :Right-Align T)
-                               (Max-Pods ".Spec.Maxreplicas" 8
-                                         (Lambda (L R)
-                                                 (< (String-To-Number L) (String-To-Number R)))
-                                         Nil :Right-Align T)
-                               (Replicas ".Status.Currentreplicas" 8
-                                         (Lambda (L R)
-                                                 (< (String-To-Number L) (String-To-Number R)))
-                                         Nil :Right-Align T)))
-      T)
+(eval '(kubed-define-resource horizontalpodautoscaler
+           ((reference ".spec.scaleTargetRef.name" 28)
+            (ref-kind ".spec.scaleTargetRef.kind" 14)
+            (min-pods ".spec.minReplicas" 8
+                      (lambda (l r)
+                        (< (string-to-number l) (string-to-number r)))
+                      nil :right-align t)
+            (max-pods ".spec.maxReplicas" 8
+                      (lambda (l r)
+                        (< (string-to-number l) (string-to-number r)))
+                      nil :right-align t)
+            (replicas ".status.currentReplicas" 8
+                      (lambda (l r)
+                        (< (string-to-number l) (string-to-number r)))
+                      nil :right-align t)))
+      t)
 
-(Eval '(Kubed-Define-Resource Poddisruptionbudget
-                              ((Min-Available ".Spec.Minavailable" 14)
-                               (Max-Unavailable ".Spec.Maxunavailable" 16)
-                               (Allowed-Disruptions ".Status.Disruptionsallowed" 20
-                                                    (Lambda (L R)
-                                                            (< (String-To-Number L)
-                                                               (String-To-Number R)))
-                                                    Nil :Right-Align T)
-                               (Current-Healthy ".Status.Currenthealthy" 16
-                                                (Lambda (L R)
-                                                        (< (String-To-Number L)
-                                                           (String-To-Number R)))
-                                                Nil :Right-Align T)
-                               (Desired-Healthy ".Status.Desiredhealthy" 16
-                                                (Lambda (L R)
-                                                        (< (String-To-Number L)
-                                                           (String-To-Number R)))
-                                                Nil :Right-Align T)))
-      T)
+(eval '(kubed-define-resource poddisruptionbudget
+           ((min-available ".spec.minAvailable" 14)
+            (max-unavailable ".spec.maxUnavailable" 16)
+            (allowed-disruptions ".status.disruptionsAllowed" 20
+                                 (lambda (l r)
+                                   (< (string-to-number l)
+                                      (string-to-number r)))
+                                 nil :right-align t)
+            (current-healthy ".status.currentHealthy" 16
+                             (lambda (l r)
+                               (< (string-to-number l)
+                                  (string-to-number r)))
+                             nil :right-align t)
+            (desired-healthy ".status.desiredHealthy" 16
+                             (lambda (l r)
+                               (< (string-to-number l)
+                                  (string-to-number r)))
+                             nil :right-align t)))
+      t)
 
-(Eval '(Kubed-Define-Resource Customresourcedefinition
-                              ((Group ".Spec.Group" 34)
-                               (Kind ".Spec.Names.Kind" 24)
-                               (Scope ".Spec.Scope" 12 Nil
-                                      (Lambda (S)
-                                              (Propertize S 'Face
-                                                          (Pcase S
-                                                                 ("Namespaced" 'Success)
-                                                                 ("Cluster"    'Warning)
-                                                                 (_            'Default)))))
-                               (Versions ".Spec.Versions[*].Name" 16)
-                               (Creationtimestamp ".Metadata.Creationtimestamp" 20))
-                              :Namespaced Nil
-                              (List-Instances "I" "List Instances Of"
-                                              (Let* ((Plural (Car (Split-String
-                                                                   Customresourcedefinition "\\.")))
-                                                     (Entry  (Tabulated-List-Get-Entry))
-                                                     (Scope  (And Entry
-                                                                  (Substring-No-Properties
-                                                                   (Aref Entry 3))))
-                                                     (Ns-P   (String= Scope "Namespaced"))
-                                                     (Ctx    Kubed-List-Context)
-                                                     (Buf    (Get-Buffer-Create
-                                                              (Format "*Kubed %S[%S]*" Plural Ctx))))
-                                                    (With-Current-Buffer Buf
-                                                                         (Let ((Inhibit-Read-Only T))
-                                                                              (Erase-Buffer)
-                                                                              (Apply #'Call-Process
-                                                                                     Kubed-Kubectl-Program Nil T Nil
-                                                                                     "Get" Plural "-O" "Wide"
-                                                                                     (Append
-                                                                                      (When Ctx (List "--Context" Ctx))
-                                                                                      (When Ns-P (List "--All-Namespaces"))))
-                                                                              (Goto-Char (Point-Min))
-                                                                              (Special-Mode)))
-                                                    (Display-Buffer Buf))))
-      T)
+(eval '(kubed-define-resource customresourcedefinition
+           ((group ".spec.group" 34)
+            (kind ".spec.names.kind" 24)
+            (scope ".spec.scope" 12 nil
+                   (lambda (s)
+                     (propertize s 'face
+                                 (pcase s
+                                   ("Namespaced" 'success)
+                                   ("Cluster"    'warning)
+                                   (_            'default)))))
+            (versions ".spec.versions[*].name" 16)
+            (creationtimestamp ".metadata.creationTimestamp" 20))
+         :namespaced nil
+         (list-instances "I" "List instances of"
+                         (let* ((plural (car (split-string
+                                              customresourcedefinition "\\.")))
+                                (entry  (tabulated-list-get-entry))
+                                (scope  (and entry
+                                             (substring-no-properties
+                                              (aref entry 3))))
+                                (ns-p   (string= scope "Namespaced"))
+                                (ctx    kubed-list-context)
+                                (buf    (get-buffer-create
+                                         (format "*kubed %s[%s]*" plural ctx))))
+                           (with-current-buffer buf
+                             (let ((inhibit-read-only t))
+                               (erase-buffer)
+                               (apply #'call-process
+                                      kubed-kubectl-program nil t nil
+                                      "get" plural "-o" "wide"
+                                      (append
+                                       (when ctx (list "--context" ctx))
+                                       (when ns-p (list "--all-namespaces"))))
+                               (goto-char (point-min))
+                               (special-mode)))
+                           (display-buffer buf))))
+      t)
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 8–9.  Strimzi + Plain Resources
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Eval '(Kubed-Define-Resource Kafka ()
-                              :Suffixes ([("P" "Pause Reconciliation"  Kubed-Kafkas-Pause)
-                                          ("R" "Resume Reconciliation" Kubed-Kafkas-Resume)])
-                              (Pause "P" "Pause Reconciliation For"
-                                     (Kubed-Ext-Strimzi-Pause-Reconciliation
-                                      "Kafka" Kafka Kubed-List-Context Kubed-List-Namespace)
-                                     (Kubed-List-Update T))
-                              (Resume "R" "Resume Reconciliation For"
-                                      (Kubed-Ext-Strimzi-Resume-Reconciliation
-                                       "Kafka" Kafka Kubed-List-Context Kubed-List-Namespace)
-                                      (Kubed-List-Update T)))
-      T)
+(eval '(kubed-define-resource kafka ()
+         :suffixes ([("P" "Pause Reconciliation"  kubed-kafkas-pause)
+                     ("R" "Resume Reconciliation" kubed-kafkas-resume)])
+         (pause "P" "Pause reconciliation for"
+                (kubed-ext-strimzi-pause-reconciliation
+                 "kafka" kafka kubed-list-context kubed-list-namespace)
+                (kubed-list-update t))
+         (resume "R" "Resume reconciliation for"
+                 (kubed-ext-strimzi-resume-reconciliation
+                  "kafka" kafka kubed-list-context kubed-list-namespace)
+                 (kubed-list-update t)))
+      t)
 
-(Eval '(Kubed-Define-Resource Kafkaconnect ()
-                              :Plural Kafkaconnects
-                              :Prefix (("$" "Scale" Kubed-Scale-Kafkaconnect))
-                              :Suffixes ([("$" "Scale"                 Kubed-Kafkaconnects-Scale)
-                                          ("P" "Pause Reconciliation"  Kubed-Kafkaconnects-Pause)
-                                          ("R" "Resume Reconciliation" Kubed-Kafkaconnects-Resume)])
-                              (Scale "$" "Scale"
-                                     (Kubed-Ext-Scale-Kafkaconnect
-                                      Kafkaconnect
-                                      (If Current-Prefix-Arg
-                                          (Prefix-Numeric-Value Current-Prefix-Arg)
-                                          (Read-Number "Number Of Replicas: "))
-                                      Kubed-List-Context Kubed-List-Namespace))
-                              (Pause "P" "Pause Reconciliation For"
-                                     (Kubed-Ext-Strimzi-Pause-Reconciliation
-                                      "Kafkaconnect" Kafkaconnect
-                                      Kubed-List-Context Kubed-List-Namespace)
-                                     (Kubed-List-Update T))
-                              (Resume "R" "Resume Reconciliation For"
-                                      (Kubed-Ext-Strimzi-Resume-Reconciliation
-                                       "Kafkaconnect" Kafkaconnect
-                                       Kubed-List-Context Kubed-List-Namespace)
-                                      (Kubed-List-Update T)))
-      T)
+(eval '(kubed-define-resource kafkaconnect ()
+         :plural kafkaconnects
+         :prefix (("$" "Scale" kubed-scale-kafkaconnect))
+         :suffixes ([("$" "Scale"                 kubed-kafkaconnects-scale)
+                     ("P" "Pause Reconciliation"  kubed-kafkaconnects-pause)
+                     ("R" "Resume Reconciliation" kubed-kafkaconnects-resume)])
+         (scale "$" "Scale"
+                (kubed-ext-scale-kafkaconnect
+                 kafkaconnect
+                 (if current-prefix-arg
+                     (prefix-numeric-value current-prefix-arg)
+                   (read-number "Number of replicas: "))
+                 kubed-list-context kubed-list-namespace))
+         (pause "P" "Pause reconciliation for"
+                (kubed-ext-strimzi-pause-reconciliation
+                 "kafkaconnect" kafkaconnect
+                 kubed-list-context kubed-list-namespace)
+                (kubed-list-update t))
+         (resume "R" "Resume reconciliation for"
+                 (kubed-ext-strimzi-resume-reconciliation
+                  "kafkaconnect" kafkaconnect
+                  kubed-list-context kubed-list-namespace)
+                 (kubed-list-update t)))
+      t)
 
-(Eval '(Kubed-Define-Resource Kafkaconnector ()
-                              :Suffixes ([("P" "Pause"   Kubed-Kafkaconnectors-Pause)
-                                          ("R" "Resume"  Kubed-Kafkaconnectors-Resume)
-                                          ("X" "Restart" Kubed-Kafkaconnectors-Restart)])
-                              (Pause "P" "Pause"
-                                     (Kubed-Patch "Kafkaconnectors" Kafkaconnector
-                                                  (Kubed-Ext--Json-Patch "Pause" "True")
-                                                  Kubed-List-Context Kubed-List-Namespace "Merge")
-                                     (Kubed-List-Update T))
-                              (Resume "R" "Resume"
-                                      (Kubed-Patch "Kafkaconnectors" Kafkaconnector
-                                                   (Kubed-Ext--Json-Patch "Pause" "False")
-                                                   Kubed-List-Context Kubed-List-Namespace "Merge")
-                                      (Kubed-List-Update T))
-                              (Restart "X" "Restart"
-                                       (Kubed-Ext-Strimzi-Restart-Connector
-                                        Kafkaconnector Kubed-List-Context Kubed-List-Namespace)
-                                       (Kubed-List-Update T)))
-      T)
+(eval '(kubed-define-resource kafkaconnector ()
+         :suffixes ([("P" "Pause"   kubed-kafkaconnectors-pause)
+                     ("R" "Resume"  kubed-kafkaconnectors-resume)
+                     ("X" "Restart" kubed-kafkaconnectors-restart)])
+         (pause "P" "Pause"
+                (kubed-patch "kafkaconnectors" kafkaconnector
+                             (kubed-ext--json-patch "pause" "true")
+                             kubed-list-context kubed-list-namespace "merge")
+                (kubed-list-update t))
+         (resume "R" "Resume"
+                 (kubed-patch "kafkaconnectors" kafkaconnector
+                              (kubed-ext--json-patch "pause" "false")
+                              kubed-list-context kubed-list-namespace "merge")
+                 (kubed-list-update t))
+         (restart "X" "Restart"
+                  (kubed-ext-strimzi-restart-connector
+                   kafkaconnector kubed-list-context kubed-list-namespace)
+                  (kubed-list-update t)))
+      t)
 
-(Eval '(Kubed-Define-Resource Kafkatopic ()
-                              :Suffixes ([("P" "Set Partitions" Kubed-Kafkatopics-Set-Partitions)])
-                              (Set-Partitions "P" "Set Partitions For"
-                                              (Let ((N (Read-Number "Number Of Partitions: ")))
-                                                   (Kubed-Patch "Kafkatopics" Kafkatopic
-                                                                (Kubed-Ext--Json-Patch "Partitions"
-                                                                                       (Number-To-String N))
-                                                                Kubed-List-Context Kubed-List-Namespace
-                                                                "Merge"))
-                                              (Kubed-List-Update T)))
-      T)
+(eval '(kubed-define-resource kafkatopic ()
+         :suffixes ([("p" "Set Partitions" kubed-kafkatopics-set-partitions)])
+         (set-partitions "p" "Set partitions for"
+                         (let ((n (read-number "Number of partitions: ")))
+                           (kubed-patch "kafkatopics" kafkatopic
+                                        (kubed-ext--json-patch "partitions"
+                                                               (number-to-string n))
+                                        kubed-list-context kubed-list-namespace
+                                        "merge"))
+                         (kubed-list-update t)))
+      t)
 
-(Dolist (Spec '((Kafkabridge) (Kafkamirrormaker2) (Kafkamirrormaker)
-                (Kafkanodepool) (Kafkarebalance) (Kafkauser) (Strimzipodset)))
-        (Eval (Cons 'Kubed-Define-Resource Spec) T))
+(dolist (spec '((kafkabridge) (kafkamirrormaker2) (kafkamirrormaker)
+                (kafkanodepool) (kafkarebalance) (kafkauser) (strimzipodset)))
+  (eval (cons 'kubed-define-resource spec) t))
 
-(Dolist (Spec '((Endpoint) (Limitrange) (Podtemplate) (Replicationcontroller)
-                (Resourcequota) (Serviceaccount) (Controllerrevision) (Lease)
-                (Endpointslice) (Rolebinding) (Role)
-                (Azureapplicationgatewayrewrite) (Podmonitor) (Servicemonitor)))
-        (Eval (Cons 'Kubed-Define-Resource Spec) T))
+(dolist (spec '((endpoint) (limitrange) (podtemplate) (replicationcontroller)
+                (resourcequota) (serviceaccount) (controllerrevision) (lease)
+                (endpointslice) (rolebinding) (role)
+                (azureapplicationgatewayrewrite) (podmonitor) (servicemonitor)))
+  (eval (cons 'kubed-define-resource spec) t))
 
 ;;; ═══════════════════════════════════════════════════════════════
-;;; § 9a.  Human-Readable Age For All Timestamp Columns
+;;; § 9a.  Human-Readable Age for All Timestamp Columns
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defvar Kubed-Ext--Timestamp-Patched-Types
-  (Make-Hash-Table :Test 'Equal)
-  "Resource Types Whose Timestamp Columns Carry A Formatter.")
+(defvar kubed-ext--timestamp-patched-types
+  (make-hash-table :test 'equal)
+  "Resource types whose timestamp columns carry a formatter.")
 
-(Defun Kubed-Ext--Timestamp-Column-Spec-P (Spec)
-  "Non-Nil If Spec Names A Kubernetes Timestamp Column.
-Spec Is A Fetch-Column String Such As
-`Creationtimestamp:.Metadata.Creationtimestamp'."
-  (And
-   (Stringp Spec)
-   (Or (String-Match-P "\\.Creationtimestamp" Spec)
-       (String-Match-P "\\.Starttime" Spec)
-       (String-Match-P "\\.Lasttimestamp" Spec)
-       (String-Match-P "\\.Lastscheduletime" Spec)
-       (String-Match-P "\\.Lastsuccessfultime" Spec)
-       (String-Match-P "\\.Deletiontimestamp" Spec)
-       (String-Match-P "\\`Age:" Spec)
-       (String-Match-P "\\`Last.Seen:" Spec)
-       (String-Match-P "\\`Lastschedule:" Spec)
-       (String-Match-P "\\`Lastsuccess:" Spec)
-       (String-Match-P "\\`Starttime:" Spec)
-       (String-Match-P "Timestamp:" Spec))))
+(defun kubed-ext--timestamp-column-spec-p (spec)
+  "Non-nil if SPEC names a Kubernetes timestamp column.
+SPEC is a fetch-column string such as
+`CREATIONTIMESTAMP:.metadata.creationTimestamp'."
+  (and
+   (stringp spec)
+   (or (string-match-p "\\.creationTimestamp" spec)
+       (string-match-p "\\.startTime" spec)
+       (string-match-p "\\.lastTimestamp" spec)
+       (string-match-p "\\.lastScheduleTime" spec)
+       (string-match-p "\\.lastSuccessfulTime" spec)
+       (string-match-p "\\.deletionTimestamp" spec)
+       (string-match-p "\\`AGE:" spec)
+       (string-match-p "\\`LAST.SEEN:" spec)
+       (string-match-p "\\`LASTSCHEDULE:" spec)
+       (string-match-p "\\`LASTSUCCESS:" spec)
+       (string-match-p "\\`STARTTIME:" spec)
+       (string-match-p "TIMESTAMP:" spec))))
 
-(Defun Kubed-Ext--Patch-Type-Timestamp-Columns (Type)
-  "Attach Age Formatter To Timestamp Columns For Type.
-Pods And Deployments Are Skipped Because They Format
-Ages Inside Their Custom Entries Functions."
-  (Unless (Or (Gethash Type Kubed-Ext--Timestamp-Patched-Types)
-              (Member Type '("Pods" "Deployments")))
-          (Puthash Type T Kubed-Ext--Timestamp-Patched-Types)
-          (Let ((Columns (Alist-Get Type Kubed--Columns
-                                    Nil Nil #'String=)))
-               (When Columns
-                     (Setf (Alist-Get Type Kubed--Columns
-                                      Nil Nil #'String=)
-                           (Mapcar
-                            (Lambda (Col)
-                                    (Let ((Spec (If (Consp Col)
-                                                    (Car Col)
-                                                    Col)))
-                                         (If (And (Kubed-Ext--Timestamp-Column-Spec-P
-                                                   Spec)
-                                                  (Not (And (Consp Col) (Cdr Col))))
-                                             (Cons Spec #'Kubed-Ext--Format-Age)
-                                             Col)))
-                            Columns))))))
+(defun kubed-ext--patch-type-timestamp-columns (type)
+  "Attach age formatter to timestamp columns for TYPE.
+Pods and deployments are skipped because they format
+ages inside their custom entries functions."
+  (unless (or (gethash type kubed-ext--timestamp-patched-types)
+              (member type '("pods" "deployments")))
+    (puthash type t kubed-ext--timestamp-patched-types)
+    (let ((columns (alist-get type kubed--columns
+                              nil nil #'string=)))
+      (when columns
+        (setf (alist-get type kubed--columns
+                         nil nil #'string=)
+              (mapcar
+               (lambda (col)
+                 (let ((spec (if (consp col)
+                                 (car col)
+                               col)))
+                   (if (and (kubed-ext--timestamp-column-spec-p
+                             spec)
+                            (not (and (consp col) (cdr col))))
+                       (cons spec #'kubed-ext--format-age)
+                     col)))
+               columns))))))
 
-(Defun Kubed-Ext--Patch-All-Timestamp-Columns ()
-  "Patch Timestamp Columns For All Known Resource Types."
-  (Dolist (Entry Kubed--Columns)
-          (Kubed-Ext--Patch-Type-Timestamp-Columns (Car Entry))))
+(defun kubed-ext--patch-all-timestamp-columns ()
+  "Patch timestamp columns for all known resource types."
+  (dolist (entry kubed--columns)
+    (kubed-ext--patch-type-timestamp-columns (car entry))))
 
-(Defun Kubed-Ext--Fix-Timestamp-Display-Columns ()
-  "Rename Timestamp Display Columns To Short Labels.
-Install Numeric Sort Via The `Kubed-Sort-Value' Text
-Property That `Kubed-Ext--Format-Age' Attaches."
-  (Dolist (Type-Name '("Services" "Secrets" "Jobs"
-                       "Replicasets" "Daemonsets"
-                       "Statefulsets" "Ingressclasses"
-                       "Namespaces" "Nodes" "Events"
-                       "Cronjobs"))
-          (Let ((Fmt-Var (Intern
-                          (Format "Kubed-%S-Columns"
-                                  Type-Name))))
-               (When (And (Boundp Fmt-Var)
-                          (Symbol-Value Fmt-Var))
-                     (Let ((Idx 0))
-                          (Set Fmt-Var
-                               (Mapcar
-                                (Lambda (Col)
-                                        (Cl-Incf Idx)
-                                        (Let ((Nm (Downcase (Car Col))))
-                                             (Cond
-                                              ((Or (String= Nm "Creationtimestamp")
-                                                   (String= Nm "Starttime"))
-                                               (Append
-                                                (List "Age" 10
-                                                      (Kubed-Ext-Top-Numeric-Sorter
-                                                       Idx))
-                                                (Nthcdr 3 Col)))
-                                              ((String= Nm "Last-Seen")
-                                               (Append
-                                                (List "Last Seen" 10
-                                                      (Kubed-Ext-Top-Numeric-Sorter
-                                                       Idx))
-                                                (Nthcdr 3 Col)))
-                                              ((String= Nm "Lastschedule")
-                                               (Append
-                                                (List "Last Sched" 10
-                                                      (Kubed-Ext-Top-Numeric-Sorter
-                                                       Idx))
-                                                (Nthcdr 3 Col)))
-                                              ((String= Nm "Lastsuccess")
-                                               (Append
-                                                (List "Last Ok" 10
-                                                      (Kubed-Ext-Top-Numeric-Sorter
-                                                       Idx))
-                                                (Nthcdr 3 Col)))
-                                              (T Col))))
-                                (Symbol-Value Fmt-Var))))))))
+(defun kubed-ext--fix-timestamp-display-columns ()
+  "Rename timestamp display columns to short labels.
+Install numeric sort via the `kubed-sort-value' text
+property that `kubed-ext--format-age' attaches."
+  (dolist (type-name '("services" "secrets" "jobs"
+                       "replicasets" "daemonsets"
+                       "statefulsets" "ingressclasses"
+                       "namespaces" "nodes" "events"
+                       "cronjobs"))
+    (let ((fmt-var (intern
+                    (format "kubed-%s-columns"
+                            type-name))))
+      (when (and (boundp fmt-var)
+                 (symbol-value fmt-var))
+        (let ((idx 0))
+          (set fmt-var
+               (mapcar
+                (lambda (col)
+                  (cl-incf idx)
+                  (let ((nm (downcase (car col))))
+                    (cond
+                     ((or (string= nm "creationtimestamp")
+                          (string= nm "starttime"))
+                      (append
+                       (list "Age" 10
+                             (kubed-ext-top-numeric-sorter
+                              idx))
+                       (nthcdr 3 col)))
+                     ((string= nm "last-seen")
+                      (append
+                       (list "Last Seen" 10
+                             (kubed-ext-top-numeric-sorter
+                              idx))
+                       (nthcdr 3 col)))
+                     ((string= nm "lastschedule")
+                      (append
+                       (list "Last Sched" 10
+                             (kubed-ext-top-numeric-sorter
+                              idx))
+                       (nthcdr 3 col)))
+                     ((string= nm "lastsuccess")
+                      (append
+                       (list "Last OK" 10
+                             (kubed-ext-top-numeric-sorter
+                              idx))
+                       (nthcdr 3 col)))
+                     (t col))))
+                (symbol-value fmt-var))))))))
 
-(Defun Kubed-Ext--Ensure-Age-Formatting
-  (Orig-Fn Type Context &Optional Namespace)
-  "Around-Advice For `Kubed-Update'.
-Patch Timestamp Columns For Type Before Calling
-Orig-Fn With Type, Context, And Namespace."
-  (Kubed-Ext--Patch-Type-Timestamp-Columns Type)
-  (Funcall Orig-Fn Type Context Namespace))
+(defun kubed-ext--ensure-age-formatting
+    (orig-fn type context &optional namespace)
+  "Around-advice for `kubed-update'.
+Patch timestamp columns for TYPE before calling
+ORIG-FN with TYPE, CONTEXT, and NAMESPACE."
+  (kubed-ext--patch-type-timestamp-columns type)
+  (funcall orig-fn type context namespace))
 
-(Advice-Add 'Kubed-Update :Around
-            #'Kubed-Ext--Ensure-Age-Formatting)
+(advice-add 'kubed-update :around
+            #'kubed-ext--ensure-age-formatting)
 
-;; Apply Patches Now -- All Kubed-Define-Resource Forms
-;; Have Already Been Evaluated.
-(Kubed-Ext--Patch-All-Timestamp-Columns)
-(Kubed-Ext--Fix-Timestamp-Display-Columns)
+;; Apply patches now -- all kubed-define-resource forms
+;; have already been evaluated.
+(kubed-ext--patch-all-timestamp-columns)
+(kubed-ext--fix-timestamp-display-columns)
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 10.  Async Helpers
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defun Kubed-Ext--Async-Kubectl (Args Callback &Optional Errback)
-  "Run Kubectl With Args Asynchronously.
-Call Callback With Output String On Success.
-Call Errback With Error String On Failure."
-  (Let* ((Output-Buf (Generate-New-Buffer " *Kubed-Ext-Async*"))
-         (Default-Directory Temporary-File-Directory))
-        (Make-Process
-         :Name "Kubed-Ext-Kubectl"
-         :Buffer Output-Buf
-         :Command (Cons Kubed-Kubectl-Program Args)
-         :Noquery T
-         :Sentinel
-         (Lambda (Proc _Event)
-                 (When (Memq (Process-Status Proc) '(Exit Signal))
-                       (Let ((Exit-Code (Process-Exit-Status Proc))
-                             (Output ""))
-                            (When (Buffer-Live-P Output-Buf)
-                                  (Setq Output (With-Current-Buffer Output-Buf (Buffer-String)))
-                                  (Kill-Buffer Output-Buf))
-                            (If (Zerop Exit-Code)
-                                (Funcall Callback Output)
-                                (When Errback
-                                      (Funcall Errback
-                                               (Format "Kubectl Exited %D" Exit-Code))))))))))
+(defun kubed-ext--async-kubectl (args callback &optional errback)
+  "Run kubectl with ARGS asynchronously.
+Call CALLBACK with output string on success.
+Call ERRBACK with error string on failure."
+  (let* ((output-buf (generate-new-buffer " *kubed-ext-async*"))
+         (default-directory temporary-file-directory))
+    (make-process
+     :name "kubed-ext-kubectl"
+     :buffer output-buf
+     :command (cons kubed-kubectl-program args)
+     :noquery t
+     :sentinel
+     (lambda (proc _event)
+       (when (memq (process-status proc) '(exit signal))
+         (let ((exit-code (process-exit-status proc))
+               (output ""))
+           (when (buffer-live-p output-buf)
+             (setq output (with-current-buffer output-buf (buffer-string)))
+             (kill-buffer output-buf))
+           (if (zerop exit-code)
+               (funcall callback output)
+             (when errback
+               (funcall errback
+                        (format "kubectl exited %d" exit-code))))))))))
 
-(Defun Kubed-Ext--Async-Kubectl-2 (Args1 Args2 Callback &Optional Errback)
-  "Run Two Kubectl Commands Concurrently.
-Args1 And Args2 Are Arg Lists.
-Callback Is Called With (List Out1 Out2) On Success.
-Errback Is Called With Error Message On Failure."
-  (Let ((Results (Cons Nil Nil))
-        (Count 0)
-        (Failed Nil))
-       (Kubed-Ext--Async-Kubectl
-        Args1
-        (Lambda (Out)
-                (Unless Failed
-                        (Setcar Results Out)
-                        (Cl-Incf Count)
-                        (When (= Count 2)
-                              (Funcall Callback (List (Car Results) (Cdr Results))))))
-        (Lambda (Err)
-                (Unless Failed (Setq Failed T) (When Errback (Funcall Errback Err)))))
-       (Kubed-Ext--Async-Kubectl
-        Args2
-        (Lambda (Out)
-                (Unless Failed
-                        (Setcdr Results Out)
-                        (Cl-Incf Count)
-                        (When (= Count 2)
-                              (Funcall Callback (List (Car Results) (Cdr Results))))))
-        (Lambda (Err)
-                (Unless Failed (Setq Failed T) (When Errback (Funcall Errback Err)))))))
+(defun kubed-ext--async-kubectl-2 (args1 args2 callback &optional errback)
+  "Run two kubectl commands concurrently.
+ARGS1 and ARGS2 are arg lists.
+CALLBACK is called with (list out1 out2) on success.
+ERRBACK is called with error message on failure."
+  (let ((results (cons nil nil))
+        (count 0)
+        (failed nil))
+    (kubed-ext--async-kubectl
+     args1
+     (lambda (out)
+       (unless failed
+         (setcar results out)
+         (cl-incf count)
+         (when (= count 2)
+           (funcall callback (list (car results) (cdr results))))))
+     (lambda (err)
+       (unless failed (setq failed t) (when errback (funcall errback err)))))
+    (kubed-ext--async-kubectl
+     args2
+     (lambda (out)
+       (unless failed
+         (setcdr results out)
+         (cl-incf count)
+         (when (= count 2)
+           (funcall callback (list (car results) (cdr results))))))
+     (lambda (err)
+       (unless failed (setq failed t) (when errback (funcall errback err)))))))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 10b.  Top Commands
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defvar-Local Kubed-Ext-Top-Context Nil "Context For Top Buffer.")
-(Defvar-Local Kubed-Ext-Top-Namespace Nil "Namespace For Top Buffer.")
-(Defvar-Local Kubed-Ext-Top--Fetching Nil "Non-Nil When Async Fetch In Progress.")
+(defvar-local kubed-ext-top-context nil "Context for top buffer.")
+(defvar-local kubed-ext-top-namespace nil "Namespace for top buffer.")
+(defvar-local kubed-ext-top--fetching nil "Non-nil when async fetch in progress.")
 
-(Defun Kubed-Ext-Top-Refresh ()
-  "Refresh The Current Top Buffer Asynchronously."
-  (Interactive)
-  (If Kubed-Ext-Top--Fetching
-      (Message "Metrics Fetch Already In Progress...")
-      (Setq Kubed-Ext-Top--Fetching T)
-      (Setq Tabulated-List-Entries Nil)
-      (Let ((Inhibit-Read-Only T))
-           (Erase-Buffer)
-           (Insert (Propertize "\N  Fetching Metrics From Api...\N" 'Face 'Shadow)))
-      (Cond
-       ((Derived-Mode-P 'Kubed-Ext-Top-Nodes-Mode) (Kubed-Ext--Top-Nodes-Fetch))
-       ((Derived-Mode-P 'Kubed-Ext-Top-Pods-Mode)  (Kubed-Ext--Top-Pods-Fetch)))))
+(defun kubed-ext-top-refresh ()
+  "Refresh the current top buffer asynchronously."
+  (interactive)
+  (if kubed-ext-top--fetching
+      (message "Metrics fetch already in progress...")
+    (setq kubed-ext-top--fetching t)
+    (setq tabulated-list-entries nil)
+    (let ((inhibit-read-only t))
+      (erase-buffer)
+      (insert (propertize "\n  Fetching metrics from API...\n" 'face 'shadow)))
+    (cond
+     ((derived-mode-p 'kubed-ext-top-nodes-mode) (kubed-ext--top-nodes-fetch))
+     ((derived-mode-p 'kubed-ext-top-pods-mode)  (kubed-ext--top-pods-fetch)))))
 
-(Defun Kubed-Ext--Top-Nodes-Fetch ()
-  "Fetch Node Metrics Asynchronously And Populate The Table."
-  (Let ((Ctx Kubed-Ext-Top-Context) (Buf (Current-Buffer)))
-       (Kubed-Ext--Async-Kubectl-2
-        (List "Top" "Nodes" "--No-Headers" "--Context" Ctx)
-        (List "Get" "Nodes" "--No-Headers" "--Context" Ctx "-O"
-              (Concat "Custom-Columns=Name:.Metadata.Name,"
-                      "Cpu:.Status.Allocatable.Cpu,Mem:.Status.Allocatable.Memory"))
-        (Lambda (Results)
-                (When (Buffer-Live-P Buf)
-                      (With-Current-Buffer Buf
-                                           (Setq Kubed-Ext-Top--Fetching Nil)
-                                           (Let ((Alloc-Map (Make-Hash-Table :Test 'Equal)) (Entries Nil))
-                                                (Dolist (Line (Split-String (Nth 1 Results) "\N" T))
-                                                        (Let ((F (Split-String Line Nil T)))
-                                                             (Puthash (Nth 0 F) (List (Kubed-Ext-Parse-Cpu (Nth 1 F))
-                                                                                      (Kubed-Ext-Parse-Mem (Nth 2 F)))
-                                                                      Alloc-Map)))
-                                                (Dolist (Line (Split-String (Nth 0 Results) "\N" T))
-                                                        (Let* ((F (Split-String Line Nil T))
-                                                               (Name (Nth 0 F))
-                                                               (Cpu-U (Kubed-Ext-Parse-Cpu (Nth 1 F)))
-                                                               (Mem-U (Kubed-Ext-Parse-Mem (Nth 3 F)))
-                                                               (Alloc (Gethash Name Alloc-Map '(0 0)))
-                                                               (Cpu-A (Nth 0 Alloc)) (Mem-A (Nth 1 Alloc)))
-                                                              (Push (List Name (Vector Name
-                                                                                       (Kubed-Ext-Format-Cpu Cpu-U)
-                                                                                       (Kubed-Ext-Format-Cpu Cpu-A)
-                                                                                       (Kubed-Ext-Format-Pct Cpu-U Cpu-A)
-                                                                                       (Kubed-Ext-Format-Mem Mem-U)
-                                                                                       (Kubed-Ext-Format-Mem Mem-A)
-                                                                                       (Kubed-Ext-Format-Pct Mem-U Mem-A)))
-                                                                    Entries)))
-                                                (Setq Tabulated-List-Entries (Nreverse Entries))
-                                                (Tabulated-List-Print T)))))
-        (Lambda (Err)
-                (When (Buffer-Live-P Buf)
-                      (With-Current-Buffer Buf
-                                           (Setq Kubed-Ext-Top--Fetching Nil)
-                                           (Message "Node Metrics Failed: %S" Err)))))))
+(defun kubed-ext--top-nodes-fetch ()
+  "Fetch node metrics asynchronously and populate the table."
+  (let ((ctx kubed-ext-top-context) (buf (current-buffer)))
+    (kubed-ext--async-kubectl-2
+     (list "top" "nodes" "--no-headers" "--context" ctx)
+     (list "get" "nodes" "--no-headers" "--context" ctx "-o"
+           (concat "custom-columns=NAME:.metadata.name,"
+                   "CPU:.status.allocatable.cpu,MEM:.status.allocatable.memory"))
+     (lambda (results)
+       (when (buffer-live-p buf)
+         (with-current-buffer buf
+           (setq kubed-ext-top--fetching nil)
+           (let ((alloc-map (make-hash-table :test 'equal)) (entries nil))
+             (dolist (line (split-string (nth 1 results) "\n" t))
+               (let ((f (split-string line nil t)))
+                 (puthash (nth 0 f) (list (kubed-ext-parse-cpu (nth 1 f))
+                                          (kubed-ext-parse-mem (nth 2 f)))
+                          alloc-map)))
+             (dolist (line (split-string (nth 0 results) "\n" t))
+               (let* ((f (split-string line nil t))
+                      (name (nth 0 f))
+                      (cpu-u (kubed-ext-parse-cpu (nth 1 f)))
+                      (mem-u (kubed-ext-parse-mem (nth 3 f)))
+                      (alloc (gethash name alloc-map '(0 0)))
+                      (cpu-a (nth 0 alloc)) (mem-a (nth 1 alloc)))
+                 (push (list name (vector name
+                                          (kubed-ext-format-cpu cpu-u)
+                                          (kubed-ext-format-cpu cpu-a)
+                                          (kubed-ext-format-pct cpu-u cpu-a)
+                                          (kubed-ext-format-mem mem-u)
+                                          (kubed-ext-format-mem mem-a)
+                                          (kubed-ext-format-pct mem-u mem-a)))
+                       entries)))
+             (setq tabulated-list-entries (nreverse entries))
+             (tabulated-list-print t)))))
+     (lambda (err)
+       (when (buffer-live-p buf)
+         (with-current-buffer buf
+           (setq kubed-ext-top--fetching nil)
+           (message "Node metrics failed: %s" err)))))))
 
-(Defun Kubed-Ext--Top-Pods-Fetch ()
-  "Fetch Pod Metrics Asynchronously And Populate The Table."
-  (Let ((Ctx Kubed-Ext-Top-Context) (Ns Kubed-Ext-Top-Namespace)
-        (Buf (Current-Buffer)))
-       (Kubed-Ext--Async-Kubectl-2
-        (Append (List "Top" "Pods" "--No-Headers" "--Context" Ctx)
-                (When Ns (List "-N" Ns)))
-        (Append (List "Get" "Pods" "--No-Headers" "--Context" Ctx "-O"
-                      (Concat "Custom-Columns=Name:.Metadata.Name,"
-                              "Cr:.Spec.Containers[*].Resources.Requests.Cpu,"
-                              "Cl:.Spec.Containers[*].Resources.Limits.Cpu,"
-                              "Mr:.Spec.Containers[*].Resources.Requests.Memory,"
-                              "Ml:.Spec.Containers[*].Resources.Limits.Memory"))
-                (When Ns (List "-N" Ns)))
-        (Lambda (Results)
-                (When (Buffer-Live-P Buf)
-                      (With-Current-Buffer Buf
-                                           (Setq Kubed-Ext-Top--Fetching Nil)
-                                           (Let ((Spec-Map (Make-Hash-Table :Test 'Equal)) (Entries Nil))
-                                                (Dolist (Line (Split-String (Nth 1 Results) "\N" T))
-                                                        (Let ((F (Split-String Line Nil T)))
-                                                             (Puthash (Nth 0 F) (List (Kubed-Ext-Sum-Cpu (Nth 1 F))
-                                                                                      (Kubed-Ext-Sum-Cpu (Nth 2 F))
-                                                                                      (Kubed-Ext-Sum-Mem (Nth 3 F))
-                                                                                      (Kubed-Ext-Sum-Mem (Nth 4 F)))
-                                                                      Spec-Map)))
-                                                (Dolist (Line (Split-String (Nth 0 Results) "\N" T))
-                                                        (Let* ((F (Split-String Line Nil T))
-                                                               (Name (Nth 0 F))
-                                                               (Cpu-U (Kubed-Ext-Parse-Cpu (Nth 1 F)))
-                                                               (Mem-U (Kubed-Ext-Parse-Mem (Nth 2 F)))
-                                                               (Spec (Gethash Name Spec-Map '(0 0 0 0))))
-                                                              (Push (List Name
-                                                                          (Vector Name
-                                                                                  (Kubed-Ext-Format-Cpu Cpu-U)
-                                                                                  (Kubed-Ext-Format-Mem Mem-U)
-                                                                                  (Kubed-Ext-Format-Cpu (Nth 0 Spec))
-                                                                                  (Kubed-Ext-Format-Cpu (Nth 1 Spec))
-                                                                                  (Kubed-Ext-Format-Pct Cpu-U (Nth 0 Spec))
-                                                                                  (Kubed-Ext-Format-Pct Cpu-U (Nth 1 Spec))
-                                                                                  (Kubed-Ext-Format-Mem (Nth 2 Spec))
-                                                                                  (Kubed-Ext-Format-Mem (Nth 3 Spec))
-                                                                                  (Kubed-Ext-Format-Pct Mem-U (Nth 2 Spec))
-                                                                                  (Kubed-Ext-Format-Pct Mem-U (Nth 3 Spec))))
-                                                                    Entries)))
-                                                (Setq Tabulated-List-Entries (Nreverse Entries))
-                                                (Tabulated-List-Print T)))))
-        (Lambda (Err)
-                (When (Buffer-Live-P Buf)
-                      (With-Current-Buffer Buf
-                                           (Setq Kubed-Ext-Top--Fetching Nil)
-                                           (Message "Pod Metrics Failed: %S" Err)))))))
+(defun kubed-ext--top-pods-fetch ()
+  "Fetch pod metrics asynchronously and populate the table."
+  (let ((ctx kubed-ext-top-context) (ns kubed-ext-top-namespace)
+        (buf (current-buffer)))
+    (kubed-ext--async-kubectl-2
+     (append (list "top" "pods" "--no-headers" "--context" ctx)
+             (when ns (list "-n" ns)))
+     (append (list "get" "pods" "--no-headers" "--context" ctx "-o"
+                   (concat "custom-columns=NAME:.metadata.name,"
+                           "CR:.spec.containers[*].resources.requests.cpu,"
+                           "CL:.spec.containers[*].resources.limits.cpu,"
+                           "MR:.spec.containers[*].resources.requests.memory,"
+                           "ML:.spec.containers[*].resources.limits.memory"))
+             (when ns (list "-n" ns)))
+     (lambda (results)
+       (when (buffer-live-p buf)
+         (with-current-buffer buf
+           (setq kubed-ext-top--fetching nil)
+           (let ((spec-map (make-hash-table :test 'equal)) (entries nil))
+             (dolist (line (split-string (nth 1 results) "\n" t))
+               (let ((f (split-string line nil t)))
+                 (puthash (nth 0 f) (list (kubed-ext-sum-cpu (nth 1 f))
+                                          (kubed-ext-sum-cpu (nth 2 f))
+                                          (kubed-ext-sum-mem (nth 3 f))
+                                          (kubed-ext-sum-mem (nth 4 f)))
+                          spec-map)))
+             (dolist (line (split-string (nth 0 results) "\n" t))
+               (let* ((f (split-string line nil t))
+                      (name (nth 0 f))
+                      (cpu-u (kubed-ext-parse-cpu (nth 1 f)))
+                      (mem-u (kubed-ext-parse-mem (nth 2 f)))
+                      (spec (gethash name spec-map '(0 0 0 0))))
+                 (push (list name
+                             (vector name
+                                     (kubed-ext-format-cpu cpu-u)
+                                     (kubed-ext-format-mem mem-u)
+                                     (kubed-ext-format-cpu (nth 0 spec))
+                                     (kubed-ext-format-cpu (nth 1 spec))
+                                     (kubed-ext-format-pct cpu-u (nth 0 spec))
+                                     (kubed-ext-format-pct cpu-u (nth 1 spec))
+                                     (kubed-ext-format-mem (nth 2 spec))
+                                     (kubed-ext-format-mem (nth 3 spec))
+                                     (kubed-ext-format-pct mem-u (nth 2 spec))
+                                     (kubed-ext-format-pct mem-u (nth 3 spec))))
+                       entries)))
+             (setq tabulated-list-entries (nreverse entries))
+             (tabulated-list-print t)))))
+     (lambda (err)
+       (when (buffer-live-p buf)
+         (with-current-buffer buf
+           (setq kubed-ext-top--fetching nil)
+           (message "Pod metrics failed: %s" err)))))))
 
-(Define-Derived-Mode Kubed-Ext-Top-Nodes-Mode Tabulated-List-Mode
-  "Kubed Top Nodes" "Major Mode For Displaying Node Resource Usage."
-  (Setq Tabulated-List-Format
-        (Vector (List "Name" 40 T)
-                (List "Cpu"   8 (Kubed-Ext-Top-Numeric-Sorter 1) :Right-Align T)
-                (List "Cpu/A" 8 (Kubed-Ext-Top-Numeric-Sorter 2) :Right-Align T)
-                (List "%Cpu"  6 (Kubed-Ext-Top-Numeric-Sorter 3) :Right-Align T)
-                (List "Mem"   8 (Kubed-Ext-Top-Numeric-Sorter 4) :Right-Align T)
-                (List "Mem/A" 8 (Kubed-Ext-Top-Numeric-Sorter 5) :Right-Align T)
-                (List "%Mem"  6 (Kubed-Ext-Top-Numeric-Sorter 6) :Right-Align T))
-        Tabulated-List-Padding 2
-        Tabulated-List-Entries Nil)
-  (Tabulated-List-Init-Header))
+(define-derived-mode kubed-ext-top-nodes-mode tabulated-list-mode
+  "Kubed Top Nodes" "Major mode for displaying node resource usage."
+  (setq tabulated-list-format
+        (vector (list "Name" 40 t)
+                (list "CPU"   8 (kubed-ext-top-numeric-sorter 1) :right-align t)
+                (list "CPU/A" 8 (kubed-ext-top-numeric-sorter 2) :right-align t)
+                (list "%CPU"  6 (kubed-ext-top-numeric-sorter 3) :right-align t)
+                (list "MEM"   8 (kubed-ext-top-numeric-sorter 4) :right-align t)
+                (list "MEM/A" 8 (kubed-ext-top-numeric-sorter 5) :right-align t)
+                (list "%MEM"  6 (kubed-ext-top-numeric-sorter 6) :right-align t))
+        tabulated-list-padding 2
+        tabulated-list-entries nil)
+  (tabulated-list-init-header))
 
-(Define-Derived-Mode Kubed-Ext-Top-Pods-Mode Tabulated-List-Mode
-  "Kubed Top Pods" "Major Mode For Displaying Pod Resource Usage."
-  (Setq Tabulated-List-Format
-        (Vector (List "Name"   48 T)
-                (List "Cpu"     7 (Kubed-Ext-Top-Numeric-Sorter 1)  :Right-Align T)
-                (List "Mem"     8 (Kubed-Ext-Top-Numeric-Sorter 2)  :Right-Align T)
-                (List "Cpu/R"   7 (Kubed-Ext-Top-Numeric-Sorter 3)  :Right-Align T)
-                (List "Cpu/L"   7 (Kubed-Ext-Top-Numeric-Sorter 4)  :Right-Align T)
-                (List "%Cpu/R"  7 (Kubed-Ext-Top-Numeric-Sorter 5)  :Right-Align T)
-                (List "%Cpu/L"  7 (Kubed-Ext-Top-Numeric-Sorter 6)  :Right-Align T)
-                (List "Mem/R"   8 (Kubed-Ext-Top-Numeric-Sorter 7)  :Right-Align T)
-                (List "Mem/L"   8 (Kubed-Ext-Top-Numeric-Sorter 8)  :Right-Align T)
-                (List "%Mem/R"  7 (Kubed-Ext-Top-Numeric-Sorter 9)  :Right-Align T)
-                (List "%Mem/L"  7 (Kubed-Ext-Top-Numeric-Sorter 10) :Right-Align T))
-        Tabulated-List-Padding 2
-        Tabulated-List-Entries Nil)
-  (Tabulated-List-Init-Header))
+(define-derived-mode kubed-ext-top-pods-mode tabulated-list-mode
+  "Kubed Top Pods" "Major mode for displaying pod resource usage."
+  (setq tabulated-list-format
+        (vector (list "Name"   48 t)
+                (list "CPU"     7 (kubed-ext-top-numeric-sorter 1)  :right-align t)
+                (list "MEM"     8 (kubed-ext-top-numeric-sorter 2)  :right-align t)
+                (list "CPU/R"   7 (kubed-ext-top-numeric-sorter 3)  :right-align t)
+                (list "CPU/L"   7 (kubed-ext-top-numeric-sorter 4)  :right-align t)
+                (list "%CPU/R"  7 (kubed-ext-top-numeric-sorter 5)  :right-align t)
+                (list "%CPU/L"  7 (kubed-ext-top-numeric-sorter 6)  :right-align t)
+                (list "MEM/R"   8 (kubed-ext-top-numeric-sorter 7)  :right-align t)
+                (list "MEM/L"   8 (kubed-ext-top-numeric-sorter 8)  :right-align t)
+                (list "%MEM/R"  7 (kubed-ext-top-numeric-sorter 9)  :right-align t)
+                (list "%MEM/L"  7 (kubed-ext-top-numeric-sorter 10) :right-align t))
+        tabulated-list-padding 2
+        tabulated-list-entries nil)
+  (tabulated-list-init-header))
 
-(Keymap-Set Kubed-Ext-Top-Nodes-Mode-Map "G" #'Kubed-Ext-Top-Refresh)
-(Keymap-Set Kubed-Ext-Top-Nodes-Mode-Map "Q" #'Quit-Window)
-(Keymap-Set Kubed-Ext-Top-Nodes-Mode-Map "B" #'Kubed-Ext-Switch-Buffer)
-(Keymap-Set Kubed-Ext-Top-Pods-Mode-Map  "G" #'Kubed-Ext-Top-Refresh)
-(Keymap-Set Kubed-Ext-Top-Pods-Mode-Map  "Q" #'Quit-Window)
-(Keymap-Set Kubed-Ext-Top-Pods-Mode-Map  "B" #'Kubed-Ext-Switch-Buffer)
+(keymap-set kubed-ext-top-nodes-mode-map "g" #'kubed-ext-top-refresh)
+(keymap-set kubed-ext-top-nodes-mode-map "q" #'quit-window)
+(keymap-set kubed-ext-top-nodes-mode-map "b" #'kubed-ext-switch-buffer)
+(keymap-set kubed-ext-top-pods-mode-map  "g" #'kubed-ext-top-refresh)
+(keymap-set kubed-ext-top-pods-mode-map  "q" #'quit-window)
+(keymap-set kubed-ext-top-pods-mode-map  "b" #'kubed-ext-switch-buffer)
 
-(Defun Kubed-Ext-Top-Nodes (&Optional Context)
-  "Display Node Resource Usage In Context."
-  (Interactive
-   (List (If Current-Prefix-Arg
-             (Kubed-Read-Context "Context" (Kubed-Local-Context))
-             (Kubed-Local-Context))))
-  (Let* ((Context (Or Context (Kubed-Local-Context)))
-         (Buf (Get-Buffer-Create (Format "*Kubed-Top-Nodes[%S]*" Context))))
-        (With-Current-Buffer Buf
-                             (Kubed-Ext-Top-Nodes-Mode)
-                             (Setq-Local Kubed-Ext-Top-Context Context)
-                             (Kubed-Ext-Top-Refresh))
-        (Display-Buffer Buf)))
+(defun kubed-ext-top-nodes (&optional context)
+  "Display node resource usage in CONTEXT."
+  (interactive
+   (list (if current-prefix-arg
+             (kubed-read-context "Context" (kubed-local-context))
+           (kubed-local-context))))
+  (let* ((context (or context (kubed-local-context)))
+         (buf (get-buffer-create (format "*kubed-top-nodes[%s]*" context))))
+    (with-current-buffer buf
+      (kubed-ext-top-nodes-mode)
+      (setq-local kubed-ext-top-context context)
+      (kubed-ext-top-refresh))
+    (display-buffer buf)))
 
-(Defun Kubed-Ext-Top-Pods (&Optional Context Namespace)
-  "Display Pod Resource Usage In Context And Namespace."
-  (Interactive
-   (Let* ((C (Kubed-Local-Context))
-          (C (If (Equal Current-Prefix-Arg '(16))
-                 (Kubed-Read-Context "Context" C) C))
-          (N (Kubed--Namespace C Current-Prefix-Arg)))
-         (List C N)))
-  (Let* ((Context (Or Context (Kubed-Local-Context)))
-         (Namespace (Or Namespace (Kubed--Namespace Context)))
-         (Buf (Get-Buffer-Create
-               (Format "*Kubed-Top-Pods@%S[%S]*" Namespace Context))))
-        (With-Current-Buffer Buf
-                             (Kubed-Ext-Top-Pods-Mode)
-                             (Setq-Local Kubed-Ext-Top-Context Context)
-                             (Setq-Local Kubed-Ext-Top-Namespace Namespace)
-                             (Kubed-Ext-Top-Refresh))
-        (Display-Buffer Buf)))
+(defun kubed-ext-top-pods (&optional context namespace)
+  "Display pod resource usage in CONTEXT and NAMESPACE."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg)))
+     (list c n)))
+  (let* ((context (or context (kubed-local-context)))
+         (namespace (or namespace (kubed--namespace context)))
+         (buf (get-buffer-create
+               (format "*kubed-top-pods@%s[%s]*" namespace context))))
+    (with-current-buffer buf
+      (kubed-ext-top-pods-mode)
+      (setq-local kubed-ext-top-context context)
+      (setq-local kubed-ext-top-namespace namespace)
+      (kubed-ext-top-refresh))
+    (display-buffer buf)))
 
 ;;; ═══════════════════════════════════════════════════════════════
-;;; § 11.  Terminal Support (Vterm, Eat, Eshell, Ansi-Term)
+;;; § 11.  Terminal Support (vterm, eat, eshell, ansi-term)
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defvar Kubed-Ext--Tramp-Optimized Nil
-  "Non-Nil When Tramp Has Already Been Optimized For Kubed.")
+(defvar kubed-ext--tramp-optimized nil
+  "Non-nil when TRAMP has already been optimized for kubed.")
 
-(Defun Kubed-Ext-Optimize-Tramp ()
-  "Configure Tramp To Cache Connections, Improving Eshell/Dired Speed."
-  (Unless Kubed-Ext--Tramp-Optimized
-          (Setq Kubed-Ext--Tramp-Optimized T)
-          (Require 'Tramp)
-          (When (Require 'Kubed-Tramp Nil T)
-                (When (Boundp 'Kubed-Tramp-Method)
-                      (Add-To-List 'Tramp-Connection-Properties
-                                   (List (Regexp-Quote (Format "/%S:" Kubed-Tramp-Method))
-                                         "Direct-Async-Process" T))))
-          (When (Boundp 'Tramp-Completion-Reread-Directory-Timeout)
-                (Setq Tramp-Completion-Reread-Directory-Timeout Nil))))
+(defun kubed-ext-optimize-tramp ()
+  "Configure TRAMP to cache connections, improving Eshell/Dired speed."
+  (unless kubed-ext--tramp-optimized
+    (setq kubed-ext--tramp-optimized t)
+    (require 'tramp)
+    (when (require 'kubed-tramp nil t)
+      (when (boundp 'kubed-tramp-method)
+        (add-to-list 'tramp-connection-properties
+                     (list (regexp-quote (format "/%s:" kubed-tramp-method))
+                           "direct-async-process" t))))
+    (when (boundp 'tramp-completion-reread-directory-timeout)
+      (setq tramp-completion-reread-directory-timeout nil))))
 
-(Add-Hook 'Kubed-List-Mode-Hook #'Kubed-Ext-Optimize-Tramp)
+(add-hook 'kubed-list-mode-hook #'kubed-ext-optimize-tramp)
 
-(Defun Kubed-Ext--Kubectl-Exec-Command (Pod Container Context Namespace Shell)
-  "Build Kubectl Exec Command For Pod/Container/Context/Namespace/Shell."
-  (Mapconcat #'Shell-Quote-Argument
-             (Append (List Kubed-Kubectl-Program "Exec" "-It" Pod
-                           "-C" Container)
-                     (When Namespace (List "-N" Namespace))
-                     (When Context   (List "--Context" Context))
-                     (List "--" Shell))
+(defun kubed-ext--kubectl-exec-command (pod container context namespace shell)
+  "Build kubectl exec command for POD/CONTAINER/CONTEXT/NAMESPACE/SHELL."
+  (mapconcat #'shell-quote-argument
+             (append (list kubed-kubectl-program "exec" "-it" pod
+                           "-c" container)
+                     (when namespace (list "-n" namespace))
+                     (when context   (list "--context" context))
+                     (list "--" shell))
              " "))
 
-(Defun Kubed-Ext-Pods-Vterm (Click)
-  "Open Vterm In Kubernetes Pod At Click Position."
-  (Interactive (List Last-Nonmenu-Event) Kubed-Pods-Mode)
-  (Unless (Require 'Vterm Nil T)
-          (User-Error "This Command Requires The `Vterm' Package"))
-  (If-Let ((Pod (Kubed-Ext--Resource-At-Event Click)))
-          (Let* ((Container (Kubed-Read-Container Pod "Container" T
-                                                  Kubed-List-Context Kubed-List-Namespace))
-                 (Vterm-Shell (Kubed-Ext--Kubectl-Exec-Command
-                               Pod Container Kubed-List-Context Kubed-List-Namespace
-                               Kubed-Ext-Pod-Shell))
-                 (Vterm-Buffer-Name
-                  (Format "*Kubed Vterm %S*"
-                          (Kubed-Display-Resource-Short-Description
-                           "Pods" Pod Kubed-List-Context Kubed-List-Namespace))))
-                (Vterm Vterm-Buffer-Name))
-          (User-Error "No Kubernetes Pod At Point")))
+(defun kubed-ext-pods-vterm (click)
+  "Open vterm in Kubernetes pod at CLICK position."
+  (interactive (list last-nonmenu-event) kubed-pods-mode)
+  (unless (require 'vterm nil t)
+    (user-error "This command requires the `vterm' package"))
+  (if-let ((pod (kubed-ext--resource-at-event click)))
+      (let* ((container (kubed-read-container pod "Container" t
+                                              kubed-list-context kubed-list-namespace))
+             (vterm-shell (kubed-ext--kubectl-exec-command
+                           pod container kubed-list-context kubed-list-namespace
+                           kubed-ext-pod-shell))
+             (vterm-buffer-name
+              (format "*Kubed vterm %s*"
+                      (kubed-display-resource-short-description
+                       "pods" pod kubed-list-context kubed-list-namespace))))
+        (vterm vterm-buffer-name))
+    (user-error "No Kubernetes pod at point")))
 
-(Defun Kubed-Ext-Vterm-Pod (Pod &Optional Context Namespace)
-  "Open Vterm In Kubernetes Pod In Context/Namespace."
-  (Interactive
-   (Let* ((C (Kubed-Local-Context))
-          (C (If (Equal Current-Prefix-Arg '(16))
-                 (Kubed-Read-Context "Context" C) C))
-          (N (Kubed--Namespace C Current-Prefix-Arg)))
-         (List (Kubed-Read-Pod "Open Vterm In Pod" Nil Nil C N) C N)))
-  (Unless (Require 'Vterm Nil T)
-          (User-Error "This Command Requires The `Vterm' Package"))
-  (Let* ((Context (Or Context (Kubed-Local-Context)))
-         (Namespace (Or Namespace (Kubed--Namespace Context)))
-         (Container (Kubed-Read-Container Pod "Container" T Context Namespace))
-         (Vterm-Shell (Kubed-Ext--Kubectl-Exec-Command
-                       Pod Container Context Namespace Kubed-Ext-Pod-Shell))
-         (Vterm-Buffer-Name
-          (Format "*Kubed Vterm %S*"
-                  (Kubed-Display-Resource-Short-Description
-                   "Pods" Pod Context Namespace))))
-        (Vterm Vterm-Buffer-Name)))
+(defun kubed-ext-vterm-pod (pod &optional context namespace)
+  "Open vterm in Kubernetes POD in CONTEXT/NAMESPACE."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg)))
+     (list (kubed-read-pod "Open vterm in pod" nil nil c n) c n)))
+  (unless (require 'vterm nil t)
+    (user-error "This command requires the `vterm' package"))
+  (let* ((context (or context (kubed-local-context)))
+         (namespace (or namespace (kubed--namespace context)))
+         (container (kubed-read-container pod "Container" t context namespace))
+         (vterm-shell (kubed-ext--kubectl-exec-command
+                       pod container context namespace kubed-ext-pod-shell))
+         (vterm-buffer-name
+          (format "*Kubed vterm %s*"
+                  (kubed-display-resource-short-description
+                   "pods" pod context namespace))))
+    (vterm vterm-buffer-name)))
 
-(Defun Kubed-Ext-Pods-Eat (Click)
-  "Open Eat Terminal In Kubernetes Pod At Click Position."
-  (Interactive (List Last-Nonmenu-Event) Kubed-Pods-Mode)
-  (Unless (Require 'Eat Nil T)
-          (User-Error "This Command Requires The `Eat' Package"))
-  (If-Let ((Pod (Kubed-Ext--Resource-At-Event Click)))
-          (Let* ((Container (Kubed-Read-Container Pod "Container" T
-                                                  Kubed-List-Context Kubed-List-Namespace))
-                 (Cmd (Kubed-Ext--Kubectl-Exec-Command
-                       Pod Container Kubed-List-Context Kubed-List-Namespace
-                       Kubed-Ext-Pod-Shell))
-                 (Eat-Buffer-Name
-                  (Format "*Kubed Eat %S*"
-                          (Kubed-Display-Resource-Short-Description
-                           "Pods" Pod Kubed-List-Context Kubed-List-Namespace))))
-                (Eat Cmd T))
-          (User-Error "No Kubernetes Pod At Point")))
+(defun kubed-ext-pods-eat (click)
+  "Open eat terminal in Kubernetes pod at CLICK position."
+  (interactive (list last-nonmenu-event) kubed-pods-mode)
+  (unless (require 'eat nil t)
+    (user-error "This command requires the `eat' package"))
+  (if-let ((pod (kubed-ext--resource-at-event click)))
+      (let* ((container (kubed-read-container pod "Container" t
+                                              kubed-list-context kubed-list-namespace))
+             (cmd (kubed-ext--kubectl-exec-command
+                   pod container kubed-list-context kubed-list-namespace
+                   kubed-ext-pod-shell))
+             (eat-buffer-name
+              (format "*Kubed eat %s*"
+                      (kubed-display-resource-short-description
+                       "pods" pod kubed-list-context kubed-list-namespace))))
+        (eat cmd t))
+    (user-error "No Kubernetes pod at point")))
 
-(Defun Kubed-Ext-Eat-Pod (Pod &Optional Context Namespace)
-  "Open Eat Terminal In Kubernetes Pod In Context/Namespace."
-  (Interactive
-   (Let* ((C (Kubed-Local-Context))
-          (C (If (Equal Current-Prefix-Arg '(16))
-                 (Kubed-Read-Context "Context" C) C))
-          (N (Kubed--Namespace C Current-Prefix-Arg)))
-         (List (Kubed-Read-Pod "Open Eat In Pod" Nil Nil C N) C N)))
-  (Unless (Require 'Eat Nil T)
-          (User-Error "This Command Requires The `Eat' Package"))
-  (Let* ((Context (Or Context (Kubed-Local-Context)))
-         (Namespace (Or Namespace (Kubed--Namespace Context)))
-         (Container (Kubed-Read-Container Pod "Container" T Context Namespace))
-         (Cmd (Kubed-Ext--Kubectl-Exec-Command
-               Pod Container Context Namespace Kubed-Ext-Pod-Shell))
-         (Eat-Buffer-Name
-          (Format "*Kubed Eat %S*"
-                  (Kubed-Display-Resource-Short-Description
-                   "Pods" Pod Context Namespace))))
-        (Eat Cmd T)))
+(defun kubed-ext-eat-pod (pod &optional context namespace)
+  "Open eat terminal in Kubernetes POD in CONTEXT/NAMESPACE."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg)))
+     (list (kubed-read-pod "Open eat in pod" nil nil c n) c n)))
+  (unless (require 'eat nil t)
+    (user-error "This command requires the `eat' package"))
+  (let* ((context (or context (kubed-local-context)))
+         (namespace (or namespace (kubed--namespace context)))
+         (container (kubed-read-container pod "Container" t context namespace))
+         (cmd (kubed-ext--kubectl-exec-command
+               pod container context namespace kubed-ext-pod-shell))
+         (eat-buffer-name
+          (format "*Kubed eat %s*"
+                  (kubed-display-resource-short-description
+                   "pods" pod context namespace))))
+    (eat cmd t)))
 
-(Defun Kubed-Ext-Pods-Eshell (Click)
-  "Open Eshell In Kubernetes Pod At Click Position."
-  (Interactive (List Last-Nonmenu-Event) Kubed-Pods-Mode)
-  (Require 'Kubed-Tramp) (Kubed-Tramp-Assert-Support)
-  (If-Let ((Pod (Kubed-Ext--Resource-At-Event Click)))
-          (Let* ((Default-Directory
-                   (Kubed-Remote-File-Name
-                    Kubed-List-Context Kubed-List-Namespace Pod))
-                 (Eshell-Buffer-Name
-                  (Format "*Kubed Eshell %S*"
-                          (Kubed-Display-Resource-Short-Description
-                           "Pods" Pod Kubed-List-Context Kubed-List-Namespace))))
-                (Eshell T))
-          (User-Error "No Kubernetes Pod At Point")))
+(defun kubed-ext-pods-eshell (click)
+  "Open eshell in Kubernetes pod at CLICK position."
+  (interactive (list last-nonmenu-event) kubed-pods-mode)
+  (require 'kubed-tramp) (kubed-tramp-assert-support)
+  (if-let ((pod (kubed-ext--resource-at-event click)))
+      (let* ((default-directory
+               (kubed-remote-file-name
+                kubed-list-context kubed-list-namespace pod))
+             (eshell-buffer-name
+              (format "*Kubed eshell %s*"
+                      (kubed-display-resource-short-description
+                       "pods" pod kubed-list-context kubed-list-namespace))))
+        (eshell t))
+    (user-error "No Kubernetes pod at point")))
 
-(Defun Kubed-Ext-Eshell-Pod (Pod &Optional Context Namespace)
-  "Open Eshell In Kubernetes Pod In Context/Namespace."
-  (Interactive
-   (Let* ((C (Kubed-Local-Context))
-          (C (If (Equal Current-Prefix-Arg '(16))
-                 (Kubed-Read-Context "Context" C) C))
-          (N (Kubed--Namespace C Current-Prefix-Arg)))
-         (List (Kubed-Read-Pod "Open Eshell In Pod" Nil Nil C N) C N)))
-  (Require 'Kubed-Tramp) (Kubed-Tramp-Assert-Support)
-  (Let* ((Context (Or Context (Kubed-Local-Context)))
-         (Namespace (Or Namespace (Kubed--Namespace Context)))
-         (Default-Directory (Kubed-Remote-File-Name Context Namespace Pod))
-         (Eshell-Buffer-Name
-          (Format "*Kubed Eshell %S*"
-                  (Kubed-Display-Resource-Short-Description
-                   "Pods" Pod Context Namespace))))
-        (Eshell T)))
+(defun kubed-ext-eshell-pod (pod &optional context namespace)
+  "Open eshell in Kubernetes POD in CONTEXT/NAMESPACE."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg)))
+     (list (kubed-read-pod "Open eshell in pod" nil nil c n) c n)))
+  (require 'kubed-tramp) (kubed-tramp-assert-support)
+  (let* ((context (or context (kubed-local-context)))
+         (namespace (or namespace (kubed--namespace context)))
+         (default-directory (kubed-remote-file-name context namespace pod))
+         (eshell-buffer-name
+          (format "*Kubed eshell %s*"
+                  (kubed-display-resource-short-description
+                   "pods" pod context namespace))))
+    (eshell t)))
 
-(Defun Kubed-Ext-Pods-Ansi-Term (Click)
-  "Open `Ansi-Term' In Kubernetes Pod At Click Position."
-  (Interactive (List Last-Nonmenu-Event) Kubed-Pods-Mode)
-  (If-Let ((Pod (Kubed-Ext--Resource-At-Event Click)))
-          (Let* ((Container (Kubed-Read-Container Pod "Container" T
-                                                  Kubed-List-Context Kubed-List-Namespace))
-                 (Cmd (Kubed-Ext--Kubectl-Exec-Command
-                       Pod Container Kubed-List-Context Kubed-List-Namespace
-                       Kubed-Ext-Pod-Shell))
-                 (Buf-Name (Format "Kubed Term %S"
-                                   (Kubed-Display-Resource-Short-Description
-                                    "Pods" Pod Kubed-List-Context Kubed-List-Namespace))))
-                (With-Current-Buffer (Ansi-Term "/Bin/Bash" Buf-Name)
-                                     (Process-Send-String (Get-Buffer-Process (Current-Buffer))
-                                                          (Concat Cmd "\N"))))
-          (User-Error "No Kubernetes Pod At Point")))
+(defun kubed-ext-pods-ansi-term (click)
+  "Open `ansi-term' in Kubernetes pod at CLICK position."
+  (interactive (list last-nonmenu-event) kubed-pods-mode)
+  (if-let ((pod (kubed-ext--resource-at-event click)))
+      (let* ((container (kubed-read-container pod "Container" t
+                                              kubed-list-context kubed-list-namespace))
+             (cmd (kubed-ext--kubectl-exec-command
+                   pod container kubed-list-context kubed-list-namespace
+                   kubed-ext-pod-shell))
+             (buf-name (format "Kubed term %s"
+                               (kubed-display-resource-short-description
+                                "pods" pod kubed-list-context kubed-list-namespace))))
+        (with-current-buffer (ansi-term "/bin/bash" buf-name)
+          (process-send-string (get-buffer-process (current-buffer))
+                               (concat cmd "\n"))))
+    (user-error "No Kubernetes pod at point")))
 
-(Defun Kubed-Ext-Pods-Shell-Command (Click)
-  "Run A Shell Command Via Kubectl Exec In Pod At Click Position."
-  (Interactive (List Last-Nonmenu-Event) Kubed-Pods-Mode)
-  (If-Let ((Pod (Kubed-Ext--Resource-At-Event Click)))
-          (Let* ((Container (Kubed-Read-Container Pod "Container" T
-                                                  Kubed-List-Context Kubed-List-Namespace))
-                 (Prefix (Concat
-                          (Mapconcat #'Shell-Quote-Argument
-                                     (Append (List Kubed-Kubectl-Program
-                                                   "Exec" "-It" Pod "-C" Container)
-                                             (When Kubed-List-Namespace
-                                                   (List "-N" Kubed-List-Namespace))
-                                             (When Kubed-List-Context
-                                                   (List "--Context" Kubed-List-Context))
-                                             (List "--"))
-                                     " ")
-                          " "))
-                 (Command (Read-String "Shell Command: " Prefix)))
-                (Shell-Command Command))
-          (User-Error "No Kubernetes Pod At Point")))
+(defun kubed-ext-pods-shell-command (click)
+  "Run a shell command via kubectl exec in pod at CLICK position."
+  (interactive (list last-nonmenu-event) kubed-pods-mode)
+  (if-let ((pod (kubed-ext--resource-at-event click)))
+      (let* ((container (kubed-read-container pod "Container" t
+                                              kubed-list-context kubed-list-namespace))
+             (prefix (concat
+                      (mapconcat #'shell-quote-argument
+                                 (append (list kubed-kubectl-program
+                                               "exec" "-it" pod "-c" container)
+                                         (when kubed-list-namespace
+                                           (list "-n" kubed-list-namespace))
+                                         (when kubed-list-context
+                                           (list "--context" kubed-list-context))
+                                         (list "--"))
+                                 " ")
+                      " "))
+             (command (read-string "Shell command: " prefix)))
+        (shell-command command))
+    (user-error "No Kubernetes pod at point")))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 12.  Describe Resource
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defun Kubed-Ext-List-Describe-Resource (Click)
-  "Describe Kubernetes Resource At Click Position Using Kubectl Describe."
-  (Interactive (List Last-Nonmenu-Event) Kubed-List-Mode)
-  (If-Let ((Name (Kubed-Ext--Resource-At-Event Click)))
-          (Let* ((Type Kubed-List-Type)
-                 (Namespace Kubed-List-Namespace)
-                 (Context Kubed-List-Context)
-                 (Buf (Get-Buffer-Create
-                       (Format "*Kubed Describe %S/%S@%S[%S]*"
-                               Type Name
-                               (Or Namespace "Default")
-                               (Or Context "Current")))))
-                (With-Current-Buffer Buf
-                                     (Let ((Inhibit-Read-Only T))
-                                          (Erase-Buffer)
-                                          (Apply #'Call-Process Kubed-Kubectl-Program Nil T Nil
-                                                 (Append (List "Describe" Type Name)
-                                                         (When Namespace (List "-N" Namespace))
-                                                         (When Context (List "--Context" Context))))
-                                          (Goto-Char (Point-Min))
-                                          (Special-Mode)))
-                (Display-Buffer Buf))
-          (User-Error "No Kubernetes Resource At Point")))
+(defun kubed-ext-list-describe-resource (click)
+  "Describe Kubernetes resource at CLICK position using kubectl describe."
+  (interactive (list last-nonmenu-event) kubed-list-mode)
+  (if-let ((name (kubed-ext--resource-at-event click)))
+      (let* ((type kubed-list-type)
+             (namespace kubed-list-namespace)
+             (context kubed-list-context)
+             (buf (get-buffer-create
+                   (format "*Kubed describe %s/%s@%s[%s]*"
+                           type name
+                           (or namespace "default")
+                           (or context "current")))))
+        (with-current-buffer buf
+          (let ((inhibit-read-only t))
+            (erase-buffer)
+            (apply #'call-process kubed-kubectl-program nil t nil
+                   (append (list "describe" type name)
+                           (when namespace (list "-n" namespace))
+                           (when context (list "--context" context))))
+            (goto-char (point-min))
+            (special-mode)))
+        (display-buffer buf))
+    (user-error "No Kubernetes resource at point")))
 
-(Defun Kubed-Ext-Describe-Resource (Type Name &Optional Context Namespace)
-  "Describe Resource Name Of Type In Context And Namespace."
-  (Interactive
-   (Let* ((C (Kubed-Local-Context))
-          (C (If (Equal Current-Prefix-Arg '(16))
-                 (Kubed-Read-Context "Context" C) C))
-          (Type (Kubed-Read-Resource-Type "Type To Describe" Nil C))
-          (Ns (When (Kubed-Namespaced-P Type C)
-                    (Kubed--Namespace C Current-Prefix-Arg)))
-          (Name (Kubed-Read-Resource-Name Type "Describe" Nil Nil C Ns)))
-         (List Type Name C Ns)))
-  (Let* ((Ctx (Or Context (Kubed-Local-Context)))
-         (Ns (Or Namespace
-                 (When (Kubed-Namespaced-P Type Ctx)
-                       (Kubed--Namespace Ctx))))
-         (Buf (Get-Buffer-Create
-               (Format "*Kubed Describe %S/%S@%S[%S]*"
-                       Type Name (Or Ns "Cluster") Ctx))))
-        (With-Current-Buffer Buf
-                             (Let ((Inhibit-Read-Only T))
-                                  (Erase-Buffer)
-                                  (Apply #'Call-Process Kubed-Kubectl-Program Nil T Nil
-                                         (Append (List "Describe" Type Name)
-                                                 (When Ns (List "-N" Ns))
-                                                 (When Ctx (List "--Context" Ctx))))
-                                  (Goto-Char (Point-Min))
-                                  (Special-Mode)))
-        (Display-Buffer Buf)))
-
-;;; ═══════════════════════════════════════════════════════════════
-;;; § 12a.  Initcontainer Logs
-;;; ═══════════════════════════════════════════════════════════════
-
-(Defun Kubed-Ext-Pod-Init-Containers (Pod &Optional Context Namespace)
-  "Return List Of Init Container Names In Pod In Context/Namespace, Or Nil."
-  (Condition-Case Nil
-                  (Let ((Output (Car (Apply #'Process-Lines
-                                            Kubed-Kubectl-Program "Get" "Pod" Pod
-                                            "-O" "Jsonpath={.Spec.Initcontainers[*].Name}"
-                                            (Append
-                                             (When Namespace (List "--Namespace" Namespace))
-                                             (When Context (List "--Context" Context)))))))
-                       (When (And Output
-                                  (Not (Kubed-Ext-None-P Output)))
-                             (Split-String Output " " T)))
-                  (Error Nil)))
-
-(Defun Kubed-Ext-Logs-Init-Container (&Optional Context Namespace)
-  "Show Logs For An Init Container Of A Pod In Context/Namespace."
-  (Interactive
-   (Let* ((C (Kubed-Local-Context))
-          (C (If (Equal Current-Prefix-Arg '(16))
-                 (Kubed-Read-Context "Context" C) C))
-          (N (Kubed--Namespace C Current-Prefix-Arg)))
-         (List C N)))
-  (Let* ((Ctx (Or Context (Kubed-Local-Context)))
-         (Ns (Or Namespace (Kubed--Namespace Ctx)))
-         (Pod (Kubed-Read-Pod "Pod" Nil Nil Ctx Ns))
-         (Init-Containers (Kubed-Ext-Pod-Init-Containers Pod Ctx Ns)))
-        (Unless Init-Containers
-                (User-Error "Pod `%S' Has No Init Containers" Pod))
-        (Let ((Container (If (= (Length Init-Containers) 1)
-                             (Car Init-Containers)
-                             (Completing-Read "Init Container: "
-                                              Init-Containers Nil T))))
-             (Kubed-Logs "Pods" Pod Ctx Ns Container Nil Nil Nil Nil Nil Nil))))
-
-(Defun Kubed-Ext-Pods-Logs-Init-Container (Click)
-  "Show Init Container Logs For Pod At Click Position."
-  (Interactive (List Last-Nonmenu-Event) Kubed-Pods-Mode)
-  (If-Let ((Pod (Kubed-Ext--Resource-At-Event Click)))
-          (Let ((Init-Containers (Kubed-Ext-Pod-Init-Containers
-                                  Pod Kubed-List-Context Kubed-List-Namespace)))
-               (Unless Init-Containers
-                       (User-Error "Pod `%S' Has No Init Containers" Pod))
-               (Let ((Container (If (= (Length Init-Containers) 1)
-                                    (Car Init-Containers)
-                                    (Completing-Read "Init Container: "
-                                                     Init-Containers Nil T))))
-                    (Kubed-Logs "Pods" Pod Kubed-List-Context Kubed-List-Namespace
-                                Container Nil Nil Nil Nil Nil Nil)))
-          (User-Error "No Kubernetes Pod At Point")))
+(defun kubed-ext-describe-resource (type name &optional context namespace)
+  "Describe resource NAME of TYPE in CONTEXT and NAMESPACE."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (type (kubed-read-resource-type "Type to describe" nil c))
+          (ns (when (kubed-namespaced-p type c)
+                (kubed--namespace c current-prefix-arg)))
+          (name (kubed-read-resource-name type "Describe" nil nil c ns)))
+     (list type name c ns)))
+  (let* ((ctx (or context (kubed-local-context)))
+         (ns (or namespace
+                 (when (kubed-namespaced-p type ctx)
+                   (kubed--namespace ctx))))
+         (buf (get-buffer-create
+               (format "*Kubed describe %s/%s@%s[%s]*"
+                       type name (or ns "cluster") ctx))))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (apply #'call-process kubed-kubectl-program nil t nil
+               (append (list "describe" type name)
+                       (when ns (list "-n" ns))
+                       (when ctx (list "--context" ctx))))
+        (goto-char (point-min))
+        (special-mode)))
+    (display-buffer buf)))
 
 ;;; ═══════════════════════════════════════════════════════════════
-;;; § 12b.  Logs By Label Selector
+;;; § 12a.  initContainer Logs
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defun Kubed-Ext-Logs-By-Label (&Optional Context Namespace)
-  "Show Logs For Pods Matching A Label Selector In Context/Namespace."
-  (Interactive
-   (Let* ((C (Kubed-Local-Context))
-          (C (If (Equal Current-Prefix-Arg '(16))
-                 (Kubed-Read-Context "Context" C) C))
-          (N (Kubed--Namespace C Current-Prefix-Arg)))
-         (List C N)))
-  (Let* ((Ctx (Or Context (Kubed-Local-Context)))
-         (Ns (Or Namespace (Kubed--Namespace Ctx)))
-         (Labels (Kubed-Ext-Discover-Labels "Pods" Ctx Ns))
-         (Label (Completing-Read "Label Selector: " Labels Nil Nil
-                                 Nil 'Kubed-Ext-Label-Selector-History))
-         (Tail (Read-Number "Tail Lines: " 100))
-         (Buf (Generate-New-Buffer
-               (Format "*Kubed-Logs -L %S@%S[%S]*" Label Ns Ctx))))
-        (With-Current-Buffer Buf (Run-Hooks 'Kubed-Logs-Setup-Hook))
-        (Start-Process "*Kubed-Logs-By-Label*" Buf
-                       Kubed-Kubectl-Program "Logs" "-L" Label
-                       "--Tail" (Number-To-String Tail)
-                       "-N" Ns "--Context" Ctx)
-        (Display-Buffer Buf)))
+(defun kubed-ext-pod-init-containers (pod &optional context namespace)
+  "Return list of init container names in POD in CONTEXT/NAMESPACE, or nil."
+  (condition-case nil
+      (let ((output (car (apply #'process-lines
+                                kubed-kubectl-program "get" "pod" pod
+                                "-o" "jsonpath={.spec.initContainers[*].name}"
+                                (append
+                                 (when namespace (list "--namespace" namespace))
+                                 (when context (list "--context" context)))))))
+        (when (and output
+                   (not (kubed-ext-none-p output)))
+          (split-string output " " t)))
+    (error nil)))
+
+(defun kubed-ext-logs-init-container (&optional context namespace)
+  "Show logs for an init container of a pod in CONTEXT/NAMESPACE."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg)))
+     (list c n)))
+  (let* ((ctx (or context (kubed-local-context)))
+         (ns (or namespace (kubed--namespace ctx)))
+         (pod (kubed-read-pod "Pod" nil nil ctx ns))
+         (init-containers (kubed-ext-pod-init-containers pod ctx ns)))
+    (unless init-containers
+      (user-error "Pod `%s' has no init containers" pod))
+    (let ((container (if (= (length init-containers) 1)
+                         (car init-containers)
+                       (completing-read "Init container: "
+                                        init-containers nil t))))
+      (kubed-logs "pods" pod ctx ns container nil nil nil nil nil nil))))
+
+(defun kubed-ext-pods-logs-init-container (click)
+  "Show init container logs for pod at CLICK position."
+  (interactive (list last-nonmenu-event) kubed-pods-mode)
+  (if-let ((pod (kubed-ext--resource-at-event click)))
+      (let ((init-containers (kubed-ext-pod-init-containers
+                              pod kubed-list-context kubed-list-namespace)))
+        (unless init-containers
+          (user-error "Pod `%s' has no init containers" pod))
+        (let ((container (if (= (length init-containers) 1)
+                             (car init-containers)
+                           (completing-read "Init container: "
+                                            init-containers nil t))))
+          (kubed-logs "pods" pod kubed-list-context kubed-list-namespace
+                      container nil nil nil nil nil nil)))
+    (user-error "No Kubernetes pod at point")))
+
+;;; ═══════════════════════════════════════════════════════════════
+;;; § 12b.  Logs by Label Selector
+;;; ═══════════════════════════════════════════════════════════════
+
+(defun kubed-ext-logs-by-label (&optional context namespace)
+  "Show logs for pods matching a label selector in CONTEXT/NAMESPACE."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg)))
+     (list c n)))
+  (let* ((ctx (or context (kubed-local-context)))
+         (ns (or namespace (kubed--namespace ctx)))
+         (labels (kubed-ext-discover-labels "pods" ctx ns))
+         (label (completing-read "Label selector: " labels nil nil
+                                 nil 'kubed-ext-label-selector-history))
+         (tail (read-number "Tail lines: " 100))
+         (buf (generate-new-buffer
+               (format "*kubed-logs -l %s@%s[%s]*" label ns ctx))))
+    (with-current-buffer buf (run-hooks 'kubed-logs-setup-hook))
+    (start-process "*kubed-logs-by-label*" buf
+                   kubed-kubectl-program "logs" "-l" label
+                   "--tail" (number-to-string tail)
+                   "-n" ns "--context" ctx)
+    (display-buffer buf)))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 13.  Rollout Management
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defvar-Local Kubed-Ext-Rollout-Type Nil)
-(Defvar-Local Kubed-Ext-Rollout-Name Nil)
-(Defvar-Local Kubed-Ext-Rollout-Context Nil)
-(Defvar-Local Kubed-Ext-Rollout-Namespace Nil)
+(defvar-local kubed-ext-rollout-type nil)
+(defvar-local kubed-ext-rollout-name nil)
+(defvar-local kubed-ext-rollout-context nil)
+(defvar-local kubed-ext-rollout-namespace nil)
 
-(Defun Kubed-Ext-Rollout-History (Type Name &Optional Context Namespace)
-  "Show Rollout History For Type/Name In Context/Namespace."
-  (Interactive
-   (Let* ((C (Kubed-Local-Context))
-          (C (If (Equal Current-Prefix-Arg '(16))
-                 (Kubed-Read-Context "Context" C) C))
-          (N (Kubed--Namespace C Current-Prefix-Arg))
-          (Type (Completing-Read "Resource Type: "
-                                 '("Deployment" "Statefulset" "Daemonset") Nil T))
-          (Name (Kubed-Read-Resource-Name
-                 (Concat Type "S") "Rollout History For" Nil Nil C N)))
-         (List Type Name C N)))
-  (Let* ((Ctx (Or Context (Kubed-Local-Context)))
-         (Ns (Or Namespace (Kubed--Namespace Ctx)))
-         (Typename (Format "%S/%S" Type Name))
-         (Buf (Get-Buffer-Create
-               (Format "*Kubed Rollout %S@%S[%S]*"
-                       Typename (Or Ns "Default") Ctx))))
-        (With-Current-Buffer Buf
-                             (Let ((Inhibit-Read-Only T))
-                                  (Erase-Buffer)
-                                  (Insert (Propertize (Format "Rollout History: %S\N" Typename)
-                                                      'Face 'Bold))
-                                  (Insert (Format "Namespace: %S  Context: %S\N" (Or Ns "Default") Ctx))
-                                  (Insert (Make-String 60 ?─) "\N\N")
-                                  (Apply #'Call-Process Kubed-Kubectl-Program Nil T Nil
-                                         "Rollout" "History" Typename
-                                         (Append (When Ns (List "-N" Ns))
-                                                 (When Ctx (List "--Context" Ctx))))
-                                  (Insert "\N" (Make-String 60 ?─) "\N")
-                                  (Insert (Propertize
-                                           "\Nkeys: R = View Revision  U = Undo  G = Refresh  Q = Quit\N"
-                                           'Face 'Shadow))
-                                  (Goto-Char (Point-Min))
-                                  (Setq-Local Kubed-Ext-Rollout-Type Type
-                                              Kubed-Ext-Rollout-Name Name
-                                              Kubed-Ext-Rollout-Context Ctx
-                                              Kubed-Ext-Rollout-Namespace Ns)
-                                  (Kubed-Ext-Rollout-History-Mode)))
-        (Display-Buffer Buf)))
+(defun kubed-ext-rollout-history (type name &optional context namespace)
+  "Show rollout history for TYPE/NAME in CONTEXT/NAMESPACE."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg))
+          (type (completing-read "Resource type: "
+                                 '("deployment" "statefulset" "daemonset") nil t))
+          (name (kubed-read-resource-name
+                 (concat type "s") "Rollout history for" nil nil c n)))
+     (list type name c n)))
+  (let* ((ctx (or context (kubed-local-context)))
+         (ns (or namespace (kubed--namespace ctx)))
+         (typename (format "%s/%s" type name))
+         (buf (get-buffer-create
+               (format "*kubed rollout %s@%s[%s]*"
+                       typename (or ns "default") ctx))))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (propertize (format "Rollout History: %s\n" typename)
+                            'face 'bold))
+        (insert (format "Namespace: %s  Context: %s\n" (or ns "default") ctx))
+        (insert (make-string 60 ?─) "\n\n")
+        (apply #'call-process kubed-kubectl-program nil t nil
+               "rollout" "history" typename
+               (append (when ns (list "-n" ns))
+                       (when ctx (list "--context" ctx))))
+        (insert "\n" (make-string 60 ?─) "\n")
+        (insert (propertize
+                 "\nKeys: r = view revision  u = undo  g = refresh  q = quit\n"
+                 'face 'shadow))
+        (goto-char (point-min))
+        (setq-local kubed-ext-rollout-type type
+                    kubed-ext-rollout-name name
+                    kubed-ext-rollout-context ctx
+                    kubed-ext-rollout-namespace ns)
+        (kubed-ext-rollout-history-mode)))
+    (display-buffer buf)))
 
-(Defun Kubed-Ext-Rollout-Show-Revision ()
-  "Show A Specific Revision From The Rollout History Buffer."
-  (Interactive Nil Kubed-Ext-Rollout-History-Mode)
-  (Let* ((Typename (Format "%S/%S" Kubed-Ext-Rollout-Type
-                           Kubed-Ext-Rollout-Name))
-         (Ctx Kubed-Ext-Rollout-Context)
-         (Ns Kubed-Ext-Rollout-Namespace)
-         (Rev (Read-Number "Revision: "))
-         (Buf (Get-Buffer-Create
-               (Format "*Kubed Rollout %S Rev %D*" Typename Rev))))
-        (With-Current-Buffer Buf
-                             (Let ((Inhibit-Read-Only T))
-                                  (Erase-Buffer)
-                                  (Insert (Propertize (Format "Revision %D: %S\N" Rev Typename)
-                                                      'Face 'Bold))
-                                  (Insert (Make-String 60 ?─) "\N\N")
-                                  (Apply #'Call-Process Kubed-Kubectl-Program Nil T Nil
-                                         "Rollout" "History" Typename (Format "--Revision=%D" Rev)
-                                         (Append (When Ns (List "-N" Ns))
-                                                 (When Ctx (List "--Context" Ctx))))
-                                  (Goto-Char (Point-Min))
-                                  (Special-Mode)))
-        (Display-Buffer Buf)))
+(defun kubed-ext-rollout-show-revision ()
+  "Show a specific revision from the rollout history buffer."
+  (interactive nil kubed-ext-rollout-history-mode)
+  (let* ((typename (format "%s/%s" kubed-ext-rollout-type
+                           kubed-ext-rollout-name))
+         (ctx kubed-ext-rollout-context)
+         (ns kubed-ext-rollout-namespace)
+         (rev (read-number "Revision: "))
+         (buf (get-buffer-create
+               (format "*kubed rollout %s rev %d*" typename rev))))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (propertize (format "Revision %d: %s\n" rev typename)
+                            'face 'bold))
+        (insert (make-string 60 ?─) "\n\n")
+        (apply #'call-process kubed-kubectl-program nil t nil
+               "rollout" "history" typename (format "--revision=%d" rev)
+               (append (when ns (list "-n" ns))
+                       (when ctx (list "--context" ctx))))
+        (goto-char (point-min))
+        (special-mode)))
+    (display-buffer buf)))
 
-(Defun Kubed-Ext-Rollout-Undo (Type Name &Optional Revision Context Namespace)
-  "Undo Rollout Of Type/Name To Revision In Context/Namespace."
-  (Interactive
-   (Let* ((C (Kubed-Local-Context))
-          (C (If (Equal Current-Prefix-Arg '(16))
-                 (Kubed-Read-Context "Context" C) C))
-          (N (Kubed--Namespace C Current-Prefix-Arg))
-          (Type (Completing-Read "Resource Type: "
-                                 '("Deployment" "Statefulset" "Daemonset") Nil T))
-          (Name (Kubed-Read-Resource-Name
-                 (Concat Type "S") "Undo Rollout For" Nil Nil C N))
-          (Rev (When (Y-Or-N-P "Specify Target Revision? ")
-                     (Read-Number "To Revision: "))))
-         (List Type Name Rev C N)))
-  (Let* ((Ctx (Or Context (Kubed-Local-Context)))
-         (Ns (Or Namespace (Kubed--Namespace Ctx)))
-         (Typename (Format "%S/%S" Type Name)))
-        (Unless (Zerop (Apply #'Call-Process Kubed-Kubectl-Program Nil Nil Nil
-                              "Rollout" "Undo" Typename
-                              (Append
-                               (When Revision
-                                     (List (Format "--To-Revision=%D" Revision)))
-                               (When Ns (List "-N" Ns))
-                               (When Ctx (List "--Context" Ctx)))))
-                (User-Error "Failed To Undo Rollout For %S" Typename))
-        (Message "Rolled Back %S%S." Typename
-                 (If Revision (Format " To Revision %D" Revision) ""))))
+(defun kubed-ext-rollout-undo (type name &optional revision context namespace)
+  "Undo rollout of TYPE/NAME to REVISION in CONTEXT/NAMESPACE."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg))
+          (type (completing-read "Resource type: "
+                                 '("deployment" "statefulset" "daemonset") nil t))
+          (name (kubed-read-resource-name
+                 (concat type "s") "Undo rollout for" nil nil c n))
+          (rev (when (y-or-n-p "Specify target revision? ")
+                 (read-number "To revision: "))))
+     (list type name rev c n)))
+  (let* ((ctx (or context (kubed-local-context)))
+         (ns (or namespace (kubed--namespace ctx)))
+         (typename (format "%s/%s" type name)))
+    (unless (zerop (apply #'call-process kubed-kubectl-program nil nil nil
+                          "rollout" "undo" typename
+                          (append
+                           (when revision
+                             (list (format "--to-revision=%d" revision)))
+                           (when ns (list "-n" ns))
+                           (when ctx (list "--context" ctx)))))
+      (user-error "Failed to undo rollout for %s" typename))
+    (message "Rolled back %s%s." typename
+             (if revision (format " to revision %d" revision) ""))))
 
-(Defun Kubed-Ext-Rollout-Undo-From-History ()
-  "Undo Rollout From History Buffer."
-  (Interactive Nil Kubed-Ext-Rollout-History-Mode)
-  (Let* ((Typename (Format "%S/%S" Kubed-Ext-Rollout-Type
-                           Kubed-Ext-Rollout-Name))
-         (Rev (When (Y-Or-N-P "Specify Revision? ")
-                    (Read-Number "To Revision: "))))
-        (When (Y-Or-N-P (Format "Undo Rollout For %S%S? "
-                                Typename
-                                (If Rev (Format " To Rev %D" Rev) "")))
-              (Kubed-Ext-Rollout-Undo Kubed-Ext-Rollout-Type Kubed-Ext-Rollout-Name
-                                      Rev Kubed-Ext-Rollout-Context
-                                      Kubed-Ext-Rollout-Namespace))))
+(defun kubed-ext-rollout-undo-from-history ()
+  "Undo rollout from history buffer."
+  (interactive nil kubed-ext-rollout-history-mode)
+  (let* ((typename (format "%s/%s" kubed-ext-rollout-type
+                           kubed-ext-rollout-name))
+         (rev (when (y-or-n-p "Specify revision? ")
+                (read-number "To revision: "))))
+    (when (y-or-n-p (format "Undo rollout for %s%s? "
+                            typename
+                            (if rev (format " to rev %d" rev) "")))
+      (kubed-ext-rollout-undo kubed-ext-rollout-type kubed-ext-rollout-name
+                              rev kubed-ext-rollout-context
+                              kubed-ext-rollout-namespace))))
 
-(Defun Kubed-Ext-Rollout-Refresh ()
-  "Refresh Rollout History Buffer."
-  (Interactive Nil Kubed-Ext-Rollout-History-Mode)
-  (Kubed-Ext-Rollout-History Kubed-Ext-Rollout-Type Kubed-Ext-Rollout-Name
-                             Kubed-Ext-Rollout-Context
-                             Kubed-Ext-Rollout-Namespace))
+(defun kubed-ext-rollout-refresh ()
+  "Refresh rollout history buffer."
+  (interactive nil kubed-ext-rollout-history-mode)
+  (kubed-ext-rollout-history kubed-ext-rollout-type kubed-ext-rollout-name
+                             kubed-ext-rollout-context
+                             kubed-ext-rollout-namespace))
 
-(Define-Derived-Mode Kubed-Ext-Rollout-History-Mode Special-Mode "Kubed Rollout"
-  "Mode For Viewing Kubernetes Rollout History."
-  :Interactive Nil)
+(define-derived-mode kubed-ext-rollout-history-mode special-mode "Kubed Rollout"
+  "Mode for viewing Kubernetes rollout history."
+  :interactive nil)
 
-(Keymap-Set Kubed-Ext-Rollout-History-Mode-Map "R"
-            #'Kubed-Ext-Rollout-Show-Revision)
-(Keymap-Set Kubed-Ext-Rollout-History-Mode-Map "U"
-            #'Kubed-Ext-Rollout-Undo-From-History)
-(Keymap-Set Kubed-Ext-Rollout-History-Mode-Map "G"
-            #'Kubed-Ext-Rollout-Refresh)
-(Keymap-Set Kubed-Ext-Rollout-History-Mode-Map "Q" #'Quit-Window)
+(keymap-set kubed-ext-rollout-history-mode-map "r"
+            #'kubed-ext-rollout-show-revision)
+(keymap-set kubed-ext-rollout-history-mode-map "u"
+            #'kubed-ext-rollout-undo-from-history)
+(keymap-set kubed-ext-rollout-history-mode-map "g"
+            #'kubed-ext-rollout-refresh)
+(keymap-set kubed-ext-rollout-history-mode-map "q" #'quit-window)
 
-(Defun Kubed-Ext-Deployments-Rollout-History (Click)
-  "Show Rollout History For Deployment At Click Position."
-  (Interactive (List Last-Nonmenu-Event) Kubed-Deployments-Mode)
-  (If-Let ((Dep (Kubed-Ext--Resource-At-Event Click)))
-          (Kubed-Ext-Rollout-History "Deployment" Dep
-                                     Kubed-List-Context Kubed-List-Namespace)
-          (User-Error "No Kubernetes Deployment At Point")))
+(defun kubed-ext-deployments-rollout-history (click)
+  "Show rollout history for deployment at CLICK position."
+  (interactive (list last-nonmenu-event) kubed-deployments-mode)
+  (if-let ((dep (kubed-ext--resource-at-event click)))
+      (kubed-ext-rollout-history "deployment" dep
+                                 kubed-list-context kubed-list-namespace)
+    (user-error "No Kubernetes deployment at point")))
 
-(Defun Kubed-Ext-Deployments-Rollout-Undo (Click)
-  "Undo Rollout For Deployment At Click Position."
-  (Interactive (List Last-Nonmenu-Event) Kubed-Deployments-Mode)
-  (If-Let ((Dep (Kubed-Ext--Resource-At-Event Click)))
-          (Let ((Rev (When (Y-Or-N-P "Specify Target Revision? ")
-                           (Read-Number "To Revision: "))))
-               (When (Y-Or-N-P (Format "Undo Rollout For %S?" Dep))
-                     (Kubed-Ext-Rollout-Undo "Deployment" Dep Rev
-                                             Kubed-List-Context Kubed-List-Namespace)
-                     (Kubed-List-Update T)))
-          (User-Error "No Kubernetes Deployment At Point")))
+(defun kubed-ext-deployments-rollout-undo (click)
+  "Undo rollout for deployment at CLICK position."
+  (interactive (list last-nonmenu-event) kubed-deployments-mode)
+  (if-let ((dep (kubed-ext--resource-at-event click)))
+      (let ((rev (when (y-or-n-p "Specify target revision? ")
+                   (read-number "To revision: "))))
+        (when (y-or-n-p (format "Undo rollout for %s?" dep))
+          (kubed-ext-rollout-undo "deployment" dep rev
+                                  kubed-list-context kubed-list-namespace)
+          (kubed-list-update t)))
+    (user-error "No Kubernetes deployment at point")))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 14.  Jab / Bounce Deployment
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defun Kubed-Ext-Jab-Deployment (Deployment &Optional Context Namespace)
-  "Force Rolling Update Of Deployment In Context/Namespace."
-  (Interactive
-   (Let* ((C (Kubed-Local-Context))
-          (C (If (Equal Current-Prefix-Arg '(16))
-                 (Kubed-Read-Context "Context" C) C))
-          (N (Kubed--Namespace C Current-Prefix-Arg)))
-         (List (Kubed-Read-Deployment "Jab (Bounce) Deployment" Nil Nil C N) C N)))
-  (Let* ((Ctx (Or Context (Kubed-Local-Context)))
-         (Ns (Or Namespace (Kubed--Namespace Ctx)))
-         (Q Kubed-Ext--Dq)
-         (Ts (Number-To-String (Floor (Float-Time))))
-         (Patch (Concat "{" Q "Spec" Q ":{" Q "Template" Q ":{" Q "Metadata" Q
-                        ":{" Q "Labels" Q ":{" Q "Date" Q ":" Q Ts Q "}}}}}")))
-        (Unless (Zerop (Apply #'Call-Process Kubed-Kubectl-Program Nil Nil Nil
-                              "Patch" "Deployment" Deployment "-P" Patch
-                              (Append (When Ns (List "-N" Ns))
-                                      (When Ctx (List "--Context" Ctx)))))
-                (User-Error "Failed To Jab Deployment %S" Deployment))
-        (Message "Jabbed Deployment %S (Timestamp %S)." Deployment Ts)))
+(defun kubed-ext-jab-deployment (deployment &optional context namespace)
+  "Force rolling update of DEPLOYMENT in CONTEXT/NAMESPACE."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg)))
+     (list (kubed-read-deployment "Jab (bounce) deployment" nil nil c n) c n)))
+  (let* ((ctx (or context (kubed-local-context)))
+         (ns (or namespace (kubed--namespace ctx)))
+         (q kubed-ext--dq)
+         (ts (number-to-string (floor (float-time))))
+         (patch (concat "{" q "spec" q ":{" q "template" q ":{" q "metadata" q
+                        ":{" q "labels" q ":{" q "date" q ":" q ts q "}}}}}")))
+    (unless (zerop (apply #'call-process kubed-kubectl-program nil nil nil
+                          "patch" "deployment" deployment "-p" patch
+                          (append (when ns (list "-n" ns))
+                                  (when ctx (list "--context" ctx)))))
+      (user-error "Failed to jab deployment %s" deployment))
+    (message "Jabbed deployment %s (timestamp %s)." deployment ts)))
 
-(Defun Kubed-Ext-Deployments-Jab (Click)
-  "Jab Deployment At Click Position To Force A Rolling Update."
-  (Interactive (List Last-Nonmenu-Event) Kubed-Deployments-Mode)
-  (If-Let ((Dep (Kubed-Ext--Resource-At-Event Click)))
-          (Progn (Kubed-Ext-Jab-Deployment Dep Kubed-List-Context
-                                           Kubed-List-Namespace)
-                 (Kubed-List-Update T))
-          (User-Error "No Kubernetes Deployment At Point")))
+(defun kubed-ext-deployments-jab (click)
+  "Jab deployment at CLICK position to force a rolling update."
+  (interactive (list last-nonmenu-event) kubed-deployments-mode)
+  (if-let ((dep (kubed-ext--resource-at-event click)))
+      (progn (kubed-ext-jab-deployment dep kubed-list-context
+                                       kubed-list-namespace)
+             (kubed-list-update t))
+    (user-error "No Kubernetes deployment at point")))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 15.  Copy / Clipboard Operations
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defvar Kubed-Ext--Last-Kubectl-Command Nil
-  "Last Kubectl Command Tracked By Kubed-Ext.")
+(defvar kubed-ext--last-kubectl-command nil
+  "Last kubectl command tracked by kubed-ext.")
 
-(Defun Kubed-Ext-List-Copy-Log-Command (Click)
-  "Copy `Kubectl Logs -F' Command For Resource At Click Position."
-  (Interactive (List Last-Nonmenu-Event) Kubed-List-Mode)
-  (If-Let ((Name (Kubed-Ext--Resource-At-Event Click)))
-          (Let ((Cmd (Format "%S Logs -F --Tail=100 %S%S%S"
-                             Kubed-Kubectl-Program
-                             (If (String= Kubed-List-Type "Pods")
-                                 ""
-                                 (Concat Kubed-List-Type "/"))
-                             Name
-                             (Concat
-                              (When Kubed-List-Namespace
-                                    (Format " -N %S" Kubed-List-Namespace))
-                              (When Kubed-List-Context
-                                    (Format " --Context %S" Kubed-List-Context))))))
-               (Kill-New Cmd)
-               (Message "Copied: %S" Cmd))
-          (User-Error "No Kubernetes Resource At Point")))
+(defun kubed-ext-list-copy-log-command (click)
+  "Copy `kubectl logs -f' command for resource at CLICK position."
+  (interactive (list last-nonmenu-event) kubed-list-mode)
+  (if-let ((name (kubed-ext--resource-at-event click)))
+      (let ((cmd (format "%s logs -f --tail=100 %s%s%s"
+                         kubed-kubectl-program
+                         (if (string= kubed-list-type "pods")
+                             ""
+                           (concat kubed-list-type "/"))
+                         name
+                         (concat
+                          (when kubed-list-namespace
+                            (format " -n %s" kubed-list-namespace))
+                          (when kubed-list-context
+                            (format " --context %s" kubed-list-context))))))
+        (kill-new cmd)
+        (message "Copied: %s" cmd))
+    (user-error "No Kubernetes resource at point")))
 
-(Defun Kubed-Ext-List-Copy-Kubectl-Prefix ()
-  "Copy The Current Kubectl Command Prefix."
-  (Interactive Nil Kubed-List-Mode)
-  (Let ((Prefix (Format "%S%S%S"
-                        Kubed-Kubectl-Program
-                        (If Kubed-List-Namespace
-                            (Format " -N %S" Kubed-List-Namespace) "")
-                        (If Kubed-List-Context
-                            (Format " --Context %S" Kubed-List-Context) ""))))
-       (Kill-New Prefix)
-       (Message "Copied: %S" Prefix)))
+(defun kubed-ext-list-copy-kubectl-prefix ()
+  "Copy the current kubectl command prefix."
+  (interactive nil kubed-list-mode)
+  (let ((prefix (format "%s%s%s"
+                        kubed-kubectl-program
+                        (if kubed-list-namespace
+                            (format " -n %s" kubed-list-namespace) "")
+                        (if kubed-list-context
+                            (format " --context %s" kubed-list-context) ""))))
+    (kill-new prefix)
+    (message "Copied: %s" prefix)))
 
-(Defun Kubed-Ext-List-Copy-Last-Command ()
-  "Copy The Last Tracked Kubectl Command."
-  (Interactive Nil Kubed-List-Mode)
-  (If Kubed-Ext--Last-Kubectl-Command
-      (Progn (Kill-New Kubed-Ext--Last-Kubectl-Command)
-             (Message "Copied: %S" Kubed-Ext--Last-Kubectl-Command))
-      (Message "No Kubectl Command Tracked Yet.")))
+(defun kubed-ext-list-copy-last-command ()
+  "Copy the last tracked kubectl command."
+  (interactive nil kubed-list-mode)
+  (if kubed-ext--last-kubectl-command
+      (progn (kill-new kubed-ext--last-kubectl-command)
+             (message "Copied: %s" kubed-ext--last-kubectl-command))
+    (message "No kubectl command tracked yet.")))
 
-(Defun Kubed-Ext-List-Copy-Resource-As-Yaml (Click)
-  "Copy Yaml Of Resource At Click Position."
-  (Interactive (List Last-Nonmenu-Event) Kubed-List-Mode)
-  (If-Let ((Name (Kubed-Ext--Resource-At-Event Click)))
-          (Let* ((Type Kubed-List-Type)
-                 (Namespace Kubed-List-Namespace)
-                 (Context Kubed-List-Context)
-                 (Yaml (With-Temp-Buffer
-                        (Apply #'Call-Process Kubed-Kubectl-Program Nil T Nil
-                               "Get" Type Name "-O" "Yaml"
-                               (Append
-                                (When Namespace (List "-N" Namespace))
-                                (When Context (List "--Context" Context))))
-                        (Buffer-String))))
-                (Kill-New Yaml)
-                (Message "Yaml For %S/%S Copied (%D Bytes)." Type Name (Length Yaml)))
-          (User-Error "No Kubernetes Resource At Point")))
+(defun kubed-ext-list-copy-resource-as-yaml (click)
+  "Copy YAML of resource at CLICK position."
+  (interactive (list last-nonmenu-event) kubed-list-mode)
+  (if-let ((name (kubed-ext--resource-at-event click)))
+      (let* ((type kubed-list-type)
+             (namespace kubed-list-namespace)
+             (context kubed-list-context)
+             (yaml (with-temp-buffer
+                     (apply #'call-process kubed-kubectl-program nil t nil
+                            "get" type name "-o" "yaml"
+                            (append
+                             (when namespace (list "-n" namespace))
+                             (when context (list "--context" context))))
+                     (buffer-string))))
+        (kill-new yaml)
+        (message "YAML for %s/%s copied (%d bytes)." type name (length yaml)))
+    (user-error "No Kubernetes resource at point")))
 
-(Transient-Define-Prefix Kubed-Ext-Copy-Popup ()
-                         "Kubed Copy Menu."
-                         ["Copy To Kill Ring"
-                          ("W" "Resource Name"  Kubed-List-Copy-As-Kill)
-                          ("L" "Log Command"    Kubed-Ext-List-Copy-Log-Command)
-                          ("P" "Kubectl Prefix" Kubed-Ext-List-Copy-Kubectl-Prefix)
-                          ("C" "Last Command"   Kubed-Ext-List-Copy-Last-Command)
-                          ("Y" "Resource Yaml"  Kubed-Ext-List-Copy-Resource-As-Yaml)])
+(transient-define-prefix kubed-ext-copy-popup ()
+  "Kubed Copy Menu."
+  ["Copy to kill ring"
+   ("w" "Resource name"  kubed-list-copy-as-kill)
+   ("l" "Log command"    kubed-ext-list-copy-log-command)
+   ("p" "kubectl prefix" kubed-ext-list-copy-kubectl-prefix)
+   ("C" "Last command"   kubed-ext-list-copy-last-command)
+   ("y" "Resource YAML"  kubed-ext-list-copy-resource-as-yaml)])
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 16.  Label Selector
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defvar Kubed-Ext-Label-Selector-History Nil
-  "History List For Label Selectors.")
+(defvar kubed-ext-label-selector-history nil
+  "History list for label selectors.")
 
-(Defvar Kubed-Ext--Label-Cache (Make-Hash-Table :Test 'Equal)
-  "Label Cache.")
+(defvar kubed-ext--label-cache (make-hash-table :test 'equal)
+  "Label cache.")
 
-(Defvar Kubed-Ext--Label-Cache-Time (Make-Hash-Table :Test 'Equal)
-  "Label Cache Timestamps.")
+(defvar kubed-ext--label-cache-time (make-hash-table :test 'equal)
+  "Label cache timestamps.")
 
-(Defun Kubed-Ext--Fetch-Labels (Type Context Namespace)
-  "Discover Label Key=Value Pairs From Resources Of Type In Context/Namespace."
-  (Condition-Case Nil
-                  (Let ((Output (With-Temp-Buffer
-                                 (Apply #'Call-Process Kubed-Kubectl-Program Nil '(T Nil) Nil
-                                        "Get" (Or Type "Pods") "--No-Headers"
-                                        "-O" "Custom-Columns=Labels:.Metadata.Labels"
-                                        (Append
-                                         (When Namespace (List "-N" Namespace))
-                                         (When Context (List "--Context" Context))))
-                                 (Buffer-String))))
-                       (Delete-Dups
-                        (Mapcan (Lambda (Line)
-                                        (Let ((Trimmed (String-Trim Line)))
-                                             (When (String-Match "^Map$$$.+$$$" Trimmed)
-                                                   (Mapcar (Lambda (Pair)
-                                                                   (Replace-Regexp-In-String ":" "=" Pair))
-                                                           (Split-String (Match-String 1 Trimmed) " ")))))
-                                (Split-String Output "\N" T))))
-                  (Error Nil)))
+(defun kubed-ext--fetch-labels (type context namespace)
+  "Discover label key=value pairs from resources of TYPE in CONTEXT/NAMESPACE."
+  (condition-case nil
+      (let ((output (with-temp-buffer
+                      (apply #'call-process kubed-kubectl-program nil '(t nil) nil
+                             "get" (or type "pods") "--no-headers"
+                             "-o" "custom-columns=LABELS:.metadata.labels"
+                             (append
+                              (when namespace (list "-n" namespace))
+                              (when context (list "--context" context))))
+                      (buffer-string))))
+        (delete-dups
+         (mapcan (lambda (line)
+                   (let ((trimmed (string-trim line)))
+                     (when (string-match "^map$$$.+$$$" trimmed)
+                       (mapcar (lambda (pair)
+                                 (replace-regexp-in-string ":" "=" pair))
+                               (split-string (match-string 1 trimmed) " ")))))
+                 (split-string output "\n" t))))
+    (error nil)))
 
-(Defun Kubed-Ext-Discover-Labels (&Optional Type Context Namespace)
-  "Discover Labels Of Type In Context/Namespace With 60-Second Caching."
-  (Let* ((Key (List (Or Type "Pods") (Or Context "") (Or Namespace "")))
-         (Cached (Gethash Key Kubed-Ext--Label-Cache))
-         (Cache-Time (Gethash Key Kubed-Ext--Label-Cache-Time 0)))
-        (If (And Cached (< (- (Float-Time) Cache-Time) 60))
-            Cached
-            (Let ((Labels (Kubed-Ext--Fetch-Labels Type Context Namespace)))
-                 (Puthash Key Labels Kubed-Ext--Label-Cache)
-                 (Puthash Key (Float-Time) Kubed-Ext--Label-Cache-Time)
-                 Labels))))
+(defun kubed-ext-discover-labels (&optional type context namespace)
+  "Discover labels of TYPE in CONTEXT/NAMESPACE with 60-second caching."
+  (let* ((key (list (or type "pods") (or context "") (or namespace "")))
+         (cached (gethash key kubed-ext--label-cache))
+         (cache-time (gethash key kubed-ext--label-cache-time 0)))
+    (if (and cached (< (- (float-time) cache-time) 60))
+        cached
+      (let ((labels (kubed-ext--fetch-labels type context namespace)))
+        (puthash key labels kubed-ext--label-cache)
+        (puthash key (float-time) kubed-ext--label-cache-time)
+        labels))))
 
-(Defun Kubed-Ext--Find-Active-Selector (Type Context Namespace)
-  "Find The Label Selector For Type/Context/Namespace."
-  (Catch 'Found
-         (Dolist (Buf (Buffer-List))
-                 (When (Buffer-Live-P Buf)
-                       (With-Current-Buffer Buf
-                                            (When (And (Derived-Mode-P 'Kubed-List-Mode)
-                                                       Kubed-Ext-List-Label-Selector
-                                                       (Equal Kubed-List-Type Type)
-                                                       (Equal Kubed-List-Context Context)
-                                                       (Equal Kubed-List-Namespace Namespace))
-                                                  (Throw 'Found Kubed-Ext-List-Label-Selector)))))))
+(defun kubed-ext--find-active-selector (type context namespace)
+  "Find the label selector for TYPE/CONTEXT/NAMESPACE."
+  (catch 'found
+    (dolist (buf (buffer-list))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf
+          (when (and (derived-mode-p 'kubed-list-mode)
+                     kubed-ext-list-label-selector
+                     (equal kubed-list-type type)
+                     (equal kubed-list-context context)
+                     (equal kubed-list-namespace namespace))
+            (throw 'found kubed-ext-list-label-selector)))))))
 
-(Defun Kubed-Ext-Update-With-Selector (Orig-Fn Type Context &Optional Namespace)
-  "Advice For Orig-Fn: Inject --Selector For Type/Context/Namespace."
-  (Let ((Sel (Kubed-Ext--Find-Active-Selector Type Context Namespace)))
-       (If (Null Sel)
-           (Funcall Orig-Fn Type Context Namespace)
-           (Cl-Letf* ((Real-Mp (Symbol-Function 'Make-Process))
-                      ((Symbol-Function 'Make-Process)
-                       (Lambda (&Rest Args)
-                               (Let ((Cmd (Plist-Get Args :Command)))
-                                    (When (And Cmd (Member "Get" Cmd))
-                                          (Plist-Put Args :Command
-                                                     (Append Cmd (List "--Selector" Sel)))))
-                               (Apply Real-Mp Args))))
-                     (Funcall Orig-Fn Type Context Namespace)))))
+(defun kubed-ext-update-with-selector (orig-fn type context &optional namespace)
+  "Advice for ORIG-FN: inject --selector for TYPE/CONTEXT/NAMESPACE."
+  (let ((sel (kubed-ext--find-active-selector type context namespace)))
+    (if (null sel)
+        (funcall orig-fn type context namespace)
+      (cl-letf* ((real-mp (symbol-function 'make-process))
+                 ((symbol-function 'make-process)
+                  (lambda (&rest args)
+                    (let ((cmd (plist-get args :command)))
+                      (when (and cmd (member "get" cmd))
+                        (plist-put args :command
+                                   (append cmd (list "--selector" sel)))))
+                    (apply real-mp args))))
+        (funcall orig-fn type context namespace)))))
 
-(Advice-Add 'Kubed-Update :Around #'Kubed-Ext-Update-With-Selector)
+(advice-add 'kubed-update :around #'kubed-ext-update-with-selector)
 
-(Defun Kubed-Ext-List-Set-Label-Selector (Selector)
-  "Set Label Selector For Server-Side Filtering.  Empty Clears It."
-  (Interactive
-   (List (Completing-Read
-          (Format-Prompt "Label Selector" "Clear")
-          (Append '("")
-                  (Kubed-Ext-Discover-Labels
-                   Kubed-List-Type Kubed-List-Context Kubed-List-Namespace)
-                  Kubed-Ext-Label-Selector-History)
-          Nil Nil Nil 'Kubed-Ext-Label-Selector-History))
-   Kubed-List-Mode)
-  (Setq-Local Kubed-Ext-List-Label-Selector
-              (If (String-Empty-P Selector) Nil Selector))
-  (Kubed-List-Update))
+(defun kubed-ext-list-set-label-selector (selector)
+  "Set label SELECTOR for server-side filtering.  Empty clears it."
+  (interactive
+   (list (completing-read
+          (format-prompt "Label selector" "clear")
+          (append '("")
+                  (kubed-ext-discover-labels
+                   kubed-list-type kubed-list-context kubed-list-namespace)
+                  kubed-ext-label-selector-history)
+          nil nil nil 'kubed-ext-label-selector-history))
+   kubed-list-mode)
+  (setq-local kubed-ext-list-label-selector
+              (if (string-empty-p selector) nil selector))
+  (kubed-list-update))
 
-;; Replaced In Section § 21
-;; (Setq Kubed-List-Mode-Line-Format
-;;       '(:Eval
-;;         (If (Process-Live-P
-;;              (Alist-Get 'Process (Kubed--Alist Kubed-List-Type
-;;                                                Kubed-List-Context
-;;                                                Kubed-List-Namespace)))
-;;             (Propertize " [...]" 'Help-Echo "Updating...")
-;;           (Concat
-;;            (When Kubed-List-Filter
-;;              (Propertize
-;;               (Concat " [" (Mapconcat #'Prin1-To-String
-;;                                       Kubed-List-Filter " ") "]")
-;;               'Help-Echo "Current Filter"))
-;;            (When Kubed-Ext-List-Label-Selector
-;;              (Propertize
-;;               (Concat " {" Kubed-Ext-List-Label-Selector "}")
-;;               'Help-Echo "Label Selector" 'Face 'Warning))
-;;            (When (And (Bound-And-True-P Kubed-Ext-Resource-Filter)
-;;                       (Not (String-Empty-P Kubed-Ext-Resource-Filter)))
-;;              (Propertize
-;;               (Concat " /" Kubed-Ext-Resource-Filter "/")
-;;               'Help-Echo "Substring Filter" 'Face 'Italic))))))
+;; replaced in section § 21
+;; (setq kubed-list-mode-line-format
+;;       '(:eval
+;;         (if (process-live-p
+;;              (alist-get 'process (kubed--alist kubed-list-type
+;;                                                kubed-list-context
+;;                                                kubed-list-namespace)))
+;;             (propertize " [...]" 'help-echo "Updating...")
+;;           (concat
+;;            (when kubed-list-filter
+;;              (propertize
+;;               (concat " [" (mapconcat #'prin1-to-string
+;;                                       kubed-list-filter " ") "]")
+;;               'help-echo "Current filter"))
+;;            (when kubed-ext-list-label-selector
+;;              (propertize
+;;               (concat " {" kubed-ext-list-label-selector "}")
+;;               'help-echo "Label selector" 'face 'warning))
+;;            (when (and (bound-and-true-p kubed-ext-resource-filter)
+;;                       (not (string-empty-p kubed-ext-resource-filter)))
+;;              (propertize
+;;               (concat " /" kubed-ext-resource-filter "/")
+;;               'help-echo "Substring filter" 'face 'italic))))))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 17.  Buffer Switching + Command Log
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defun Kubed-Ext-Switch-Buffer ()
-  "Switch To Another Kubed Buffer.
+(defun kubed-ext-switch-buffer ()
+  "Switch to another Kubed buffer.
 
-Includes List Buffers, Wide-View Buffers, And Top/Metrics Buffers."
-  (Interactive)
-  (Let (Bufs)
-       (Dolist (Buf (Buffer-List))
-               (When (With-Current-Buffer Buf
-                                          (Or (Derived-Mode-P 'Kubed-List-Mode)
-                                              (Derived-Mode-P 'Kubed-Ext-Wide-Mode)
-                                              (Derived-Mode-P 'Kubed-Ext-Top-Nodes-Mode)
-                                              (Derived-Mode-P 'Kubed-Ext-Top-Pods-Mode)
-                                              (Derived-Mode-P 'Kubed-Ext-Port-Forwards-Mode)))
-                     (Push (Cons (Kubed-Ext--Buffer-Switch-Candidate Buf) Buf) Bufs)))
-       (Setq Bufs (Nreverse Bufs))
-       (If Bufs
-           (Let* ((Sel (Completing-Read "Switch To Kubed Buffer: " Bufs Nil T))
-                  (Buf (Alist-Get Sel Bufs Nil Nil #'String=)))
-                 (Switch-To-Buffer Buf))
-           (User-Error "No Kubed Buffers Found"))))
+Includes list buffers, wide-view buffers, and top/metrics buffers."
+  (interactive)
+  (let (bufs)
+    (dolist (buf (buffer-list))
+      (when (with-current-buffer buf
+              (or (derived-mode-p 'kubed-list-mode)
+                  (derived-mode-p 'kubed-ext-wide-mode)
+                  (derived-mode-p 'kubed-ext-top-nodes-mode)
+                  (derived-mode-p 'kubed-ext-top-pods-mode)
+                  (derived-mode-p 'kubed-ext-port-forwards-mode)))
+        (push (cons (kubed-ext--buffer-switch-candidate buf) buf) bufs)))
+    (setq bufs (nreverse bufs))
+    (if bufs
+        (let* ((sel (completing-read "Switch to kubed buffer: " bufs nil t))
+               (buf (alist-get sel bufs nil nil #'string=)))
+          (switch-to-buffer buf))
+      (user-error "No kubed buffers found"))))
 
-(Defun Kubed-Ext--Buffer-Switch-Candidate (Buf)
-  "Return A Human-Readable Completion Candidate String For Buf."
-  (With-Current-Buffer Buf
-                       (Cond
-                        ((Derived-Mode-P 'Kubed-List-Mode)
-                         (Format "%-14s  %S"
-                                 (Or (Bound-And-True-P Kubed-List-Type) "")
-                                 (Buffer-Name Buf)))
-                        ((Derived-Mode-P 'Kubed-Ext-Wide-Mode)
-                         (Format "%-14s  %S"
-                                 (Format "Wide:%S" (Or Kubed-Ext-Wide--Type ""))
-                                 (Buffer-Name Buf)))
-                        ((Derived-Mode-P 'Kubed-Ext-Top-Nodes-Mode)
-                         (Format "%-14s  %S"
-                                 (Format "Top:Nodes@%S" (Or Kubed-Ext-Top-Context ""))
-                                 (Buffer-Name Buf)))
-                        ((Derived-Mode-P 'Kubed-Ext-Top-Pods-Mode)
-                         (Format "%-14s  %S"
-                                 (Format "Top:Pods@%S" (Or Kubed-Ext-Top-Namespace ""))
-                                 (Buffer-Name Buf)))
-                        ((Derived-Mode-P 'Kubed-Ext-Port-Forwards-Mode)
-                         (Format "%-14s  %S" "Portfwds" (Buffer-Name Buf)))
-                        (T (Buffer-Name Buf)))))
+(defun kubed-ext--buffer-switch-candidate (buf)
+  "Return a human-readable completion candidate string for BUF."
+  (with-current-buffer buf
+    (cond
+     ((derived-mode-p 'kubed-list-mode)
+      (format "%-14s  %s"
+              (or (bound-and-true-p kubed-list-type) "")
+              (buffer-name buf)))
+     ((derived-mode-p 'kubed-ext-wide-mode)
+      (format "%-14s  %s"
+              (format "wide:%s" (or kubed-ext-wide--type ""))
+              (buffer-name buf)))
+     ((derived-mode-p 'kubed-ext-top-nodes-mode)
+      (format "%-14s  %s"
+              (format "top:nodes@%s" (or kubed-ext-top-context ""))
+              (buffer-name buf)))
+     ((derived-mode-p 'kubed-ext-top-pods-mode)
+      (format "%-14s  %s"
+              (format "top:pods@%s" (or kubed-ext-top-namespace ""))
+              (buffer-name buf)))
+     ((derived-mode-p 'kubed-ext-port-forwards-mode)
+      (format "%-14s  %s" "portfwds" (buffer-name buf)))
+     (t (buffer-name buf)))))
 
-(Defun Kubed-Ext--Log-Kubectl-Command (Cmd-Str)
-  "Log Cmd-Str To The Kubectl Command Log Buffer.
-Creates The Buffer If It Does Not Exist."
-  (Setq Kubed-Ext--Last-Kubectl-Command Cmd-Str)
-  (Let ((Buf (Get-Buffer-Create "*Kubed-Command-Log*")))
-       (With-Current-Buffer Buf
-                            (Unless (Derived-Mode-P 'Special-Mode)
-                                    (Special-Mode))
-                            (Let ((Inhibit-Read-Only T))
-                                 (Goto-Char (Point-Max))
-                                 (Insert (Format "[%S] %S\N"
-                                                 (Format-Time-String "%H:%M:%S") Cmd-Str))
-                                 (When (> (Line-Number-At-Pos) 500)
-                                       (Goto-Char (Point-Min))
-                                       (Forward-Line 100)
-                                       (Delete-Region (Point-Min) (Point)))))))
+(defun kubed-ext--log-kubectl-command (cmd-str)
+  "Log CMD-STR to the kubectl command log buffer.
+Creates the buffer if it does not exist."
+  (setq kubed-ext--last-kubectl-command cmd-str)
+  (let ((buf (get-buffer-create "*kubed-command-log*")))
+    (with-current-buffer buf
+      (unless (derived-mode-p 'special-mode)
+        (special-mode))
+      (let ((inhibit-read-only t))
+        (goto-char (point-max))
+        (insert (format "[%s] %s\n"
+                        (format-time-string "%H:%M:%S") cmd-str))
+        (when (> (line-number-at-pos) 500)
+          (goto-char (point-min))
+          (forward-line 100)
+          (delete-region (point-min) (point)))))))
 
-(Defun Kubed-Ext--Make-Process-Logger (Orig-Fn &Rest Args)
-  "Log Kubectl `Make-Process' Call, Including Shell-Wrapped Invocations.
+(defun kubed-ext--make-process-logger (orig-fn &rest args)
+  "Log kubectl `make-process' call, including shell-wrapped invocations.
 
-Handles Two Forms:
-  Direct:  (:Command (Kubectl Get Pods ...))
-  Wrapped: (:Command (/Bin/Sh -C \"Kubectl Logs ... | Rg ...\"))
+Handles two forms:
+  Direct:  (:command (kubectl get pods ...))
+  Wrapped: (:command (/bin/sh -c \"kubectl logs ... | rg ...\"))
 
-Orig-Fn Is The Advised Function, Args Its Arguments."
-  (Let ((Cmd (Plist-Get Args :Command)))
-       (When (And (Consp Cmd) (Stringp (Car Cmd)))
-             (Let ((Prog (File-Name-Nondirectory
-                          (File-Name-Sans-Extension (Car Cmd)))))
-                  (Cond
-                   ;; Direct Kubectl Invocation.
-                   ((String-Suffix-P "Kubectl" Prog)
-                    (Kubed-Ext--Log-Kubectl-Command
-                     (Mapconcat #'Identity (Seq-Filter #'Stringp Cmd) " ")))
-                   ;; Shell Wrapper: /Bin/Sh -C "Kubectl ... | Rg ..."
-                   ((Member Prog '("Sh" "Bash" "Zsh"))
-                    (Let ((Shell-Arg (Car (Last (Seq-Filter #'Stringp Cmd)))))
-                         (When (And (Stringp Shell-Arg)
-                                    (String-Match-P "Kubectl" Shell-Arg))
-                               (Kubed-Ext--Log-Kubectl-Command Shell-Arg))))))))
-  (Apply Orig-Fn Args))
+ORIG-FN is the advised function, ARGS its arguments."
+  (let ((cmd (plist-get args :command)))
+    (when (and (consp cmd) (stringp (car cmd)))
+      (let ((prog (file-name-nondirectory
+                   (file-name-sans-extension (car cmd)))))
+        (cond
+         ;; Direct kubectl invocation.
+         ((string-suffix-p "kubectl" prog)
+          (kubed-ext--log-kubectl-command
+           (mapconcat #'identity (seq-filter #'stringp cmd) " ")))
+         ;; Shell wrapper: /bin/sh -c "kubectl ... | rg ..."
+         ((member prog '("sh" "bash" "zsh"))
+          (let ((shell-arg (car (last (seq-filter #'stringp cmd)))))
+            (when (and (stringp shell-arg)
+                       (string-match-p "kubectl" shell-arg))
+              (kubed-ext--log-kubectl-command shell-arg))))))))
+  (apply orig-fn args))
 
-(Advice-Add 'Make-Process :Around #'Kubed-Ext--Make-Process-Logger)
+(advice-add 'make-process :around #'kubed-ext--make-process-logger)
 
-(Defun Kubed-Ext--Call-Process-Logger (Orig-Fn Program &Rest Args)
-  "Log Kubectl `Call-Process'.
-Orig-Fn Is The Advised Function.  Program And Args Are Passed Through."
-  (When (And (Stringp Program)
-             (String-Suffix-P
-              "Kubectl"
-              (File-Name-Sans-Extension
-               (File-Name-Nondirectory Program))))
-        (Kubed-Ext--Log-Kubectl-Command
-         (Mapconcat #'Identity
-                    (Cons Program (Seq-Filter #'Stringp (Nthcdr 3 Args)))
-                    " ")))
-  (Apply Orig-Fn Program Args))
+(defun kubed-ext--call-process-logger (orig-fn program &rest args)
+  "Log kubectl `call-process'.
+ORIG-FN is the advised function.  PROGRAM and ARGS are passed through."
+  (when (and (stringp program)
+             (string-suffix-p
+              "kubectl"
+              (file-name-sans-extension
+               (file-name-nondirectory program))))
+    (kubed-ext--log-kubectl-command
+     (mapconcat #'identity
+                (cons program (seq-filter #'stringp (nthcdr 3 args)))
+                " ")))
+  (apply orig-fn program args))
 
-(Advice-Add 'Call-Process :Around #'Kubed-Ext--Call-Process-Logger)
+(advice-add 'call-process :around #'kubed-ext--call-process-logger)
 
-(Defun Kubed-Ext--Call-Process-Region-Logger
-  (Orig-Fn Start End Program &Rest Args)
-  "Log Kubectl `Call-Process-Region'.
-Orig-Fn Is Advised.  Start End Program Args Are Passed Through."
-  (When (And (Stringp Program)
-             (String-Suffix-P
-              "Kubectl"
-              (File-Name-Sans-Extension
-               (File-Name-Nondirectory Program))))
-        (Kubed-Ext--Log-Kubectl-Command
-         (Mapconcat #'Identity
-                    (Cons Program (Seq-Filter #'Stringp (Nthcdr 3 Args)))
-                    " ")))
-  (Apply Orig-Fn Start End Program Args))
+(defun kubed-ext--call-process-region-logger
+    (orig-fn start end program &rest args)
+  "Log kubectl `call-process-region'.
+ORIG-FN is advised.  START END PROGRAM ARGS are passed through."
+  (when (and (stringp program)
+             (string-suffix-p
+              "kubectl"
+              (file-name-sans-extension
+               (file-name-nondirectory program))))
+    (kubed-ext--log-kubectl-command
+     (mapconcat #'identity
+                (cons program (seq-filter #'stringp (nthcdr 3 args)))
+                " ")))
+  (apply orig-fn start end program args))
 
-(Advice-Add 'Call-Process-Region :Around
-            #'Kubed-Ext--Call-Process-Region-Logger)
+(advice-add 'call-process-region :around
+            #'kubed-ext--call-process-region-logger)
 
-(Defun Kubed-Ext-Show-Command-Log ()
-  "Show The Kubed Command Log Buffer."
-  (Interactive)
-  (Let ((Buf (Get-Buffer-Create "*Kubed-Command-Log*")))
-       (With-Current-Buffer Buf
-                            (Unless (Derived-Mode-P 'Special-Mode) (Special-Mode)))
-       (Display-Buffer Buf)))
+(defun kubed-ext-show-command-log ()
+  "Show the kubed command log buffer."
+  (interactive)
+  (let ((buf (get-buffer-create "*kubed-command-log*")))
+    (with-current-buffer buf
+      (unless (derived-mode-p 'special-mode) (special-mode)))
+    (display-buffer buf)))
 
-;;; ─── Process Buffer Access ────────────────────────────────────
+;;; ─── Process buffer access ────────────────────────────────────
 
-(Defun Kubed-Ext-Show-Process-Buffer ()
-  "Show The Kubectl Process/Stderr Buffer For The Current List Resource."
-  (Interactive Nil Kubed-List-Mode)
-  (Let* ((Type Kubed-List-Type)
-         (Buf  (Or (Get-Buffer (Format " *Kubed-Get-%S-Stderr*" Type))
-                   (Get-Buffer (Format "*Kubed-Get-%S*"         Type))
-                   (Get-Buffer (Format " *Kubed-Get-%S*"        Type)))))
-        (If (And Buf (Buffer-Live-P Buf))
-            (Display-Buffer Buf)
-            (User-Error "No Process Buffer Found For %S" Type))))
+(defun kubed-ext-show-process-buffer ()
+  "Show the kubectl process/stderr buffer for the current list resource."
+  (interactive nil kubed-list-mode)
+  (let* ((type kubed-list-type)
+         (buf  (or (get-buffer (format " *kubed-get-%s-stderr*" type))
+                   (get-buffer (format "*kubed-get-%s*"         type))
+                   (get-buffer (format " *kubed-get-%s*"        type)))))
+    (if (and buf (buffer-live-p buf))
+        (display-buffer buf)
+      (user-error "No process buffer found for %s" type))))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 18.  Keybindings
 ;;; ═══════════════════════════════════════════════════════════════
 
 ;; ── Pods ──────────────────────────────────────────────────────────
-(Keymap-Set Kubed-Pods-Mode-Map  "T" #'Kubed-Ext-Top-Pods)
-(Keymap-Set Kubed-Pods-Mode-Map  "M" #'Kubed-Ext-Top-Pods)
-(Keymap-Set Kubed-Pods-Mode-Map  "V" #'Kubed-Ext-Pods-Vterm)
-(Keymap-Set Kubed-Pods-Mode-Map  "T" #'Kubed-Ext-Pods-Eat)
-(Keymap-Set Kubed-Pods-Mode-Map  "I" #'Kubed-Ext-Pods-Logs-Init-Container)
-(Keymap-Set Kubed-Pod-Prefix-Map "T" #'Kubed-Ext-Top-Pods)
-(Keymap-Set Kubed-Pod-Prefix-Map "V" #'Kubed-Ext-Vterm-Pod)
-(Keymap-Set Kubed-Pod-Prefix-Map "T" #'Kubed-Ext-Eat-Pod)
-(Keymap-Set Kubed-Pod-Prefix-Map "S" #'Kubed-Ext-Eshell-Pod)
-(Keymap-Set Kubed-Pod-Prefix-Map "I" #'Kubed-Ext-Logs-Init-Container)
+(keymap-set kubed-pods-mode-map  "T" #'kubed-ext-top-pods)
+(keymap-set kubed-pods-mode-map  "M" #'kubed-ext-top-pods)
+(keymap-set kubed-pods-mode-map  "v" #'kubed-ext-pods-vterm)
+(keymap-set kubed-pods-mode-map  "t" #'kubed-ext-pods-eat)
+(keymap-set kubed-pods-mode-map  "i" #'kubed-ext-pods-logs-init-container)
+(keymap-set kubed-pod-prefix-map "T" #'kubed-ext-top-pods)
+(keymap-set kubed-pod-prefix-map "v" #'kubed-ext-vterm-pod)
+(keymap-set kubed-pod-prefix-map "t" #'kubed-ext-eat-pod)
+(keymap-set kubed-pod-prefix-map "S" #'kubed-ext-eshell-pod)
+(keymap-set kubed-pod-prefix-map "i" #'kubed-ext-logs-init-container)
 
 ;; ── Nodes ─────────────────────────────────────────────────────────
-(Keymap-Set Kubed-Nodes-Mode-Map  "M" #'Kubed-Ext-Top-Nodes)
-(Keymap-Set Kubed-Node-Prefix-Map "T" #'Kubed-Ext-Top-Nodes)
+(keymap-set kubed-nodes-mode-map  "M" #'kubed-ext-top-nodes)
+(keymap-set kubed-node-prefix-map "T" #'kubed-ext-top-nodes)
 
 ;; ── Services ──────────────────────────────────────────────────────
-(Keymap-Set Kubed-Services-Mode-Map  "F" #'Kubed-Ext-Services-Forward-Port)
-(Keymap-Set Kubed-Service-Prefix-Map "F" #'Kubed-Ext-Forward-Port-To-Service)
+(keymap-set kubed-services-mode-map  "F" #'kubed-ext-services-forward-port)
+(keymap-set kubed-service-prefix-map "F" #'kubed-ext-forward-port-to-service)
 
 ;; ── Deployments ───────────────────────────────────────────────────
-(Keymap-Set Kubed-Deployments-Mode-Map "F" #'Kubed-Ext-Deployments-Forward-Port)
-(Keymap-Set Kubed-Deployments-Mode-Map "R" #'Kubed-Ext-Deployments-Rollout-History)
-(Keymap-Set Kubed-Deployments-Mode-Map "J" #'Kubed-Ext-Deployments-Jab)
-(Keymap-Set Kubed-Deployments-Mode-Map "U" #'Kubed-Ext-Deployments-Rollout-Undo)
-(Keymap-Set Kubed-Deployments-Mode-Map "M-U" #'Kubed-Ext-Unmark-All)
-(Keymap-Set Kubed-Deployment-Prefix-Map "F" #'Kubed-Ext-Forward-Port-To-Deployment)
-(Keymap-Set Kubed-Deployment-Prefix-Map "R" #'Kubed-Ext-Rollout-History)
-(Keymap-Set Kubed-Deployment-Prefix-Map "J" #'Kubed-Ext-Jab-Deployment)
-(Keymap-Set Kubed-Deployment-Prefix-Map "U" #'Kubed-Ext-Rollout-Undo)
+(keymap-set kubed-deployments-mode-map "F" #'kubed-ext-deployments-forward-port)
+(keymap-set kubed-deployments-mode-map "r" #'kubed-ext-deployments-rollout-history)
+(keymap-set kubed-deployments-mode-map "j" #'kubed-ext-deployments-jab)
+(keymap-set kubed-deployments-mode-map "U" #'kubed-ext-deployments-rollout-undo)
+(keymap-set kubed-deployments-mode-map "M-u" #'kubed-ext-unmark-all)
+(keymap-set kubed-deployment-prefix-map "F" #'kubed-ext-forward-port-to-deployment)
+(keymap-set kubed-deployment-prefix-map "r" #'kubed-ext-rollout-history)
+(keymap-set kubed-deployment-prefix-map "j" #'kubed-ext-jab-deployment)
+(keymap-set kubed-deployment-prefix-map "U" #'kubed-ext-rollout-undo)
 
-;; ── Kubed-List-Mode (Parent Of All List Modes) ────────────────────
-;;   "D" Intentionally Overrides Kubed'S Mark-For-Deletion (K9s-Style).
-;;   "%" Preserves The Old Mark-For-Deletion Workflow.
-(Keymap-Set Kubed-List-Mode-Map "D"   #'Kubed-Ext-List-Describe-Resource)
-(Keymap-Set Kubed-List-Mode-Map "%"   #'Kubed-List-Mark-For-Deletion)
-(Keymap-Set Kubed-List-Mode-Map "S"   #'Kubed-Ext-List-Set-Label-Selector)
-(Keymap-Set Kubed-List-Mode-Map "C"   #'Kubed-Ext-Copy-Popup)
-(Keymap-Set Kubed-List-Mode-Map "B"   #'Kubed-Ext-Switch-Buffer)
-(Keymap-Set Kubed-List-Mode-Map "F"   #'Kubed-Ext-Set-Filter)
-(Keymap-Set Kubed-List-Mode-Map "V"   #'Kubed-Ext-List-Wide)
-(Keymap-Set Kubed-List-Mode-Map "M"   #'Kubed-Ext-Mark-Item)
-(Keymap-Set Kubed-List-Mode-Map "M-M" #'Kubed-Ext-Mark-All)
-(Keymap-Set Kubed-List-Mode-Map "M-U" #'Kubed-Ext-Unmark-All)
-(Keymap-Set Kubed-List-Mode-Map "M-N" #'Kubed-Ext-Jump-To-Next-Highlight)
-(Keymap-Set Kubed-List-Mode-Map "M-P" #'Kubed-Ext-Jump-To-Previous-Highlight)
-(Keymap-Set Kubed-List-Mode-Map "X"   #'Kubed-Ext-Delete-Marked)
-(Keymap-Set Kubed-List-Mode-Map "A"   #'Kubed-Ext-Auto-Refresh-Mode)
-(Keymap-Set Kubed-List-Mode-Map "R"   #'Kubed-Ext-Switch-Resource)
-(Keymap-Set Kubed-List-Mode-Map "$"   #'Kubed-Ext-Show-Process-Buffer)
+;; ── kubed-list-mode (parent of all list modes) ────────────────────
+;;   "d" intentionally overrides kubed's mark-for-deletion (k9s-style).
+;;   "%" preserves the old mark-for-deletion workflow.
+(keymap-set kubed-list-mode-map "d"   #'kubed-ext-list-describe-resource)
+(keymap-set kubed-list-mode-map "%"   #'kubed-list-mark-for-deletion)
+(keymap-set kubed-list-mode-map "S"   #'kubed-ext-list-set-label-selector)
+(keymap-set kubed-list-mode-map "c"   #'kubed-ext-copy-popup)
+(keymap-set kubed-list-mode-map "b"   #'kubed-ext-switch-buffer)
+(keymap-set kubed-list-mode-map "f"   #'kubed-ext-set-filter)
+(keymap-set kubed-list-mode-map "V"   #'kubed-ext-list-wide)
+(keymap-set kubed-list-mode-map "m"   #'kubed-ext-mark-item)
+(keymap-set kubed-list-mode-map "M-m" #'kubed-ext-mark-all)
+(keymap-set kubed-list-mode-map "M-u" #'kubed-ext-unmark-all)
+(keymap-set kubed-list-mode-map "M-n" #'kubed-ext-jump-to-next-highlight)
+(keymap-set kubed-list-mode-map "M-p" #'kubed-ext-jump-to-previous-highlight)
+(keymap-set kubed-list-mode-map "X"   #'kubed-ext-delete-marked)
+(keymap-set kubed-list-mode-map "A"   #'kubed-ext-auto-refresh-mode)
+(keymap-set kubed-list-mode-map "r"   #'kubed-ext-switch-resource)
+(keymap-set kubed-list-mode-map "$"   #'kubed-ext-show-process-buffer)
 
-;; ── Kubed-Prefix-Map ──────────────────────────────────────────────
-;;   "D" Belongs To Deployments; Use "K" (Kubectl Describe Mnemonic).
-(Keymap-Set Kubed-Prefix-Map "K" #'Kubed-Ext-Describe-Resource)
-(Keymap-Set Kubed-Prefix-Map "F" #'Kubed-Ext-List-Port-Forwards)
-(Keymap-Set Kubed-Prefix-Map "B" #'Kubed-Ext-Switch-Buffer)
-(Keymap-Set Kubed-Prefix-Map "#" #'Kubed-Ext-Show-Command-Log)
-(Keymap-Set Kubed-Prefix-Map "L" #'Kubed-Ext-Logs-By-Label)
+;; ── kubed-prefix-map ──────────────────────────────────────────────
+;;   "d" belongs to deployments; use "k" (kubectl describe mnemonic).
+(keymap-set kubed-prefix-map "k" #'kubed-ext-describe-resource)
+(keymap-set kubed-prefix-map "F" #'kubed-ext-list-port-forwards)
+(keymap-set kubed-prefix-map "b" #'kubed-ext-switch-buffer)
+(keymap-set kubed-prefix-map "#" #'kubed-ext-show-command-log)
+(keymap-set kubed-prefix-map "L" #'kubed-ext-logs-by-label)
 
-(With-Eval-After-Load 'Kubed
-                      (When (Boundp 'Kubed-Deployments-Mode-Map)
-                            (Keymap-Set Kubed-Deployments-Mode-Map "M-U" #'Kubed-Ext-Unmark-All)))
+(with-eval-after-load 'kubed
+  (when (boundp 'kubed-deployments-mode-map)
+    (keymap-set kubed-deployments-mode-map "M-u" #'kubed-ext-unmark-all)))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 19.  Transient Navigation + Resource Actions
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defvar Kubed-Ext-Extra-Transient-Suffixes
-  '(("Pods"        . [("T" "Top (Metrics)"     Kubed-Ext-Top-Pods)
-                      ("V" "Vterm"              Kubed-Ext-Pods-Vterm)
-                      ("T" "Eat Terminal"       Kubed-Ext-Pods-Eat)
-                      ("E" "Eshell"             Kubed-Ext-Pods-Eshell)
-                      ("A" "Ansi-Term"          Kubed-Ext-Pods-Ansi-Term)
-                      ("&" "Shell Command"      Kubed-Ext-Pods-Shell-Command)
-                      ("I" "Init Container Log" Kubed-Ext-Pods-Logs-Init-Container)])
-    ("Nodes"       . [("T" "Top (Metrics)"  Kubed-Ext-Top-Nodes)])
-    ("Services"    . [("F" "Forward Port"   Kubed-Ext-Services-Forward-Port)])
-    ("Deployments" . [("F" "Forward Port"       Kubed-Ext-Deployments-Forward-Port)
-                      ("H" "Rollout History"    Kubed-Ext-Deployments-Rollout-History)
-                      ("J" "Jab (Bounce)"       Kubed-Ext-Deployments-Jab)
-                      ("U" "Rollout Undo"       Kubed-Ext-Deployments-Rollout-Undo)]))
-  "Additional Per-Resource-Type Transient Suffixes.")
+(defvar kubed-ext-extra-transient-suffixes
+  '(("pods"        . [("T" "Top (metrics)"     kubed-ext-top-pods)
+                      ("v" "Vterm"              kubed-ext-pods-vterm)
+                      ("t" "Eat terminal"       kubed-ext-pods-eat)
+                      ("E" "Eshell"             kubed-ext-pods-eshell)
+                      ("A" "Ansi-term"          kubed-ext-pods-ansi-term)
+                      ("&" "Shell command"      kubed-ext-pods-shell-command)
+                      ("i" "Init container log" kubed-ext-pods-logs-init-container)])
+    ("nodes"       . [("T" "Top (metrics)"  kubed-ext-top-nodes)])
+    ("services"    . [("F" "Forward Port"   kubed-ext-services-forward-port)])
+    ("deployments" . [("F" "Forward Port"       kubed-ext-deployments-forward-port)
+                      ("H" "Rollout History"    kubed-ext-deployments-rollout-history)
+                      ("j" "Jab (bounce)"       kubed-ext-deployments-jab)
+                      ("u" "Rollout Undo"       kubed-ext-deployments-rollout-undo)]))
+  "Additional per-resource-type transient suffixes.")
 
-(Defun Kubed-Ext-Switch-Context ()
-  "Switch Kubectl Context And Refresh Current Resource List."
-  (Interactive)
-  (When (Derived-Mode-P 'Kubed-List-Mode)
-        (Let* ((Type Kubed-List-Type)
-               (Ns Kubed-List-Namespace)
-               (Ctx (Kubed-Read-Context "Switch To Context")))
-              ;; Immediately Start Prefetching Namespaces For The New Context.
-              (Kubed-Ext-Prefetch-Namespaces Ctx)
-              (When Type
-                    (Let ((Fn (Intern (Format "Kubed-List-%S" Type))))
-                         (When (Fboundp Fn)
-                               (Cond
-                                ;; Non-Namespaced Resource Type.
-                                ((Not (Kubed-Namespaced-P Type Ctx))
-                                 (Funcall Fn Ctx))
-                                ;; Reuse Current Namespace.
-                                (Ns (Funcall Fn Ctx Ns))
-                                ;; Must Determine Namespace — Ensure List Is Ready First.
-                                (T
-                                 (Kubed-Ext--Ensure-Namespaces-Ready Ctx)
-                                 (Funcall Fn Ctx (Kubed--Namespace Ctx))))))))))
+(defun kubed-ext-switch-context ()
+  "Switch kubectl context and refresh current resource list."
+  (interactive)
+  (when (derived-mode-p 'kubed-list-mode)
+    (let* ((type kubed-list-type)
+           (ns kubed-list-namespace)
+           (ctx (kubed-read-context "Switch to context")))
+      ;; Immediately start prefetching namespaces for the new context.
+      (kubed-ext-prefetch-namespaces ctx)
+      (when type
+        (let ((fn (intern (format "kubed-list-%s" type))))
+          (when (fboundp fn)
+            (cond
+             ;; Non-namespaced resource type.
+             ((not (kubed-namespaced-p type ctx))
+              (funcall fn ctx))
+             ;; Reuse current namespace.
+             (ns (funcall fn ctx ns))
+             ;; Must determine namespace — ensure list is ready first.
+             (t
+              (kubed-ext--ensure-namespaces-ready ctx)
+              (funcall fn ctx (kubed--namespace ctx))))))))))
 
-(Defun Kubed-Ext-Switch-Namespace ()
-  "Switch Namespace And Refresh Current Resource List."
-  (Interactive)
-  (When (Derived-Mode-P 'Kubed-List-Mode)
-        ;; Ensure Namespace Completions Are Available Before Prompting.
-        (Kubed-Ext--Ensure-Namespaces-Ready Kubed-List-Context)
-        (Let ((Type Kubed-List-Type)
-              (Ctx Kubed-List-Context)
-              (Ns (Kubed-Read-Namespace "Switch To Namespace" Nil Nil
-                                        Kubed-List-Context)))
-             (When Type
-                   (Let ((Fn (Intern (Format "Kubed-List-%S" Type))))
-                        (When (Fboundp Fn)
-                              (If (Kubed-Namespaced-P Type Ctx)
-                                  (Funcall Fn Ctx Ns)
-                                  (Funcall Fn Ctx))))))))
+(defun kubed-ext-switch-namespace ()
+  "Switch namespace and refresh current resource list."
+  (interactive)
+  (when (derived-mode-p 'kubed-list-mode)
+    ;; Ensure namespace completions are available before prompting.
+    (kubed-ext--ensure-namespaces-ready kubed-list-context)
+    (let ((type kubed-list-type)
+          (ctx kubed-list-context)
+          (ns (kubed-read-namespace "Switch to namespace" nil nil
+                                    kubed-list-context)))
+      (when type
+        (let ((fn (intern (format "kubed-list-%s" type))))
+          (when (fboundp fn)
+            (if (kubed-namespaced-p type ctx)
+                (funcall fn ctx ns)
+              (funcall fn ctx))))))))
 
-(Defvar Kubed-Ext-Common-Resources
-  '(("Pods" . "Pods")
-    ("Deployments" . "Deployments")
-    ("Services" . "Services")
-    ("Configmaps" . "Configmaps")
-    ("Secrets" . "Secrets")
-    ("Ingresses" . "Ingresses")
-    ("Jobs" . "Jobs")
-    ("Cronjobs" . "Cronjobs")
-    ("Statefulsets" . "Statefulsets")
-    ("Daemonsets" . "Daemonsets")
-    ("Replicasets" . "Replicasets")
-    ("Persistentvolumeclaims" . "Pvcs")
-    ("Persistentvolumes" . "Pvs")
-    ("Nodes" . "Nodes")
-    ("Namespaces" . "Namespaces")
-    ("Events" . "Events")
-    ("Networkpolicies" . "Networkpolicies")
-    ("Horizontalpodautoscalers" . "Hpas")
-    ("Kafkas" . "Kafkas")
-    ("Kafkaconnects" . "Kafkaconnects")
-    ("Strimzipodsets" . "Strimzipodsets")
-    ("Kafkanodepools" . "Kafkanodepools")
-    ("Kafkarebalances" . "Kafkarebalances")
-    ("Kafkaconnectors" . "Kafkaconnectors")
-    ("Kafkatopics" . "Kafkatopics"))
-  "Common Resources For Quick Switching.")
+(defvar kubed-ext-common-resources
+  '(("pods" . "Pods")
+    ("deployments" . "Deployments")
+    ("services" . "Services")
+    ("configmaps" . "ConfigMaps")
+    ("secrets" . "Secrets")
+    ("ingresses" . "Ingresses")
+    ("jobs" . "Jobs")
+    ("cronjobs" . "CronJobs")
+    ("statefulsets" . "StatefulSets")
+    ("daemonsets" . "DaemonSets")
+    ("replicasets" . "ReplicaSets")
+    ("persistentvolumeclaims" . "PVCs")
+    ("persistentvolumes" . "PVs")
+    ("nodes" . "Nodes")
+    ("namespaces" . "Namespaces")
+    ("events" . "Events")
+    ("networkpolicies" . "NetworkPolicies")
+    ("horizontalpodautoscalers" . "HPAs")
+    ("kafkas" . "Kafkas")
+    ("kafkaconnects" . "KafkaConnects")
+    ("strimzipodsets" . "StrimziPodSets")
+    ("kafkanodepools" . "KafkaNodePools")
+    ("kafkarebalances" . "KafkaRebalances")
+    ("kafkaconnectors" . "KafkaConnectors")
+    ("kafkatopics" . "KafkaTopics"))
+  "Common resources for quick switching.")
 
-(Defun Kubed-Ext-Switch-Resource ()
-  "Switch To A Different Resource Type In The Same Context/Namespace."
-  (Interactive)
-  (When (Derived-Mode-P 'Kubed-List-Mode)
-        (Let* ((Ctx Kubed-List-Context)
-               (Ns Kubed-List-Namespace)
-               (Choices (Mapcar (Lambda (R) (Cons (Cdr R) (Car R)))
-                                Kubed-Ext-Common-Resources))
-               (Sel (Completing-Read "Switch To Resource: " Choices Nil T))
-               (Type (Alist-Get Sel Choices Nil Nil #'String=)))
-              (When Type
-                    (Let ((Fn (Intern (Format "Kubed-List-%S" Type))))
-                         (When (Fboundp Fn)
-                               (If (Kubed-Namespaced-P Type Ctx)
-                                   (Funcall Fn Ctx (Or Ns (Kubed--Namespace Ctx)))
-                                   (Funcall Fn Ctx))))))))
+(defun kubed-ext-switch-resource ()
+  "Switch to a different resource type in the same context/namespace."
+  (interactive)
+  (when (derived-mode-p 'kubed-list-mode)
+    (let* ((ctx kubed-list-context)
+           (ns kubed-list-namespace)
+           (choices (mapcar (lambda (r) (cons (cdr r) (car r)))
+                            kubed-ext-common-resources))
+           (sel (completing-read "Switch to resource: " choices nil t))
+           (type (alist-get sel choices nil nil #'string=)))
+      (when type
+        (let ((fn (intern (format "kubed-list-%s" type))))
+          (when (fboundp fn)
+            (if (kubed-namespaced-p type ctx)
+                (funcall fn ctx (or ns (kubed--namespace ctx)))
+              (funcall fn ctx))))))))
 
-(Defun Kubed-Ext-Jump-Pods ()
-  "Jump To Pods."
-  (Interactive)
-  (Kubed-List-Pods Kubed-List-Context Kubed-List-Namespace))
+(defun kubed-ext-jump-pods ()
+  "Jump to Pods."
+  (interactive)
+  (kubed-list-pods kubed-list-context kubed-list-namespace))
 
-(Defun Kubed-Ext-Jump-Deployments ()
-  "Jump To Deployments."
-  (Interactive)
-  (Kubed-List-Deployments Kubed-List-Context Kubed-List-Namespace))
+(defun kubed-ext-jump-deployments ()
+  "Jump to Deployments."
+  (interactive)
+  (kubed-list-deployments kubed-list-context kubed-list-namespace))
 
-(Defun Kubed-Ext-Jump-Services ()
-  "Jump To Services."
-  (Interactive)
-  (Kubed-List-Services Kubed-List-Context Kubed-List-Namespace))
+(defun kubed-ext-jump-services ()
+  "Jump to Services."
+  (interactive)
+  (kubed-list-services kubed-list-context kubed-list-namespace))
 
-(Defun Kubed-Ext-Jump-Jobs ()
-  "Jump To Jobs."
-  (Interactive)
-  (Kubed-List-Jobs Kubed-List-Context Kubed-List-Namespace))
+(defun kubed-ext-jump-jobs ()
+  "Jump to Jobs."
+  (interactive)
+  (kubed-list-jobs kubed-list-context kubed-list-namespace))
 
-(Defun Kubed-Ext-Jump-Configmaps ()
-  "Jump To Configmaps."
-  (Interactive)
-  (Kubed-List-Configmaps Kubed-List-Context Kubed-List-Namespace))
+(defun kubed-ext-jump-configmaps ()
+  "Jump to ConfigMaps."
+  (interactive)
+  (kubed-list-configmaps kubed-list-context kubed-list-namespace))
 
-(Defun Kubed-Ext-Jump-Secrets ()
-  "Jump To Secrets."
-  (Interactive)
-  (Kubed-List-Secrets Kubed-List-Context Kubed-List-Namespace))
+(defun kubed-ext-jump-secrets ()
+  "Jump to Secrets."
+  (interactive)
+  (kubed-list-secrets kubed-list-context kubed-list-namespace))
 
-(Defun Kubed-Ext-Jump-Ingresses ()
-  "Jump To Ingresses."
-  (Interactive)
-  (Kubed-List-Ingresses Kubed-List-Context Kubed-List-Namespace))
+(defun kubed-ext-jump-ingresses ()
+  "Jump to Ingresses."
+  (interactive)
+  (kubed-list-ingresses kubed-list-context kubed-list-namespace))
 
-(Defun Kubed-Ext-Jump-Pvcs ()
-  "Jump To Pvcs."
-  (Interactive)
-  (Kubed-List-Persistentvolumeclaims Kubed-List-Context Kubed-List-Namespace))
+(defun kubed-ext-jump-pvcs ()
+  "Jump to PVCs."
+  (interactive)
+  (kubed-list-persistentvolumeclaims kubed-list-context kubed-list-namespace))
 
-(Defun Kubed-Ext--Collect-Action-Groups ()
-  "Build Transient Group Vectors For The Current Resource Type."
-  (Let* ((Type (Or Kubed-List-Type ""))
-         (Type-Label (Capitalize Type))
-         (Upstream (Bound-And-True-P Kubed-List-Transient-Extra-Suffixes))
-         (Custom (Alist-Get Type Kubed-Ext-Extra-Transient-Suffixes
-                            Nil Nil #'String=))
-         (All (Append (When Upstream Upstream) (When Custom (List Custom))))
-         (Result Nil)
-         (Gidx 0))
-        (Dolist (Gv All)
-                (Cl-Incf Gidx)
-                (Let* ((Entries (If (Vectorp Gv) (Append Gv Nil) Gv))
-                       (Kw-Args Nil)
-                       (Suffixes Nil)
-                       (Rest Entries))
-                      (While Rest
-                             (Cond
-                              ((Keywordp (Car Rest))
-                               (Push (Pop Rest) Kw-Args)
-                               (When Rest (Push (Pop Rest) Kw-Args)))
-                              ((And (Listp (Car Rest))
-                                    (>= (Length (Car Rest)) 3)
-                                    (Stringp (Nth 0 (Car Rest)))
-                                    (Stringp (Nth 1 (Car Rest))))
-                               (Push (Pop Rest) Suffixes))
-                              (T (Pop Rest))))
-                      (Setq Kw-Args (Nreverse Kw-Args)
-                            Suffixes (Nreverse Suffixes))
-                      (When Suffixes
-                            (Push (Apply #'Vector
-                                         (Format "%S Actions%S" Type-Label
-                                                 (If (> (Length All) 1)
-                                                     (Format " (%D)" Gidx) ""))
-                                         (Append Kw-Args Suffixes))
-                                  Result))))
-        (Nreverse Result)))
+(defun kubed-ext--collect-action-groups ()
+  "Build transient group vectors for the current resource type."
+  (let* ((type (or kubed-list-type ""))
+         (type-label (capitalize type))
+         (upstream (bound-and-true-p kubed-list-transient-extra-suffixes))
+         (custom (alist-get type kubed-ext-extra-transient-suffixes
+                            nil nil #'string=))
+         (all (append (when upstream upstream) (when custom (list custom))))
+         (result nil)
+         (gidx 0))
+    (dolist (gv all)
+      (cl-incf gidx)
+      (let* ((entries (if (vectorp gv) (append gv nil) gv))
+             (kw-args nil)
+             (suffixes nil)
+             (rest entries))
+        (while rest
+          (cond
+           ((keywordp (car rest))
+            (push (pop rest) kw-args)
+            (when rest (push (pop rest) kw-args)))
+           ((and (listp (car rest))
+                 (>= (length (car rest)) 3)
+                 (stringp (nth 0 (car rest)))
+                 (stringp (nth 1 (car rest))))
+            (push (pop rest) suffixes))
+           (t (pop rest))))
+        (setq kw-args (nreverse kw-args)
+              suffixes (nreverse suffixes))
+        (when suffixes
+          (push (apply #'vector
+                       (format "%s Actions%s" type-label
+                               (if (> (length all) 1)
+                                   (format " (%d)" gidx) ""))
+                       (append kw-args suffixes))
+                result))))
+    (nreverse result)))
 
-(Declare-Function Kubed-Ext--Dynamic-Menu "Kubed-Ext")
+(declare-function kubed-ext--dynamic-menu "kubed-ext")
 
-(Defun Kubed-Ext-Transient-Menu ()
-  "Show Transient Combining Navigation, Actions, And Utilities."
-  (Interactive)
-  (Require 'Transient)
-  (Require 'Kubed-Transient Nil T)
-  (Let* ((In-List (Derived-Mode-P 'Kubed-List-Mode))
-         (Type (And In-List Kubed-List-Type))
-         (Agroups (And In-List (Kubed-Ext--Collect-Action-Groups))))
-        (Condition-Case Err
-                        (Progn
-                         (Eval
-                          `(Transient-Define-Prefix Kubed-Ext--Dynamic-Menu ()
-                                                    ,(Format "Kubed %S" (Or Type "Navigation"))
-                                                    ,@(If In-List
-                                                          '([["Navigate"
-                                                              ("C" "Switch Context"   Kubed-Ext-Switch-Context)
-                                                              ("N" "Switch Namespace" Kubed-Ext-Switch-Namespace)
-                                                              ("R" "Switch Resource"  Kubed-Ext-Switch-Resource)]
-                                                             ["Jump Workloads"
-                                                              ("1" "Pods"        Kubed-Ext-Jump-Pods)
-                                                              ("2" "Deployments" Kubed-Ext-Jump-Deployments)
-                                                              ("3" "Services"    Kubed-Ext-Jump-Services)
-                                                              ("4" "Jobs"        Kubed-Ext-Jump-Jobs)]
-                                                             ["Jump Config+Net"
-                                                              ("5" "Configmaps"  Kubed-Ext-Jump-Configmaps)
-                                                              ("6" "Secrets"     Kubed-Ext-Jump-Secrets)
-                                                              ("7" "Ingresses"   Kubed-Ext-Jump-Ingresses)
-                                                              ("8" "Pvcs"        Kubed-Ext-Jump-Pvcs)]])
-                                                          '([["Open Resource List"
-                                                              ("1" "Pods"        Kubed-List-Pods)
-                                                              ("2" "Deployments" Kubed-List-Deployments)
-                                                              ("3" "Services"    Kubed-List-Services)
-                                                              ("4" "Jobs"        Kubed-List-Jobs)
-                                                              ("5" "Configmaps"  Kubed-List-Configmaps)
-                                                              ("6" "Secrets"     Kubed-List-Secrets)]]))
-                                                    ,@(Cond
-                                                       ((Null Agroups) Nil)
-                                                       ((= (Length Agroups) 1) Agroups)
-                                                       ((<= (Length Agroups) 3)
-                                                        (List (Apply #'Vector Agroups)))
-                                                       (T (Let ((Rows Nil) (Rest Agroups))
-                                                               (While Rest
-                                                                      (Let ((Chunk (Seq-Take Rest 3)))
-                                                                           (Push (If (= (Length Chunk) 1) (Car Chunk)
-                                                                                     (Apply #'Vector Chunk))
-                                                                                 Rows)
-                                                                           (Setq Rest (Seq-Drop Rest 3))))
-                                                               (Nreverse Rows))))
-                                                    ,@(When In-List
-                                                            '([["General"
-                                                                ("G" "Refresh"          Kubed-List-Update :Transient T)
-                                                                ("D" "Describe"         Kubed-Ext-List-Describe-Resource)
-                                                                ("/" "Filter (S-Expr)"  Kubed-List-Set-Filter)
-                                                                ("F" "Filter (Substr)"  Kubed-Ext-Set-Filter)
-                                                                ("S" "Label Selector"   Kubed-Ext-List-Set-Label-Selector)
-                                                                ("V" "Wide View"        Kubed-Ext-List-Wide)
-                                                                ("A" "Auto-Refresh"     Kubed-Ext-Auto-Refresh-Mode)
-                                                                ("Q" "Quit"             Quit-Window)]
-                                                               ["Utilities"
-                                                                ("B" "Switch Buffer"    Kubed-Ext-Switch-Buffer)
-                                                                ("W" "Copy Name"        Kubed-List-Copy-As-Kill)
-                                                                ("Y" "Copy Menu"        Kubed-Ext-Copy-Popup)
-                                                                ("#" "Command Log"      Kubed-Ext-Show-Command-Log)
-                                                                ("M" "Mark Item"        Kubed-Ext-Mark-Item)
-                                                                ("X" "Delete Marked"    Kubed-Ext-Delete-Marked)]])))
-                          T)
-                         (Funcall-Interactively #'Kubed-Ext--Dynamic-Menu))
-                        (Error
-                         (Message "Dynamic Transient Error: %S" (Error-Message-String Err))
-                         (When (Fboundp 'Kubed-List-Transient)
-                               (Call-Interactively #'Kubed-List-Transient))))))
+(defun kubed-ext-transient-menu ()
+  "Show transient combining navigation, actions, and utilities."
+  (interactive)
+  (require 'transient)
+  (require 'kubed-transient nil t)
+  (let* ((in-list (derived-mode-p 'kubed-list-mode))
+         (type (and in-list kubed-list-type))
+         (agroups (and in-list (kubed-ext--collect-action-groups))))
+    (condition-case err
+        (progn
+          (eval
+           `(transient-define-prefix kubed-ext--dynamic-menu ()
+              ,(format "Kubed %s" (or type "Navigation"))
+              ,@(if in-list
+                    '([["Navigate"
+                        ("c" "Switch Context"   kubed-ext-switch-context)
+                        ("n" "Switch Namespace" kubed-ext-switch-namespace)
+                        ("r" "Switch Resource"  kubed-ext-switch-resource)]
+                       ["Jump Workloads"
+                        ("1" "Pods"        kubed-ext-jump-pods)
+                        ("2" "Deployments" kubed-ext-jump-deployments)
+                        ("3" "Services"    kubed-ext-jump-services)
+                        ("4" "Jobs"        kubed-ext-jump-jobs)]
+                       ["Jump Config+Net"
+                        ("5" "ConfigMaps"  kubed-ext-jump-configmaps)
+                        ("6" "Secrets"     kubed-ext-jump-secrets)
+                        ("7" "Ingresses"   kubed-ext-jump-ingresses)
+                        ("8" "PVCs"        kubed-ext-jump-pvcs)]])
+                  '([["Open Resource List"
+                      ("1" "Pods"        kubed-list-pods)
+                      ("2" "Deployments" kubed-list-deployments)
+                      ("3" "Services"    kubed-list-services)
+                      ("4" "Jobs"        kubed-list-jobs)
+                      ("5" "ConfigMaps"  kubed-list-configmaps)
+                      ("6" "Secrets"     kubed-list-secrets)]]))
+              ,@(cond
+                 ((null agroups) nil)
+                 ((= (length agroups) 1) agroups)
+                 ((<= (length agroups) 3)
+                  (list (apply #'vector agroups)))
+                 (t (let ((rows nil) (rest agroups))
+                      (while rest
+                        (let ((chunk (seq-take rest 3)))
+                          (push (if (= (length chunk) 1) (car chunk)
+                                  (apply #'vector chunk))
+                                rows)
+                          (setq rest (seq-drop rest 3))))
+                      (nreverse rows))))
+              ,@(when in-list
+                  '([["General"
+                      ("g" "Refresh"          kubed-list-update :transient t)
+                      ("d" "Describe"         kubed-ext-list-describe-resource)
+                      ("/" "Filter (S-expr)"  kubed-list-set-filter)
+                      ("f" "Filter (substr)"  kubed-ext-set-filter)
+                      ("S" "Label Selector"   kubed-ext-list-set-label-selector)
+                      ("V" "Wide view"        kubed-ext-list-wide)
+                      ("A" "Auto-refresh"     kubed-ext-auto-refresh-mode)
+                      ("q" "Quit"             quit-window)]
+                     ["Utilities"
+                      ("b" "Switch Buffer"    kubed-ext-switch-buffer)
+                      ("w" "Copy Name"        kubed-list-copy-as-kill)
+                      ("y" "Copy Menu"        kubed-ext-copy-popup)
+                      ("#" "Command Log"      kubed-ext-show-command-log)
+                      ("m" "Mark item"        kubed-ext-mark-item)
+                      ("X" "Delete marked"    kubed-ext-delete-marked)]])))
+           t)
+          (funcall-interactively #'kubed-ext--dynamic-menu))
+      (error
+       (message "Dynamic transient error: %s" (error-message-string err))
+       (when (fboundp 'kubed-list-transient)
+         (call-interactively #'kubed-list-transient))))))
 
-(Keymap-Set Kubed-List-Mode-Map "?" #'Kubed-Ext-Transient-Menu)
-(Keymap-Set Kubed-List-Mode-Map "C" #'Kubed-Ext-Switch-Context)
-(Keymap-Set Kubed-List-Mode-Map "N" #'Kubed-Ext-Switch-Namespace)
-(Keymap-Set Kubed-List-Mode-Map "R" #'Kubed-Ext-Switch-Resource)
+(keymap-set kubed-list-mode-map "?" #'kubed-ext-transient-menu)
+(keymap-set kubed-list-mode-map "C" #'kubed-ext-switch-context)
+(keymap-set kubed-list-mode-map "N" #'kubed-ext-switch-namespace)
+(keymap-set kubed-list-mode-map "R" #'kubed-ext-switch-resource)
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 20.  Kill All Kubed Buffers
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defun Kubed-Ext-Kill-All-Buffers (&Optional No-Confirm)
-  "Kill All Kubed-Related Buffers.
+(defun kubed-ext-kill-all-buffers (&optional no-confirm)
+  "Kill all Kubed-related buffers.
 
-Buffers Are Matched Either By Their Major/Minor Mode (E.G.
-`Kubed-List-Mode', `Kubed-Ext-Wide-Mode', Etc.) Or By Their Name
-Starting With \"*Kubed\" Or \"*Kubed\" (Case-Insensitive), Including
-Internal Space-Prefixed Scratch Buffers Such As \" *Kubed-Get-*\".
+Buffers are matched either by their major/minor mode (e.g.
+`kubed-list-mode', `kubed-ext-wide-mode', etc.) or by their name
+starting with \"*Kubed\" or \"*kubed\" (case-insensitive), including
+internal space-prefixed scratch buffers such as \" *kubed-get-*\".
 
-With A Prefix Argument No-Confirm, Skip The Confirmation Prompt And
-Kill Immediately.
+With a prefix argument NO-CONFIRM, skip the confirmation prompt and
+kill immediately.
 
-Also Stops Any Active Port-Forward Processes And Cancels The
-Auto-Refresh Timer If It Is Running."
-  (Interactive "P")
-  (Let ((Kubed-Bufs
-         (Seq-Filter
-          (Lambda (Buf)
-                  (Or
-                   ;; ── Detect By Major / Minor Mode ──────────────────
-                   (With-Current-Buffer Buf
-                                        (Or (Derived-Mode-P 'Kubed-List-Mode)
-                                            (Derived-Mode-P 'Kubed-Ext-Wide-Mode)
-                                            (Derived-Mode-P 'Kubed-Ext-Top-Nodes-Mode)
-                                            (Derived-Mode-P 'Kubed-Ext-Top-Pods-Mode)
-                                            (Derived-Mode-P 'Kubed-Ext-Port-Forwards-Mode)
-                                            (Derived-Mode-P 'Kubed-Ext-Rollout-History-Mode)
-                                            (Bound-And-True-P Kubed-Display-Resource-Mode)))
-                   ;; ── Detect By Buffer-Name Pattern ─────────────────
-                   ;; Matches: *Kubed ...  *Kubed-...  *Kubed Rollout...
-                   ;;          " *Kubed-Get-*" (Internal Scratch Buffers)
-                   (String-Match-P
-                    "\\`[[:Space:]]*\\*[Kk]Ubed"
-                    (Buffer-Name Buf))))
-          (Buffer-List))))
-       (If (Null Kubed-Bufs)
-           (Message "No Kubed Buffers To Kill.")
-           (When (Or No-Confirm
-                     (Yes-Or-No-P
-                      (Format "Kill %D Kubed Buffer%S? "
-                              (Length Kubed-Bufs)
-                              (If (= (Length Kubed-Bufs) 1) "" "S"))))
-                 ;; ── Cancel Auto-Refresh Timer ──────────────────────────
-                 (When (Fboundp 'Kubed-Ext--Auto-Refresh-Cancel-Timer)
-                       (Kubed-Ext--Auto-Refresh-Cancel-Timer))
-                 ;; ── Kill Buffers ───────────────────────────────────────
-                 (Let ((Killed 0))
-                      (Dolist (Buf Kubed-Bufs)
-                              (When (Buffer-Live-P Buf)
-                                    (Kill-Buffer Buf)
-                                    (Cl-Incf Killed)))
-                      (Message "Killed %D Kubed Buffer%S."
-                               Killed
-                               (If (= Killed 1) "" "S")))))))
+Also stops any active port-forward processes and cancels the
+auto-refresh timer if it is running."
+  (interactive "P")
+  (let ((kubed-bufs
+         (seq-filter
+          (lambda (buf)
+            (or
+             ;; ── Detect by major / minor mode ──────────────────
+             (with-current-buffer buf
+               (or (derived-mode-p 'kubed-list-mode)
+                   (derived-mode-p 'kubed-ext-wide-mode)
+                   (derived-mode-p 'kubed-ext-top-nodes-mode)
+                   (derived-mode-p 'kubed-ext-top-pods-mode)
+                   (derived-mode-p 'kubed-ext-port-forwards-mode)
+                   (derived-mode-p 'kubed-ext-rollout-history-mode)
+                   (bound-and-true-p kubed-display-resource-mode)))
+             ;; ── Detect by buffer-name pattern ─────────────────
+             ;; Matches: *Kubed ...  *kubed-...  *kubed rollout...
+             ;;          " *kubed-get-*" (internal scratch buffers)
+             (string-match-p
+              "\\`[[:space:]]*\\*[Kk]ubed"
+              (buffer-name buf))))
+          (buffer-list))))
+    (if (null kubed-bufs)
+        (message "No Kubed buffers to kill.")
+      (when (or no-confirm
+                (yes-or-no-p
+                 (format "Kill %d Kubed buffer%s? "
+                         (length kubed-bufs)
+                         (if (= (length kubed-bufs) 1) "" "s"))))
+        ;; ── Cancel auto-refresh timer ──────────────────────────
+        (when (fboundp 'kubed-ext--auto-refresh-cancel-timer)
+          (kubed-ext--auto-refresh-cancel-timer))
+        ;; ── Kill buffers ───────────────────────────────────────
+        (let ((killed 0))
+          (dolist (buf kubed-bufs)
+            (when (buffer-live-p buf)
+              (kill-buffer buf)
+              (cl-incf killed)))
+          (message "Killed %d Kubed buffer%s."
+                   killed
+                   (if (= killed 1) "" "s")))))))
 
-(Keymap-Set Kubed-Prefix-Map "Q" #'Kubed-Ext-Kill-All-Buffers)
-(Keymap-Set Kubed-List-Mode-Map "C-C C-K" #'Kubed-Ext-Kill-All-Buffers)
+(keymap-set kubed-prefix-map "Q" #'kubed-ext-kill-all-buffers)
+(keymap-set kubed-list-mode-map "C-c C-k" #'kubed-ext-kill-all-buffers)
 
 ;;; ═══════════════════════════════════════════════════════════════
-;;; § 21.  Circuit Breaker — Intelligent Vpn / Network Recovery
+;;; § 21.  Circuit Breaker — Intelligent VPN / Network Recovery
 ;;; ═══════════════════════════════════════════════════════════════
 ;;
-;; Each Kubectl Context Has An Independent Circuit In One Of Three States:
+;; Each kubectl context has an independent circuit in one of three states:
 ;;
-;;   Closed  — Normal; Auto-Refresh Runs Freely.
-;;   Network — Cluster Unreachable (Vpn, Dns, Tls, Timeout).
-;;             Trips After `Kubed-Ext-Cb-Threshold' Consecutive Network
-;;             Errors.  Recovery Probes With Exponential Back-Off Are
-;;             Scheduled Automatically; Circuit Closes On Probe Success.
-;;   Auth    — Credentials Expired (Kubelogin, Aadsts, Az-Cli).
-;;             Trips After `Kubed-Ext-Cb-Auth-Threshold' Consecutive Auth
-;;             Errors.  No Automatic Probing — User Must Re-Authenticate
-;;             Then Press `G' Or `Z' To Resume.
+;;   closed  — normal; auto-refresh runs freely.
+;;   network — cluster unreachable (VPN, DNS, TLS, timeout).
+;;             Trips after `kubed-ext-cb-threshold' consecutive network
+;;             errors.  Recovery probes with exponential back-off are
+;;             scheduled automatically; circuit closes on probe success.
+;;   auth    — credentials expired (kubelogin, AADSTS, az-cli).
+;;             Trips after `kubed-ext-cb-auth-threshold' consecutive auth
+;;             errors.  No automatic probing — user must re-authenticate
+;;             then press `g' or `Z' to resume.
 ;;
-;; Both Open States Suppress Auto-Refresh.  Mode-Line Indicators:
-;;   ⚡~Xs     Network Outage  (X = Seconds Until Next Probe)
-;;   🔑 Re-Auth  Credential Issue
+;; Both open states suppress auto-refresh.  Mode-line indicators:
+;;   ⚡~Xs     network outage  (X = seconds until next probe)
+;;   🔑 re-auth  credential issue
 
-(Defgroup Kubed-Ext-Circuit-Breaker Nil
-  "Per-Context Circuit Breaker For Kubed-Ext Auto-Refresh."
-  :Group 'Kubed-Ext)
+(defgroup kubed-ext-circuit-breaker nil
+  "Per-context circuit breaker for kubed-ext auto-refresh."
+  :group 'kubed-ext)
 
-(Defcustom Kubed-Ext-Cb-Threshold 3
-  "Consecutive Network Failures Before The Circuit Opens For A Context."
-  :Type 'Natnum
-  :Group 'Kubed-Ext-Circuit-Breaker)
+(defcustom kubed-ext-cb-threshold 3
+  "Consecutive network failures before the circuit opens for a context."
+  :type 'natnum
+  :group 'kubed-ext-circuit-breaker)
 
-(Defcustom Kubed-Ext-Cb-Auth-Threshold 2
-  "Consecutive Auth Failures Before Auto-Refresh Is Paused For A Context."
-  :Type 'Natnum
-  :Group 'Kubed-Ext-Circuit-Breaker)
+(defcustom kubed-ext-cb-auth-threshold 2
+  "Consecutive auth failures before auto-refresh is paused for a context."
+  :type 'natnum
+  :group 'kubed-ext-circuit-breaker)
 
-(Defcustom Kubed-Ext-Cb-Initial-Backoff 30
-  "Seconds Before The First Network-Recovery Probe After The Circuit Opens."
-  :Type 'Natnum
-  :Group 'Kubed-Ext-Circuit-Breaker)
+(defcustom kubed-ext-cb-initial-backoff 30
+  "Seconds before the first network-recovery probe after the circuit opens."
+  :type 'natnum
+  :group 'kubed-ext-circuit-breaker)
 
-(Defcustom Kubed-Ext-Cb-Backoff-Factor 2.0
-  "Multiplier Applied To The Probe Interval After Each Failed Probe."
-  :Type 'Number
-  :Group 'Kubed-Ext-Circuit-Breaker)
+(defcustom kubed-ext-cb-backoff-factor 2.0
+  "Multiplier applied to the probe interval after each failed probe."
+  :type 'number
+  :group 'kubed-ext-circuit-breaker)
 
-(Defcustom Kubed-Ext-Cb-Max-Backoff 300
-  "Maximum Probe Interval In Seconds (Default: 5 Minutes)."
-  :Type 'Natnum
-  :Group 'Kubed-Ext-Circuit-Breaker)
+(defcustom kubed-ext-cb-max-backoff 300
+  "Maximum probe interval in seconds (default: 5 minutes)."
+  :type 'natnum
+  :group 'kubed-ext-circuit-breaker)
 
-;; ── Per-Context State (All Tables Keyed By Context String) ───────
+;; ── Per-context state (all tables keyed by context string) ───────
 
-(Defvar Kubed-Ext--Cb-Open
-  (Make-Hash-Table :Test 'Equal)
-  "Circuit State Per Context: Nil (Closed), `Network', Or `Auth'.")
+(defvar kubed-ext--cb-open
+  (make-hash-table :test 'equal)
+  "Circuit state per context: nil (closed), `network', or `auth'.")
 
-(Defvar Kubed-Ext--Cb-Net-Failures
-  (Make-Hash-Table :Test 'Equal)
-  "Consecutive Network-Error Count Per Context.")
+(defvar kubed-ext--cb-net-failures
+  (make-hash-table :test 'equal)
+  "Consecutive network-error count per context.")
 
-(Defvar Kubed-Ext--Cb-Auth-Failures
-  (Make-Hash-Table :Test 'Equal)
-  "Consecutive Auth-Error Count Per Context.")
+(defvar kubed-ext--cb-auth-failures
+  (make-hash-table :test 'equal)
+  "Consecutive auth-error count per context.")
 
-(Defvar Kubed-Ext--Cb-Backoff
-  (Make-Hash-Table :Test 'Equal)
-  "Current Probe Back-Off Interval In Seconds Per Context.")
+(defvar kubed-ext--cb-backoff
+  (make-hash-table :test 'equal)
+  "Current probe back-off interval in seconds per context.")
 
-(Defvar Kubed-Ext--Cb-Probe-Timers
-  (Make-Hash-Table :Test 'Equal)
-  "Pending Network-Recovery Probe Timer Per Context.")
+(defvar kubed-ext--cb-probe-timers
+  (make-hash-table :test 'equal)
+  "Pending network-recovery probe timer per context.")
 
-;; ── Error Pattern Matching ────────────────────────────────────────
+;; ── Error pattern matching ────────────────────────────────────────
 
-(Defconst Kubed-Ext--Network-Error-Patterns
-  '("Eof" "Unexpected Eof" "Connection Reset By Peer" "Connection Refused"
-    "Network Is Unreachable" "No Route To Host" "Broken Pipe"
-    "No Such Host" "Name Or Service Not Known"
-    "Temporary Failure In Name Resolution"
-    "I/O Timeout" "Tls Handshake Timeout" "Context Deadline Exceeded"
-    "Request Timeout" "Unable To Connect To The Server"
-    "Transport: Error While Dialing" "Dial Tcp" "Proxy: "
-    "Azmk8s.Io" "Googleapis.Com" "Eks.Amazonaws.Com"
-    "Certificate Has Expired")
-  "Kubectl Error Substrings Indicating Transient Network Or Vpn Failures.")
+(defconst kubed-ext--network-error-patterns
+  '("EOF" "unexpected EOF" "connection reset by peer" "connection refused"
+    "network is unreachable" "no route to host" "broken pipe"
+    "no such host" "Name or service not known"
+    "Temporary failure in name resolution"
+    "i/o timeout" "TLS handshake timeout" "context deadline exceeded"
+    "request timeout" "Unable to connect to the server"
+    "transport: Error while dialing" "dial tcp" "proxy: "
+    "azmk8s.io" "googleapis.com" "eks.amazonaws.com"
+    "certificate has expired")
+  "Kubectl error substrings indicating transient network or VPN failures.")
 
-(Defconst Kubed-Ext--Auth-Error-Patterns
-  '("Azureclicredential" "Kubelogin Failed" "Aadsts"
-    "Failed To Get Token" "Getting Credentials: Exec"
-    "Exec: Executable Kubelogin" "Tokenrequesterror"
-    "Invalid_Client" "Unauthorized" "Unauthorized"
-    "Az Login" "Az Logout")
-  "Kubectl Error Substrings Indicating Expired Or Invalid Credentials.")
+(defconst kubed-ext--auth-error-patterns
+  '("AzureCLICredential" "kubelogin failed" "AADSTS"
+    "failed to get token" "getting credentials: exec"
+    "exec: executable kubelogin" "TokenRequestError"
+    "invalid_client" "Unauthorized" "unauthorized"
+    "az login" "az logout")
+  "Kubectl error substrings indicating expired or invalid credentials.")
 
-(Defun Kubed-Ext--Network-Error-P (Msg)
-  "Return Non-Nil If Msg Indicates A Transient Network Or Vpn Failure."
-  (And (Stringp Msg)
-       (Seq-Some (Lambda (Pat)
-                         (String-Match-P (Regexp-Quote Pat) Msg))
-                 Kubed-Ext--Network-Error-Patterns)))
+(defun kubed-ext--network-error-p (msg)
+  "Return non-nil if MSG indicates a transient network or VPN failure."
+  (and (stringp msg)
+       (seq-some (lambda (pat)
+                   (string-match-p (regexp-quote pat) msg))
+                 kubed-ext--network-error-patterns)))
 
-(Defun Kubed-Ext--Auth-Error-P (Msg)
-  "Return Non-Nil If Msg Indicates An Expired Or Invalid Credential."
-  (And (Stringp Msg)
-       (Seq-Some (Lambda (Pat)
-                         (String-Match-P (Regexp-Quote Pat) Msg))
-                 Kubed-Ext--Auth-Error-Patterns)))
+(defun kubed-ext--auth-error-p (msg)
+  "Return non-nil if MSG indicates an expired or invalid credential."
+  (and (stringp msg)
+       (seq-some (lambda (pat)
+                   (string-match-p (regexp-quote pat) msg))
+                 kubed-ext--auth-error-patterns)))
 
-;; ── State Accessors ───────────────────────────────────────────────
+;; ── State accessors ───────────────────────────────────────────────
 
-(Defun Kubed-Ext--Cb-Open-P (Context)
-  "Return Open Reason For Context (`Network' Or `Auth'), Or Nil If Closed."
-  (Gethash (Or Context "") Kubed-Ext--Cb-Open))
+(defun kubed-ext--cb-open-p (context)
+  "Return open reason for CONTEXT (`network' or `auth'), or nil if closed."
+  (gethash (or context "") kubed-ext--cb-open))
 
-(Defun Kubed-Ext--Cb-Backoff-For (Context)
-  "Return The Current Probe Back-Off Interval In Seconds For Context."
-  (Gethash (Or Context "") Kubed-Ext--Cb-Backoff
-           Kubed-Ext-Cb-Initial-Backoff))
+(defun kubed-ext--cb-backoff-for (context)
+  "Return the current probe back-off interval in seconds for CONTEXT."
+  (gethash (or context "") kubed-ext--cb-backoff
+           kubed-ext-cb-initial-backoff))
 
-;; ── Stderr Content Discovery ──────────────────────────────────────
+;; ── Stderr content discovery ──────────────────────────────────────
 
-(Defun Kubed-Ext--Cb-Read-Stderr (Resource-Type)
-  "Return Stderr Content For A `Kubectl Get Resource-Type' Process, Or Nil.
-Tries Several Buffer-Naming Conventions That Kubed May Use."
-  (Catch 'Found
-         (Dolist (Name (List (Format " *Kubed-Get-%S-Stderr*" Resource-Type)
-                             (Format "*Kubed-Get-%S*"         Resource-Type)
-                             (Format " *Kubed-Get-%S*"        Resource-Type)))
-                 (Let ((Buf (Get-Buffer Name)))
-                      (When (And Buf (Buffer-Live-P Buf))
-                            (Let ((Content (With-Current-Buffer Buf
-                                                                (String-Trim (Buffer-String)))))
-                                 (Unless (String-Empty-P Content)
-                                         (Throw 'Found Content))))))))
+(defun kubed-ext--cb-read-stderr (resource-type)
+  "Return stderr content for a `kubectl get RESOURCE-TYPE' process, or nil.
+Tries several buffer-naming conventions that kubed may use."
+  (catch 'found
+    (dolist (name (list (format " *kubed-get-%s-stderr*" resource-type)
+                        (format "*kubed-get-%s*"         resource-type)
+                        (format " *kubed-get-%s*"        resource-type)))
+      (let ((buf (get-buffer name)))
+        (when (and buf (buffer-live-p buf))
+          (let ((content (with-current-buffer buf
+                           (string-trim (buffer-string)))))
+            (unless (string-empty-p content)
+              (throw 'found content))))))))
 
-;; ── List-Buffer Helpers ───────────────────────────────────────────
+;; ── List-buffer helpers ───────────────────────────────────────────
 
-(Defun Kubed-Ext--Cb-In-Context-Bufs (Context Fn)
-  "Call Fn With No Args In Every Live Kubed List Buffer Using Context."
-  (Let ((Ctx (Or Context "")))
-       (Dolist (Buf (Buffer-List))
-               (When (Buffer-Live-P Buf)
-                     (With-Current-Buffer Buf
-                                          (When (And (Derived-Mode-P 'Kubed-List-Mode)
-                                                     (Equal Kubed-List-Context Ctx))
-                                                (Funcall Fn)))))))
+(defun kubed-ext--cb-in-context-bufs (context fn)
+  "Call FN with no args in every live kubed list buffer using CONTEXT."
+  (let ((ctx (or context "")))
+    (dolist (buf (buffer-list))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf
+          (when (and (derived-mode-p 'kubed-list-mode)
+                     (equal kubed-list-context ctx))
+            (funcall fn)))))))
 
-(Defun Kubed-Ext--Cb-Set-Header (Context Message)
-  "Display Message As The Error Header In Every List Buffer For Context."
-  (Kubed-Ext--Cb-In-Context-Bufs
-   Context (Lambda () (Kubed-Ext--Set-Header-Error Message))))
+(defun kubed-ext--cb-set-header (context message)
+  "Display MESSAGE as the error header in every list buffer for CONTEXT."
+  (kubed-ext--cb-in-context-bufs
+   context (lambda () (kubed-ext--set-header-error message))))
 
-(Defun Kubed-Ext--Cb-Clear-Headers (Context)
-  "Clear Circuit-Breaker Header Overlays In Every List Buffer For Context."
-  (Kubed-Ext--Cb-In-Context-Bufs
-   Context #'Kubed-Ext--Clear-Header-Error))
+(defun kubed-ext--cb-clear-headers (context)
+  "Clear circuit-breaker header overlays in every list buffer for CONTEXT."
+  (kubed-ext--cb-in-context-bufs
+   context #'kubed-ext--clear-header-error))
 
-(Defun Kubed-Ext--Cb-Refresh-Mode-Lines (Context)
-  "Force Mode-Line Update In Every Kubed List Buffer For Context."
-  (Kubed-Ext--Cb-In-Context-Bufs
-   Context #'Force-Mode-Line-Update))
+(defun kubed-ext--cb-refresh-mode-lines (context)
+  "Force mode-line update in every kubed list buffer for CONTEXT."
+  (kubed-ext--cb-in-context-bufs
+   context #'force-mode-line-update))
 
-;; ── Auth-Error Summary Extraction ────────────────────────────────
+;; ── Auth-error summary extraction ────────────────────────────────
 
-(Defun Kubed-Ext--Cb-Auth-Summary (Err-Msg)
-  "Extract A Short Human-Readable Summary From An Auth Error Err-Msg."
-  (Let* ((Lines (Split-String (String-Trim Err-Msg) "\N" T))
-         (Hint  (Seq-Find (Lambda (L)
-                                  (String-Match-P "Az Login\\|Az Logout" L))
-                          Lines)))
-        (String-Trim (Or Hint (Car Lines) "Credentials Expired."))))
+(defun kubed-ext--cb-auth-summary (err-msg)
+  "Extract a short human-readable summary from an auth error ERR-MSG."
+  (let* ((lines (split-string (string-trim err-msg) "\n" t))
+         (hint  (seq-find (lambda (l)
+                            (string-match-p "az login\\|az logout" l))
+                          lines)))
+    (string-trim (or hint (car lines) "Credentials expired."))))
 
-;; ── Core State Machine ────────────────────────────────────────────
+;; ── Core state machine ────────────────────────────────────────────
 
-(Defun Kubed-Ext--Cb-Reset-State (Context)
-  "Clear All Circuit-Breaker Counters And Cancel Any Probe Timer For Context."
-  (Let* ((Ctx   (Or Context ""))
-         (Timer (Gethash Ctx Kubed-Ext--Cb-Probe-Timers)))
-        (Puthash Ctx 0   Kubed-Ext--Cb-Net-Failures)
-        (Puthash Ctx 0   Kubed-Ext--Cb-Auth-Failures)
-        (Puthash Ctx Nil Kubed-Ext--Cb-Open)
-        (Puthash Ctx Kubed-Ext-Cb-Initial-Backoff Kubed-Ext--Cb-Backoff)
-        (When (Timerp Timer) (Cancel-Timer Timer))
-        (Remhash Ctx Kubed-Ext--Cb-Probe-Timers)))
+(defun kubed-ext--cb-reset-state (context)
+  "Clear all circuit-breaker counters and cancel any probe timer for CONTEXT."
+  (let* ((ctx   (or context ""))
+         (timer (gethash ctx kubed-ext--cb-probe-timers)))
+    (puthash ctx 0   kubed-ext--cb-net-failures)
+    (puthash ctx 0   kubed-ext--cb-auth-failures)
+    (puthash ctx nil kubed-ext--cb-open)
+    (puthash ctx kubed-ext-cb-initial-backoff kubed-ext--cb-backoff)
+    (when (timerp timer) (cancel-timer timer))
+    (remhash ctx kubed-ext--cb-probe-timers)))
 
-(Defun Kubed-Ext--Cb-On-Success (Context)
-  "Record A Successful Kubectl Call; Close The Circuit For Context If Open."
-  (Let* ((Ctx      (Or Context ""))
-         (Was-Open (Kubed-Ext--Cb-Open-P Ctx)))
-        (Kubed-Ext--Cb-Reset-State Ctx)
-        (When Was-Open
-              (Message "Kubed ✓  [%S]: Connection Restored — Auto-Refresh Resumed." Ctx)
-              (Kubed-Ext--Cb-Clear-Headers Ctx)
-              (Kubed-Ext--Cb-Refresh-Mode-Lines Ctx)
-              (Kubed-Ext--Cb-In-Context-Bufs
-               Ctx (Lambda ()
-                           (Condition-Case Nil (Kubed-List-Update T)
-                                           (Error Nil)))))))
+(defun kubed-ext--cb-on-success (context)
+  "Record a successful kubectl call; close the circuit for CONTEXT if open."
+  (let* ((ctx      (or context ""))
+         (was-open (kubed-ext--cb-open-p ctx)))
+    (kubed-ext--cb-reset-state ctx)
+    (when was-open
+      (message "Kubed ✓  [%s]: connection restored — auto-refresh resumed." ctx)
+      (kubed-ext--cb-clear-headers ctx)
+      (kubed-ext--cb-refresh-mode-lines ctx)
+      (kubed-ext--cb-in-context-bufs
+       ctx (lambda ()
+             (condition-case nil (kubed-list-update t)
+               (error nil)))))))
 
-(Defun Kubed-Ext--Cb-Trip-Network (Context Err-Msg)
-  "Open The Circuit With Reason `Network' For Context/Err-Msg."
-  (Let* ((Ctx     (Or Context ""))
-         (Delay   Kubed-Ext-Cb-Initial-Backoff)
-         (Summary (Truncate-String-To-Width
-                   (Replace-Regexp-In-String "\N" " " (String-Trim Err-Msg))
-                   60 Nil Nil "…")))
-        (Puthash Ctx 'Network Kubed-Ext--Cb-Open)
-        (Puthash Ctx Delay    Kubed-Ext--Cb-Backoff)
-        (Message "Kubed ⚡ [%S]: Unreachable — %S  [Probing In %Ds; `G'/`Z' To Retry]"
-                 Ctx Summary Delay)
-        (Kubed-Ext--Cb-Refresh-Mode-Lines Ctx)
-        (Kubed-Ext--Cb-Schedule-Probe Ctx Delay)))
+(defun kubed-ext--cb-trip-network (context err-msg)
+  "Open the circuit with reason `network' for CONTEXT/ERR-MSG."
+  (let* ((ctx     (or context ""))
+         (delay   kubed-ext-cb-initial-backoff)
+         (summary (truncate-string-to-width
+                   (replace-regexp-in-string "\n" " " (string-trim err-msg))
+                   60 nil nil "…")))
+    (puthash ctx 'network kubed-ext--cb-open)
+    (puthash ctx delay    kubed-ext--cb-backoff)
+    (message "Kubed ⚡ [%s]: unreachable — %s  [probing in %ds; `g'/`Z' to retry]"
+             ctx summary delay)
+    (kubed-ext--cb-refresh-mode-lines ctx)
+    (kubed-ext--cb-schedule-probe ctx delay)))
 
-(Defun Kubed-Ext--Cb-Trip-Auth (Context Err-Msg)
-  "Open The Circuit With Reason `Auth' For Context/Err-Msg."
-  (Let* ((Ctx     (Or Context ""))
-         (Summary (Kubed-Ext--Cb-Auth-Summary Err-Msg)))
-        (Puthash Ctx 'Auth Kubed-Ext--Cb-Open)
-        (Puthash Ctx Kubed-Ext-Cb-Initial-Backoff Kubed-Ext--Cb-Backoff)
-        (Message "Kubed 🔑 [%S]: Auth Paused — %S  [Re-Auth Then Press `G' Or `Z']"
-                 Ctx Summary)
-        (Kubed-Ext--Cb-Set-Header
-         Ctx (Format "🔑 Auth Expired — %S  [Press `G' Or `Z' To Resume]" Summary))
-        (Kubed-Ext--Cb-Refresh-Mode-Lines Ctx)))
+(defun kubed-ext--cb-trip-auth (context err-msg)
+  "Open the circuit with reason `auth' for CONTEXT/ERR-MSG."
+  (let* ((ctx     (or context ""))
+         (summary (kubed-ext--cb-auth-summary err-msg)))
+    (puthash ctx 'auth kubed-ext--cb-open)
+    (puthash ctx kubed-ext-cb-initial-backoff kubed-ext--cb-backoff)
+    (message "Kubed 🔑 [%s]: auth paused — %s  [re-auth then press `g' or `Z']"
+             ctx summary)
+    (kubed-ext--cb-set-header
+     ctx (format "🔑 Auth expired — %s  [Press `g' or `Z' to resume]" summary))
+    (kubed-ext--cb-refresh-mode-lines ctx)))
 
-(Defun Kubed-Ext--Cb-On-Failure (Context Err-Msg)
-  "Record A Kubectl Failure For Context With Error Message Err-Msg.
-Auth And Network Errors Are Counted Toward Separate Thresholds.
-When Either Threshold Is Reached The Circuit Opens, Suppressing
-Auto-Refresh.  Unknown Errors Are Silently Ignored."
-  (Let ((Ctx (Or Context "")))
-       (Cond
-        ;; ── Auth / Credential Error ───────────────────────────────
-        ;; Only Act While The Circuit Is Not Already In `Auth' State.
-        ((And (Kubed-Ext--Auth-Error-P Err-Msg)
-              (Not (Eq (Kubed-Ext--Cb-Open-P Ctx) 'Auth)))
-         (Let* ((N   (1+ (Gethash Ctx Kubed-Ext--Cb-Auth-Failures 0)))
-                (Thr Kubed-Ext-Cb-Auth-Threshold))
-               (Puthash Ctx N Kubed-Ext--Cb-Auth-Failures)
-               (If (>= N Thr)
-                   (Kubed-Ext--Cb-Trip-Auth Ctx Err-Msg)
-                   (Message "Kubed 🔑 [%S] (%D/%D): %S"
-                            Ctx N Thr (Kubed-Ext--Cb-Auth-Summary Err-Msg)))))
+(defun kubed-ext--cb-on-failure (context err-msg)
+  "Record a kubectl failure for CONTEXT with error message ERR-MSG.
+Auth and network errors are counted toward separate thresholds.
+When either threshold is reached the circuit opens, suppressing
+auto-refresh.  Unknown errors are silently ignored."
+  (let ((ctx (or context "")))
+    (cond
+     ;; ── Auth / credential error ───────────────────────────────
+     ;; Only act while the circuit is not already in `auth' state.
+     ((and (kubed-ext--auth-error-p err-msg)
+           (not (eq (kubed-ext--cb-open-p ctx) 'auth)))
+      (let* ((n   (1+ (gethash ctx kubed-ext--cb-auth-failures 0)))
+             (thr kubed-ext-cb-auth-threshold))
+        (puthash ctx n kubed-ext--cb-auth-failures)
+        (if (>= n thr)
+            (kubed-ext--cb-trip-auth ctx err-msg)
+          (message "Kubed 🔑 [%s] (%d/%d): %s"
+                   ctx n thr (kubed-ext--cb-auth-summary err-msg)))))
 
-        ;; ── Network / Transport Error ─────────────────────────────
-        ;; Only Act While The Circuit Is Fully Closed.
-        ((And (Kubed-Ext--Network-Error-P Err-Msg)
-              (Not (Kubed-Ext--Cb-Open-P Ctx)))
-         (Let* ((N   (1+ (Gethash Ctx Kubed-Ext--Cb-Net-Failures 0)))
-                (Thr Kubed-Ext-Cb-Threshold))
-               (Puthash Ctx N Kubed-Ext--Cb-Net-Failures)
-               (If (>= N Thr)
-                   (Kubed-Ext--Cb-Trip-Network Ctx Err-Msg)
-                   (Message "Kubed [%S]: Connection Check Failed (%D/%D)"
-                            Ctx N Thr)))))))
+     ;; ── Network / transport error ─────────────────────────────
+     ;; Only act while the circuit is fully closed.
+     ((and (kubed-ext--network-error-p err-msg)
+           (not (kubed-ext--cb-open-p ctx)))
+      (let* ((n   (1+ (gethash ctx kubed-ext--cb-net-failures 0)))
+             (thr kubed-ext-cb-threshold))
+        (puthash ctx n kubed-ext--cb-net-failures)
+        (if (>= n thr)
+            (kubed-ext--cb-trip-network ctx err-msg)
+          (message "Kubed [%s]: connection check failed (%d/%d)"
+                   ctx n thr)))))))
 
-;; ── Network Recovery Probe ────────────────────────────────────────
+;; ── Network recovery probe ────────────────────────────────────────
 
-(Defun Kubed-Ext--Cb-Schedule-Probe (Context Delay)
-  "Schedule A Connectivity Probe For Context After Delay Seconds."
-  (Let ((Ctx (Or Context "")))
-       (Let ((Old (Gethash Ctx Kubed-Ext--Cb-Probe-Timers)))
-            (When (Timerp Old) (Cancel-Timer Old)))
-       (Puthash Ctx
-                (Run-With-Timer Delay Nil #'Kubed-Ext--Cb-Run-Probe Ctx)
-                Kubed-Ext--Cb-Probe-Timers)))
+(defun kubed-ext--cb-schedule-probe (context delay)
+  "Schedule a connectivity probe for CONTEXT after DELAY seconds."
+  (let ((ctx (or context "")))
+    (let ((old (gethash ctx kubed-ext--cb-probe-timers)))
+      (when (timerp old) (cancel-timer old)))
+    (puthash ctx
+             (run-with-timer delay nil #'kubed-ext--cb-run-probe ctx)
+             kubed-ext--cb-probe-timers)))
 
-(Defun Kubed-Ext--Cb-Run-Probe (Context)
-  "Run A `Kubectl Api-Versions' Connectivity Probe For Context.
+(defun kubed-ext--cb-run-probe (context)
+  "Run a `kubectl api-versions' connectivity probe for CONTEXT.
 
-Exit 0         → Success; Close Circuit.
-Auth Error     → Network Is Up But Credentials Expired; Switch To
-                 `Auth' State And Stop Scheduling Further Probes.
-Network Error  → Still Unreachable; Double Back-Off And Reschedule.
-Other Error    → Server Responded; Close Circuit."
-  (Let ((Ctx (Or Context "")))
-       (When (Kubed-Ext--Cb-Open-P Ctx)
-             (Let ((Probe-Buf (Generate-New-Buffer " *Kubed-Ext-Cb-Probe*")))
-                  (Make-Process
-                   :Name     "Kubed-Ext-Cb-Probe"
-                   :Buffer   Probe-Buf
-                   :Noquery  T
-                   :Command  (List Kubed-Kubectl-Program
-                                   "Api-Versions"
-                                   "--Context"         Ctx
-                                   "--Request-Timeout" "5s")
-                   :Sentinel
-                   (Lambda (Proc _Event)
-                           (When (Memq (Process-Status Proc) '(Exit Signal))
-                                 (Let* ((Code   (Process-Exit-Status Proc))
-                                        (Output (If (Buffer-Live-P Probe-Buf)
-                                                    (Prog1 (With-Current-Buffer Probe-Buf
-                                                                                (String-Trim (Buffer-String)))
-                                                           (Kill-Buffer Probe-Buf))
-                                                    "")))
-                                       (Remhash Ctx Kubed-Ext--Cb-Probe-Timers)
-                                       (Cond
-                                        ;; Network And Auth Are Both Working.
-                                        ((Zerop Code)
-                                         (Kubed-Ext--Cb-On-Success Ctx))
+exit 0         → success; close circuit.
+auth error     → network is up but credentials expired; switch to
+                 `auth' state and stop scheduling further probes.
+network error  → still unreachable; double back-off and reschedule.
+other error    → server responded; close circuit."
+  (let ((ctx (or context "")))
+    (when (kubed-ext--cb-open-p ctx)
+      (let ((probe-buf (generate-new-buffer " *kubed-ext-cb-probe*")))
+        (make-process
+         :name     "kubed-ext-cb-probe"
+         :buffer   probe-buf
+         :noquery  t
+         :command  (list kubed-kubectl-program
+                         "api-versions"
+                         "--context"         ctx
+                         "--request-timeout" "5s")
+         :sentinel
+         (lambda (proc _event)
+           (when (memq (process-status proc) '(exit signal))
+             (let* ((code   (process-exit-status proc))
+                    (output (if (buffer-live-p probe-buf)
+                                (prog1 (with-current-buffer probe-buf
+                                         (string-trim (buffer-string)))
+                                  (kill-buffer probe-buf))
+                              "")))
+               (remhash ctx kubed-ext--cb-probe-timers)
+               (cond
+                ;; Network and auth are both working.
+                ((zerop code)
+                 (kubed-ext--cb-on-success ctx))
 
-                                        ;; Network Is Up But Credentials Have Expired.
-                                        ;; Switch To `Auth' State — No More Probes Until Manual Reset.
-                                        ((Kubed-Ext--Auth-Error-P Output)
-                                         (Puthash Ctx 'Auth Kubed-Ext--Cb-Open)
-                                         (Kubed-Ext--Cb-Set-Header
-                                          Ctx (Concat "🔑 Network Restored But Credentials Expired"
-                                                      "  [Re-Auth, Then Press `G' Or `Z']"))
-                                         (Kubed-Ext--Cb-Refresh-Mode-Lines Ctx)
-                                         (Message
-                                          "Kubed 🔑 [%S]: Network Ok But Credentials Expired — Re-Auth Then Press `G'."
-                                          Ctx))
+                ;; Network is up but credentials have expired.
+                ;; Switch to `auth' state — no more probes until manual reset.
+                ((kubed-ext--auth-error-p output)
+                 (puthash ctx 'auth kubed-ext--cb-open)
+                 (kubed-ext--cb-set-header
+                  ctx (concat "🔑 Network restored but credentials expired"
+                              "  [Re-auth, then press `g' or `Z']"))
+                 (kubed-ext--cb-refresh-mode-lines ctx)
+                 (message
+                  "Kubed 🔑 [%s]: network OK but credentials expired — re-auth then press `g'."
+                  ctx))
 
-                                        ;; Cluster Still Unreachable — Exponential Back-Off.
-                                        ((Kubed-Ext--Network-Error-P Output)
-                                         (Let* ((Cur  (Kubed-Ext--Cb-Backoff-For Ctx))
-                                                (Next (Min Kubed-Ext-Cb-Max-Backoff
-                                                           (Round (* Cur Kubed-Ext-Cb-Backoff-Factor)))))
-                                               (Puthash Ctx Next Kubed-Ext--Cb-Backoff)
-                                               (Message "Kubed ⚡ [%S]: Still Unreachable — Probing In %Ds."
-                                                        Ctx Next)
-                                               (Kubed-Ext--Cb-Refresh-Mode-Lines Ctx)
-                                               (Kubed-Ext--Cb-Schedule-Probe Ctx Next)))
+                ;; Cluster still unreachable — exponential back-off.
+                ((kubed-ext--network-error-p output)
+                 (let* ((cur  (kubed-ext--cb-backoff-for ctx))
+                        (next (min kubed-ext-cb-max-backoff
+                                   (round (* cur kubed-ext-cb-backoff-factor)))))
+                   (puthash ctx next kubed-ext--cb-backoff)
+                   (message "Kubed ⚡ [%s]: still unreachable — probing in %ds."
+                            ctx next)
+                   (kubed-ext--cb-refresh-mode-lines ctx)
+                   (kubed-ext--cb-schedule-probe ctx next)))
 
-                                        ;; Unexpected Non-Zero Exit But Server Responded — Close Circuit.
-                                        (T
-                                         (Kubed-Ext--Cb-On-Success Ctx)))))))))))
+                ;; Unexpected non-zero exit but server responded — close circuit.
+                (t
+                 (kubed-ext--cb-on-success ctx)))))))))))
 
-;; ── Wiring: Feed Kubed-Update Outcomes Into The State Machine ────
+;; ── Wiring: feed kubed-update outcomes into the state machine ────
 
-(Defun Kubed-Ext--Cb-Update-Advice (Orig-Fn Type Context &Optional Namespace)
-  "Around-Advice On `Kubed-Update': Wire Circuit-Breaker Accounting.
-Orig-Fn Is The Original Function; Type, Context, And Namespace Are
-Forwarded Unchanged."
-  (Funcall Orig-Fn Type Context Namespace)
-  (When-Let ((Proc (Alist-Get 'Process
-                              (Kubed--Alist Type Context Namespace))))
-            (When (Process-Live-P Proc)
-                  (Let* ((Ctx        (Or Context ""))
-                         (Rtype      Type)
-                         (Inner-Sent (Process-Sentinel Proc)))
-                        (Set-Process-Sentinel
-                         Proc
-                         (Lambda (P Status)
-                                 (Funcall Inner-Sent P Status)
-                                 (Cond
-                                  ((String= Status "Finished\N")
-                                   (Kubed-Ext--Cb-On-Success Ctx))
-                                  ((String= Status "Exited Abnormally With Code 1\N")
-                                   (Kubed-Ext--Cb-On-Failure
-                                    Ctx (Or (Kubed-Ext--Cb-Read-Stderr Rtype)
-                                            "Kubectl Exited With Code 1"))))))))))
+(defun kubed-ext--cb-update-advice (orig-fn type context &optional namespace)
+  "Around-advice on `kubed-update': wire circuit-breaker accounting.
+ORIG-FN is the original function; TYPE, CONTEXT, and NAMESPACE are
+forwarded unchanged."
+  (funcall orig-fn type context namespace)
+  (when-let ((proc (alist-get 'process
+                              (kubed--alist type context namespace))))
+    (when (process-live-p proc)
+      (let* ((ctx        (or context ""))
+             (rtype      type)
+             (inner-sent (process-sentinel proc)))
+        (set-process-sentinel
+         proc
+         (lambda (p status)
+           (funcall inner-sent p status)
+           (cond
+            ((string= status "finished\n")
+             (kubed-ext--cb-on-success ctx))
+            ((string= status "exited abnormally with code 1\n")
+             (kubed-ext--cb-on-failure
+              ctx (or (kubed-ext--cb-read-stderr rtype)
+                      "kubectl exited with code 1"))))))))))
 
-(Advice-Add 'Kubed-Update :Around #'Kubed-Ext--Cb-Update-Advice)
+(advice-add 'kubed-update :around #'kubed-ext--cb-update-advice)
 
-;; ── `G' Clears The Circuit Before The Manual Refresh Fires ───────
+;; ── `g' clears the circuit before the manual refresh fires ───────
 
-(Defun Kubed-Ext--Cb-Before-Manual-Refresh (&Rest _)
-  "Before-Advice On `Kubed-List-Update': Clear An Open Circuit On `G'.
-This Gives The Cluster An Immediate Retry Without Waiting For A Probe."
-  (When (And (Derived-Mode-P 'Kubed-List-Mode)
-             (Kubed-Ext--Cb-Open-P Kubed-List-Context))
-        (Kubed-Ext--Cb-Reset-State Kubed-List-Context)
-        (Kubed-Ext--Cb-Clear-Headers Kubed-List-Context)
-        (Kubed-Ext--Cb-Refresh-Mode-Lines Kubed-List-Context)))
+(defun kubed-ext--cb-before-manual-refresh (&rest _)
+  "Before-advice on `kubed-list-update': clear an open circuit on `g'.
+This gives the cluster an immediate retry without waiting for a probe."
+  (when (and (derived-mode-p 'kubed-list-mode)
+             (kubed-ext--cb-open-p kubed-list-context))
+    (kubed-ext--cb-reset-state kubed-list-context)
+    (kubed-ext--cb-clear-headers kubed-list-context)
+    (kubed-ext--cb-refresh-mode-lines kubed-list-context)))
 
-(Advice-Add 'Kubed-List-Update :Before #'Kubed-Ext--Cb-Before-Manual-Refresh)
+(advice-add 'kubed-list-update :before #'kubed-ext--cb-before-manual-refresh)
 
-;; ── Manual Reset Command ──────────────────────────────────────────
+;; ── Manual reset command ──────────────────────────────────────────
 
-(Defun Kubed-Ext-Circuit-Breaker-Reset (&Optional Context)
-  "Reset The Circuit Breaker For Context And Resume Auto-Refresh.
-Call This After Reconnecting To Vpn Or Refreshing Expired Credentials.
-With A Prefix Argument, Prompt For Context; Otherwise Use The Context
-Of The Current Buffer Or The Configured Default."
-  (Interactive
-   (List (If Current-Prefix-Arg
-             (Kubed-Read-Context "Reset Circuit For Context"
-                                 (Kubed-Local-Context))
-             (Kubed-Local-Context))))
-  (Let ((Ctx (Or Context (Kubed-Local-Context))))
-       (Kubed-Ext--Cb-Reset-State Ctx)
-       (Kubed-Ext--Cb-Clear-Headers Ctx)
-       (Kubed-Ext--Cb-Refresh-Mode-Lines Ctx)
-       (Kubed-Ext--Cb-In-Context-Bufs
-        Ctx (Lambda ()
-                    (Condition-Case Nil (Kubed-List-Update T)
-                                    (Error Nil))))
-       (Message "Kubed [%S]: Circuit Reset — Auto-Refresh Resumed." Ctx)))
+(defun kubed-ext-circuit-breaker-reset (&optional context)
+  "Reset the circuit breaker for CONTEXT and resume auto-refresh.
+Call this after reconnecting to VPN or refreshing expired credentials.
+With a prefix argument, prompt for CONTEXT; otherwise use the context
+of the current buffer or the configured default."
+  (interactive
+   (list (if current-prefix-arg
+             (kubed-read-context "Reset circuit for context"
+                                 (kubed-local-context))
+           (kubed-local-context))))
+  (let ((ctx (or context (kubed-local-context))))
+    (kubed-ext--cb-reset-state ctx)
+    (kubed-ext--cb-clear-headers ctx)
+    (kubed-ext--cb-refresh-mode-lines ctx)
+    (kubed-ext--cb-in-context-bufs
+     ctx (lambda ()
+           (condition-case nil (kubed-list-update t)
+             (error nil))))
+    (message "Kubed [%s]: circuit reset — auto-refresh resumed." ctx)))
 
-(Keymap-Set Kubed-List-Mode-Map "Z" #'Kubed-Ext-Circuit-Breaker-Reset)
-(Keymap-Set Kubed-Prefix-Map    "Z" #'Kubed-Ext-Circuit-Breaker-Reset)
+(keymap-set kubed-list-mode-map "Z" #'kubed-ext-circuit-breaker-reset)
+(keymap-set kubed-prefix-map    "Z" #'kubed-ext-circuit-breaker-reset)
 
-;; ── Auto-Refresh Tick ─────────────────────────────────────────────
+;; ── Auto-refresh tick ─────────────────────────────────────────────
 
-(Defun Kubed-Ext--Auto-Refresh-Tick ()
-  "Refresh Visible Kubed List Buffers; Skip Any With An Open Circuit.
-Reschedules Itself After Each Tick With A Fresh Random Delay."
-  (Unless (Active-Minibuffer-Window)
-          (Let ((Refreshed 0)
-                (Skipped   0))
-               (Dolist (Win (Window-List))
-                       (Let ((Buf (Window-Buffer Win)))
-                            (When (Buffer-Live-P Buf)
-                                  (With-Current-Buffer Buf
-                                                       (When (Derived-Mode-P 'Kubed-List-Mode)
-                                                             (Cond
-                                                              ;; Circuit Is Open — Skip And Count.
-                                                              ((Kubed-Ext--Cb-Open-P Kubed-List-Context)
-                                                               (Cl-Incf Skipped))
-                                                              ;; An Update Is Already In Progress — Skip Silently.
-                                                              ((Process-Live-P
-                                                                (Alist-Get 'Process
-                                                                           (Kubed--Alist Kubed-List-Type
-                                                                                         Kubed-List-Context
-                                                                                         Kubed-List-Namespace))))
-                                                              ;; Normal Case — Refresh.
-                                                              (T
-                                                               (Condition-Case Nil
-                                                                               (Progn (Kubed-List-Update T) (Cl-Incf Refreshed))
-                                                                               (Error Nil)))))))))
-               (Cond
-                ((And (> Refreshed 0) (> Skipped 0))
-                 (Message "Kubed: Refreshed %D Buffer%S; %D Paused (Circuit Open)."
-                          Refreshed (If (= Refreshed 1) "" "S") Skipped))
-                ((> Refreshed 0)
-                 (Message "Kubed: Auto-Refreshed %D Buffer%S."
-                          Refreshed (If (= Refreshed 1) "" "S"))))))
-  (Kubed-Ext--Auto-Refresh-Schedule))
+(defun kubed-ext--auto-refresh-tick ()
+  "Refresh visible kubed list buffers; skip any with an open circuit.
+Reschedules itself after each tick with a fresh random delay."
+  (unless (active-minibuffer-window)
+    (let ((refreshed 0)
+          (skipped   0))
+      (dolist (win (window-list))
+        (let ((buf (window-buffer win)))
+          (when (buffer-live-p buf)
+            (with-current-buffer buf
+              (when (derived-mode-p 'kubed-list-mode)
+                (cond
+                 ;; Circuit is open — skip and count.
+                 ((kubed-ext--cb-open-p kubed-list-context)
+                  (cl-incf skipped))
+                 ;; An update is already in progress — skip silently.
+                 ((process-live-p
+                   (alist-get 'process
+                              (kubed--alist kubed-list-type
+                                            kubed-list-context
+                                            kubed-list-namespace))))
+                 ;; Normal case — refresh.
+                 (t
+                  (condition-case nil
+                      (progn (kubed-list-update t) (cl-incf refreshed))
+                    (error nil)))))))))
+      (cond
+       ((and (> refreshed 0) (> skipped 0))
+        (message "Kubed: refreshed %d buffer%s; %d paused (circuit open)."
+                 refreshed (if (= refreshed 1) "" "s") skipped))
+       ((> refreshed 0)
+        (message "Kubed: auto-refreshed %d buffer%s."
+                 refreshed (if (= refreshed 1) "" "s"))))))
+  (kubed-ext--auto-refresh-schedule))
 
-;; ── Mode-Line ─────────────────────────────────────────────────────
+;; ── Mode-line ─────────────────────────────────────────────────────
 
-(Setq Kubed-List-Mode-Line-Format
-      '(:Eval
-        (Let* ((Ctx      Kubed-List-Context)
-               (Reason   (And Ctx (Kubed-Ext--Cb-Open-P Ctx)))
-               (Updating (Process-Live-P
-                          (Alist-Get 'Process
-                                     (Kubed--Alist Kubed-List-Type
-                                                   Ctx
-                                                   Kubed-List-Namespace))))
-               (Is-Prod  (And Ctx
-                              (Bound-And-True-P
-                               Kubed-Ext-Production-Context-Regexp)
-                              (Stringp
-                               Kubed-Ext-Production-Context-Regexp)
-                              (String-Match-P
-                               Kubed-Ext-Production-Context-Regexp Ctx))))
-              (Concat
-               ;; ── Context Badge ──────────────────────────────────
-               (When Ctx
-                     (Propertize
-                      (If Is-Prod
-                          (Format " [☢ %S ☢]" Ctx)
-                          (Format " [%S]" Ctx))
-                      'Face      (If Is-Prod 'Error 'Success)
-                      'Help-Echo (Format "Context: %S  (%S)"
-                                         Ctx
-                                         (If Is-Prod "Production" "Non-Prod"))))
-               ;; ── Status Indicators ──────────────────────────────
-               (Cond
-                (Updating
-                 (Propertize " [...]"
-                             'Help-Echo "Kubectl Update In Progress…"))
+(setq kubed-list-mode-line-format
+      '(:eval
+        (let* ((ctx      kubed-list-context)
+               (reason   (and ctx (kubed-ext--cb-open-p ctx)))
+               (updating (process-live-p
+                          (alist-get 'process
+                                     (kubed--alist kubed-list-type
+                                                   ctx
+                                                   kubed-list-namespace))))
+               (is-prod  (and ctx
+                              (bound-and-true-p
+                               kubed-ext-production-context-regexp)
+                              (stringp
+                               kubed-ext-production-context-regexp)
+                              (string-match-p
+                               kubed-ext-production-context-regexp ctx))))
+          (concat
+           ;; ── Context badge ──────────────────────────────────
+           (when ctx
+             (propertize
+              (if is-prod
+                  (format " [☢ %s ☢]" ctx)
+                (format " [%s]" ctx))
+              'face      (if is-prod 'error 'success)
+              'help-echo (format "Context: %s  (%s)"
+                                 ctx
+                                 (if is-prod "PRODUCTION" "non-prod"))))
+           ;; ── Status indicators ──────────────────────────────
+           (cond
+            (updating
+             (propertize " [...]"
+                         'help-echo "kubectl update in progress…"))
 
-                ((Eq Reason 'Network)
-                 (Let ((Secs (Round (Kubed-Ext--Cb-Backoff-For Ctx))))
-                      (Propertize (Format " ⚡~%Ds" Secs)
-                                  'Face      'Error
-                                  'Help-Echo
-                                  (Format (Concat "Network Unreachable For `%S'.\N"
-                                                  "Auto-Refresh Paused; Probing In ~%Ds.\N"
-                                                  "Press `G' Or `Z' To Retry Immediately.")
-                                          Ctx Secs))))
+            ((eq reason 'network)
+             (let ((secs (round (kubed-ext--cb-backoff-for ctx))))
+               (propertize (format " ⚡~%ds" secs)
+                           'face      'error
+                           'help-echo
+                           (format (concat "Network unreachable for `%s'.\n"
+                                           "Auto-refresh paused; probing in ~%ds.\n"
+                                           "Press `g' or `Z' to retry immediately.")
+                                   ctx secs))))
 
-                ((Eq Reason 'Auth)
-                 (Propertize " 🔑 Re-Auth"
-                             'Face      'Warning
-                             'Help-Echo
-                             (Format (Concat "Credentials Expired For `%S'.\N"
-                                             "Re-Authenticate, Then Press `G' Or `Z'.")
-                                     Ctx)))
+            ((eq reason 'auth)
+             (propertize " 🔑 re-auth"
+                         'face      'warning
+                         'help-echo
+                         (format (concat "Credentials expired for `%s'.\n"
+                                         "Re-authenticate, then press `g' or `Z'.")
+                                 ctx)))
 
-                (T
-                 (Concat
-                  (When Kubed-List-Filter
-                        (Propertize
-                         (Format " [%S]"
-                                 (Mapconcat #'Prin1-To-String
-                                            Kubed-List-Filter " "))
-                         'Help-Echo "Active S-Expression Filter"))
-                  (When (Bound-And-True-P Kubed-Ext-List-Label-Selector)
-                        (Propertize
-                         (Format " {%S}" Kubed-Ext-List-Label-Selector)
-                         'Help-Echo "Active Label Selector"
-                         'Face      'Warning))
-                  (When (And (Bound-And-True-P Kubed-Ext-Resource-Filter)
-                             (Not (String-Empty-P Kubed-Ext-Resource-Filter)))
-                        (Propertize
-                         (Format " /%S/" Kubed-Ext-Resource-Filter)
-                         'Help-Echo "Active Substring Filter"
-                         'Face      'Italic)))))))))
+            (t
+             (concat
+              (when kubed-list-filter
+                (propertize
+                 (format " [%s]"
+                         (mapconcat #'prin1-to-string
+                                    kubed-list-filter " "))
+                 'help-echo "Active s-expression filter"))
+              (when (bound-and-true-p kubed-ext-list-label-selector)
+                (propertize
+                 (format " {%s}" kubed-ext-list-label-selector)
+                 'help-echo "Active label selector"
+                 'face      'warning))
+              (when (and (bound-and-true-p kubed-ext-resource-filter)
+                         (not (string-empty-p kubed-ext-resource-filter)))
+                (propertize
+                 (format " /%s/" kubed-ext-resource-filter)
+                 'help-echo "Active substring filter"
+                 'face      'italic)))))))))
 
 ;;; ═══════════════════════════════════════════════════════════════
-;;; § 22.  Enhanced Log Filtering And Parallel Streaming
+;;; § 22.  Enhanced Log Filtering and Parallel Streaming
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defgroup Kubed-Ext-Logs Nil
-  "Kubernetes Log Filtering And Parallel Streaming."
-  :Group 'Kubed-Ext)
+(defgroup kubed-ext-logs nil
+  "Kubernetes log filtering and parallel streaming."
+  :group 'kubed-ext)
 
-(Defcustom Kubed-Ext-Log-Error-Pattern
-  "Exception\\|Error\\|Critical\\|Failure\\|Fatal\\|Panic"
-  "Case-Insensitive Regex For Filtering Error Log Lines."
-  :Type 'String
-  :Group 'Kubed-Ext-Logs)
+(defcustom kubed-ext-log-error-pattern
+  "exception\\|error\\|critical\\|failure\\|fatal\\|panic"
+  "Case-insensitive regex for filtering error log lines."
+  :type 'string
+  :group 'kubed-ext-logs)
 
-(Defcustom Kubed-Ext-Log-Parallel-Limit 5
-  "Maximum Simultaneous Kubectl Log Processes For Parallel Streaming."
-  :Type 'Natnum
-  :Group 'Kubed-Ext-Logs)
+(defcustom kubed-ext-log-parallel-limit 5
+  "Maximum simultaneous kubectl log processes for parallel streaming."
+  :type 'natnum
+  :group 'kubed-ext-logs)
 
-(Defcustom Kubed-Ext-Log-Default-Since "1h"
-  "Default --Since Duration For Filtered Log Commands (E.G. \"30m\", \"24h\")."
-  :Type 'String
-  :Group 'Kubed-Ext-Logs)
+(defcustom kubed-ext-log-default-since "1h"
+  "Default --since duration for filtered log commands (e.g. \"30m\", \"24h\")."
+  :type 'string
+  :group 'kubed-ext-logs)
 
-(Defcustom Kubed-Ext-Log-Use-External-Filter 'Auto
-  "Controls Whether Rg/Grep Or Emacs-Native Filtering Is Used.
+(defcustom kubed-ext-log-use-external-filter 'auto
+  "Controls whether rg/grep or Emacs-native filtering is used.
 
-`Auto'  — Prefer Rg, Then Grep, Then Emacs-Native.
-`Emacs' — Always Emacs-Native (Portable, No Colour).
-`Shell' — Always Shell Pipeline; Error If Neither Rg Nor Grep Found."
-  :Type '(Choice (Const :Tag "Auto-Detect (Rg > Grep > Emacs)" Auto)
-                 (Const :Tag "Emacs-Native Only"               Emacs)
-                 (Const :Tag "Shell Pipeline Only"             Shell))
-  :Group 'Kubed-Ext-Logs)
+`auto'  — prefer rg, then grep, then Emacs-native.
+`emacs' — always Emacs-native (portable, no colour).
+`shell' — always shell pipeline; error if neither rg nor grep found."
+  :type '(choice (const :tag "Auto-detect (rg > grep > Emacs)" auto)
+                 (const :tag "Emacs-native only"               emacs)
+                 (const :tag "Shell pipeline only"             shell))
+  :group 'kubed-ext-logs)
 
-(Defvar Kubed-Ext-Log-Filter-History Nil
-  "Minibuffer History For Log-Filter Pattern Prompts.")
+(defvar kubed-ext-log-filter-history nil
+  "Minibuffer history for log-filter pattern prompts.")
 
-;;; ─── Tool Selection ───────────────────────────────────────────
+;;; ─── Tool selection ───────────────────────────────────────────
 
-(Defun Kubed-Ext--Log-Shell-Filter-Cmd (Pattern)
-  "Return A Shell Command String Filtering Stdin For Pattern, Or Nil."
-  (Cond
-   ((Executable-Find "Rg")
-    (Concat "Rg --Color=Always --Line-Buffered -I "
-            (Shell-Quote-Argument Pattern)))
-   ((Executable-Find "Grep")
-    (Concat "Grep --Line-Buffered -Ei "
-            (Shell-Quote-Argument Pattern)))
-   (T Nil)))
+(defun kubed-ext--log-shell-filter-cmd (pattern)
+  "Return a shell command string filtering stdin for PATTERN, or nil."
+  (cond
+   ((executable-find "rg")
+    (concat "rg --color=always --line-buffered -i "
+            (shell-quote-argument pattern)))
+   ((executable-find "grep")
+    (concat "grep --line-buffered -Ei "
+            (shell-quote-argument pattern)))
+   (t nil)))
 
-(Defun Kubed-Ext--Log-Use-Shell-P (Pattern)
-  "Return Non-Nil When A Shell Pipeline Should Be Used To Filter Pattern."
-  (When (And (Stringp Pattern) (Not (String-Empty-P Pattern)))
-        (Pcase Kubed-Ext-Log-Use-External-Filter
-               ('Emacs Nil)
-               ('Shell
-                (Unless (Kubed-Ext--Log-Shell-Filter-Cmd Pattern)
-                        (User-Error
-                         "No Rg Or Grep Found; Set `Kubed-Ext-Log-Use-External-Filter' To `Emacs'"))
-                T)
-               (_ (Not (Null (Kubed-Ext--Log-Shell-Filter-Cmd Pattern)))))))
+(defun kubed-ext--log-use-shell-p (pattern)
+  "Return non-nil when a shell pipeline should be used to filter PATTERN."
+  (when (and (stringp pattern) (not (string-empty-p pattern)))
+    (pcase kubed-ext-log-use-external-filter
+      ('emacs nil)
+      ('shell
+       (unless (kubed-ext--log-shell-filter-cmd pattern)
+         (user-error
+          "No rg or grep found; set `kubed-ext-log-use-external-filter' to `emacs'"))
+       t)
+      (_ (not (null (kubed-ext--log-shell-filter-cmd pattern)))))))
 
-;;; ─── Filter Prompt ────────────────────────────────────────────
+;;; ─── Filter prompt ────────────────────────────────────────────
 
-(Defun Kubed-Ext--Read-Log-Filter (Prompt &Optional Default)
-  "Prompt With Prompt For A Log-Filter Regex, Defaulting To Default."
-  (Let* ((Opt-Err    (Concat "(Errors)  " Kubed-Ext-Log-Error-Pattern))
-         (Opt-None   "(None)    Show All Lines")
-         (Opt-Custom "(Custom)  Enter Pattern…")
-         (Choice     (Completing-Read
-                      (Format-Prompt Prompt (Or Default ""))
-                      (List Opt-Err Opt-None Opt-Custom)
-                      Nil Nil Nil
-                      'Kubed-Ext-Log-Filter-History
-                      (Or Default ""))))
-        (Cond
-         ((String= Choice Opt-Err)    Kubed-Ext-Log-Error-Pattern)
-         ((String= Choice Opt-None)   "")
-         ((String= Choice Opt-Custom)
-          (Read-String (Format-Prompt "Pattern" Default)
-                       Default 'Kubed-Ext-Log-Filter-History))
-         (T Choice))))
+(defun kubed-ext--read-log-filter (prompt &optional default)
+  "Prompt with PROMPT for a log-filter regex, defaulting to DEFAULT."
+  (let* ((opt-err    (concat "(errors)  " kubed-ext-log-error-pattern))
+         (opt-none   "(none)    show all lines")
+         (opt-custom "(custom)  enter pattern…")
+         (choice     (completing-read
+                      (format-prompt prompt (or default ""))
+                      (list opt-err opt-none opt-custom)
+                      nil nil nil
+                      'kubed-ext-log-filter-history
+                      (or default ""))))
+    (cond
+     ((string= choice opt-err)    kubed-ext-log-error-pattern)
+     ((string= choice opt-none)   "")
+     ((string= choice opt-custom)
+      (read-string (format-prompt "Pattern" default)
+                   default 'kubed-ext-log-filter-history))
+     (t choice))))
 
-;;; ─── Emacs-Native Line Filter ─────────────────────────────────
+;;; ─── Emacs-native line filter ─────────────────────────────────
 
-(Defun Kubed-Ext--Make-Line-Filter (Pattern)
-  "Return A `Process-Filter' Closure Keeping Only Lines Matching Pattern.
-Case-Insensitive.  Partial Lines Are Buffered Across Output Chunks."
-  (Let ((Acc ""))
-       (Lambda (Proc String)
-               (When (Buffer-Live-P (Process-Buffer Proc))
-                     (Let* ((Combined        (Concat Acc String))
-                            (Lines           (Split-String Combined "\N"))
-                            (Complete        (Butlast Lines))
-                            (Tail            (Car (Last Lines)))
-                            (Case-Fold-Search T))
-                           (Setq Acc (Or Tail ""))
-                           (With-Current-Buffer (Process-Buffer Proc)
-                                                (Let ((Inhibit-Read-Only T))
-                                                     (Goto-Char (Point-Max))
-                                                     (Dolist (Line Complete)
-                                                             (When (Or (Null Pattern)
-                                                                       (String-Empty-P Pattern)
-                                                                       (String-Match-P Pattern Line))
-                                                                   (Insert Line "\N"))))))))))
+(defun kubed-ext--make-line-filter (pattern)
+  "Return a `process-filter' closure keeping only lines matching PATTERN.
+Case-insensitive.  Partial lines are buffered across output chunks."
+  (let ((acc ""))
+    (lambda (proc string)
+      (when (buffer-live-p (process-buffer proc))
+        (let* ((combined        (concat acc string))
+               (lines           (split-string combined "\n"))
+               (complete        (butlast lines))
+               (tail            (car (last lines)))
+               (case-fold-search t))
+          (setq acc (or tail ""))
+          (with-current-buffer (process-buffer proc)
+            (let ((inhibit-read-only t))
+              (goto-char (point-max))
+              (dolist (line complete)
+                (when (or (null pattern)
+                          (string-empty-p pattern)
+                          (string-match-p pattern line))
+                  (insert line "\n"))))))))))
 
-;;; ─── Ansi-Color Filter ────────────────────────────────────────
+;;; ─── ANSI-color filter ────────────────────────────────────────
 
-(Defun Kubed-Ext--Log-Ansi-Filter (Proc String)
-  "Process Filter Inserting String Into Proc'S Buffer With Ansi Decoding."
-  (Require 'Ansi-Color)
-  (When (Buffer-Live-P (Process-Buffer Proc))
-        (With-Current-Buffer (Process-Buffer Proc)
-                             (Let ((Inhibit-Read-Only T)
-                                   (Beg               (Point-Max)))
-                                  (Goto-Char Beg)
-                                  (Insert String)
-                                  (Ansi-Color-Apply-On-Region Beg (Point-Max))))))
+(defun kubed-ext--log-ansi-filter (proc string)
+  "Process filter inserting STRING into PROC's buffer with ANSI decoding."
+  (require 'ansi-color)
+  (when (buffer-live-p (process-buffer proc))
+    (with-current-buffer (process-buffer proc)
+      (let ((inhibit-read-only t)
+            (beg               (point-max)))
+        (goto-char beg)
+        (insert string)
+        (ansi-color-apply-on-region beg (point-max))))))
 
-;;; ─── Core Launch Helper ───────────────────────────────────────
+;;; ─── Core launch helper ───────────────────────────────────────
 
-(Defun Kubed-Ext--Launch-Log-Process (Buf Kubectl-Args Filter-Pattern)
-  "Start A Kubectl Process Writing To Buf, Optionally Filtered.
+(defun kubed-ext--launch-log-process (buf kubectl-args filter-pattern)
+  "Start a kubectl process writing to BUF, optionally filtered.
 
-Kubectl-Args Must Contain Only Strings — Callers Are Responsible For
-Omitting Nil Values Via `Append' + `When' Guards.
-Filter-Pattern Is A Regex String, Or Nil/Empty For No Filtering."
-  (Let* ((Pattern   (And (Stringp Filter-Pattern)
-                         (Not (String-Empty-P Filter-Pattern))
-                         Filter-Pattern))
-         (Use-Shell (Kubed-Ext--Log-Use-Shell-P Pattern)))
-        (If Use-Shell
-            (Let* ((Filt-Cmd (Kubed-Ext--Log-Shell-Filter-Cmd Pattern))
-                   (Kube-Cmd (Mapconcat #'Shell-Quote-Argument
-                                        (Cons Kubed-Kubectl-Program Kubectl-Args)
-                                        " "))
-                   (Full-Cmd (Format "%S | %S" Kube-Cmd Filt-Cmd))
-                   (Proc     (Start-Process-Shell-Command
-                              "*Kubed-Logs-Filtered*" Buf Full-Cmd)))
-                  (When (Executable-Find "Rg")
-                        (Set-Process-Filter Proc #'Kubed-Ext--Log-Ansi-Filter))
-                  (Set-Process-Sentinel
-                   Proc
-                   (Lambda (_P Status)
-                           (When (Buffer-Live-P Buf)
-                                 (With-Current-Buffer Buf
-                                                      (Let ((Inhibit-Read-Only T))
-                                                           (Cond
-                                                            ((String= Status "Finished\N") Nil)
-                                                            ((String= Status "Exited Abnormally With Code 1\N")
-                                                             (Goto-Char (Point-Max))
-                                                             (Insert (Propertize "(No Matching Lines Found)\N"
-                                                                                 'Face 'Shadow)))
-                                                            (T
-                                                             (Goto-Char (Point-Max))
-                                                             (Insert (Propertize
-                                                                      (Format "[Process: %S]\N" (String-Trim Status))
-                                                                      'Face 'Error)))))))))
-                  Proc)
-            (Let ((Proc (Apply #'Start-Process "*Kubed-Logs*" Buf
-                               Kubed-Kubectl-Program Kubectl-Args)))
-                 (When Pattern
-                       (Set-Process-Filter Proc (Kubed-Ext--Make-Line-Filter Pattern)))
-                 Proc))))
+KUBECTL-ARGS must contain only strings — callers are responsible for
+omitting nil values via `append' + `when' guards.
+FILTER-PATTERN is a regex string, or nil/empty for no filtering."
+  (let* ((pattern   (and (stringp filter-pattern)
+                         (not (string-empty-p filter-pattern))
+                         filter-pattern))
+         (use-shell (kubed-ext--log-use-shell-p pattern)))
+    (if use-shell
+        (let* ((filt-cmd (kubed-ext--log-shell-filter-cmd pattern))
+               (kube-cmd (mapconcat #'shell-quote-argument
+                                    (cons kubed-kubectl-program kubectl-args)
+                                    " "))
+               (full-cmd (format "%s | %s" kube-cmd filt-cmd))
+               (proc     (start-process-shell-command
+                          "*kubed-logs-filtered*" buf full-cmd)))
+          (when (executable-find "rg")
+            (set-process-filter proc #'kubed-ext--log-ansi-filter))
+          (set-process-sentinel
+           proc
+           (lambda (_p status)
+             (when (buffer-live-p buf)
+               (with-current-buffer buf
+                 (let ((inhibit-read-only t))
+                   (cond
+                    ((string= status "finished\n") nil)
+                    ((string= status "exited abnormally with code 1\n")
+                     (goto-char (point-max))
+                     (insert (propertize "(no matching lines found)\n"
+                                         'face 'shadow)))
+                    (t
+                     (goto-char (point-max))
+                     (insert (propertize
+                              (format "[process: %s]\n" (string-trim status))
+                              'face 'error)))))))))
+          proc)
+      (let ((proc (apply #'start-process "*kubed-logs*" buf
+                         kubed-kubectl-program kubectl-args)))
+        (when pattern
+          (set-process-filter proc (kubed-ext--make-line-filter pattern)))
+        proc))))
 
-;;; ─── Pod: Error Logs ──────────────────────────────────────────
+;;; ─── Pod: error logs ──────────────────────────────────────────
 
-(Defun Kubed-Ext-Pods-Logs-Errors (Click)
-  "Show Error-Filtered Logs For The Pod At Click Position."
-  (Interactive (List Last-Nonmenu-Event) Kubed-Pods-Mode)
-  (If-Let ((Pod (Kubed-Ext--Resource-At-Event Click)))
-          (Let* ((Ctx  Kubed-List-Context)
-                 (Ns   Kubed-List-Namespace)
-                 (Args (Append
-                        (List "Logs" Pod
-                              "--All-Containers"
-                              "--Prefix"
-                              "--Since" Kubed-Ext-Log-Default-Since)
-                        (When Ctx (List "--Context" Ctx))
-                        (When Ns  (List "-N" Ns))))
-                 (Buf  (Generate-New-Buffer
-                        (Format "*Kubed-Logs-Errors Pods/%S@%S[%S]*"
-                                Pod (Or Ns "Default") (Or Ctx "Current")))))
-                (With-Current-Buffer Buf (Run-Hooks 'Kubed-Logs-Setup-Hook))
-                (Kubed-Ext--Launch-Log-Process Buf Args Kubed-Ext-Log-Error-Pattern)
-                (Display-Buffer Buf))
-          (User-Error "No Kubernetes Pod At Point")))
+(defun kubed-ext-pods-logs-errors (click)
+  "Show error-filtered logs for the pod at CLICK position."
+  (interactive (list last-nonmenu-event) kubed-pods-mode)
+  (if-let ((pod (kubed-ext--resource-at-event click)))
+      (let* ((ctx  kubed-list-context)
+             (ns   kubed-list-namespace)
+             (args (append
+                    (list "logs" pod
+                          "--all-containers"
+                          "--prefix"
+                          "--since" kubed-ext-log-default-since)
+                    (when ctx (list "--context" ctx))
+                    (when ns  (list "-n" ns))))
+             (buf  (generate-new-buffer
+                    (format "*kubed-logs-errors pods/%s@%s[%s]*"
+                            pod (or ns "default") (or ctx "current")))))
+        (with-current-buffer buf (run-hooks 'kubed-logs-setup-hook))
+        (kubed-ext--launch-log-process buf args kubed-ext-log-error-pattern)
+        (display-buffer buf))
+    (user-error "No Kubernetes pod at point")))
 
-;;; ─── Pod: Custom-Filtered Logs ────────────────────────────────
+;;; ─── Pod: custom-filtered logs ────────────────────────────────
 
-(Defun Kubed-Ext-Pods-Logs-Custom-Filter (Click)
-  "Show Filtered Logs For The Pod At Click, Prompting For Options."
-  (Interactive (List Last-Nonmenu-Event) Kubed-Pods-Mode)
-  (If-Let ((Pod (Kubed-Ext--Resource-At-Event Click)))
-          (Let* ((Ctx       Kubed-List-Context)
-                 (Ns        Kubed-List-Namespace)
-                 (Filt      (Kubed-Ext--Read-Log-Filter
-                             "Filter Pattern" Kubed-Ext-Log-Error-Pattern))
-                 (Since     (Read-String (Format-Prompt "Since"
-                                                        Kubed-Ext-Log-Default-Since)
-                                         Nil Nil Kubed-Ext-Log-Default-Since))
-                 (Follow    (Y-Or-N-P "Follow (Stream) Logs? "))
-                 ;; Ask All-Containers First; Only Prompt For A Specific
-                 ;; Container When The User Says No.
-                 (All-Con   (Y-Or-N-P "All Containers? "))
-                 (Container (Unless All-Con
-                                    (Kubed-Read-Container Pod "Container" T Ctx Ns)))
-                 (Args      (Append
-                             (List "Logs" Pod "--Prefix" "--Since" Since)
-                             (When Ctx     (List "--Context" Ctx))
-                             (When Ns      (List "-N" Ns))
-                             (When Follow  '("--Follow"))
-                             (If All-Con
-                                 '("--All-Containers")
-                                 (List "-C" Container))))
-                 (Buf       (Generate-New-Buffer
-                             (Format "*Kubed-Logs-Filtered Pods/%S@%S[%S]*"
-                                     Pod (Or Ns "Default") (Or Ctx "Current")))))
-                (With-Current-Buffer Buf (Run-Hooks 'Kubed-Logs-Setup-Hook))
-                (Kubed-Ext--Launch-Log-Process Buf Args Filt)
-                (Display-Buffer Buf))
-          (User-Error "No Kubernetes Pod At Point")))
+(defun kubed-ext-pods-logs-custom-filter (click)
+  "Show filtered logs for the pod at CLICK, prompting for options."
+  (interactive (list last-nonmenu-event) kubed-pods-mode)
+  (if-let ((pod (kubed-ext--resource-at-event click)))
+      (let* ((ctx       kubed-list-context)
+             (ns        kubed-list-namespace)
+             (filt      (kubed-ext--read-log-filter
+                         "Filter pattern" kubed-ext-log-error-pattern))
+             (since     (read-string (format-prompt "Since"
+                                                    kubed-ext-log-default-since)
+                                     nil nil kubed-ext-log-default-since))
+             (follow    (y-or-n-p "Follow (stream) logs? "))
+             ;; Ask all-containers first; only prompt for a specific
+             ;; container when the user says no.
+             (all-con   (y-or-n-p "All containers? "))
+             (container (unless all-con
+                          (kubed-read-container pod "Container" t ctx ns)))
+             (args      (append
+                         (list "logs" pod "--prefix" "--since" since)
+                         (when ctx     (list "--context" ctx))
+                         (when ns      (list "-n" ns))
+                         (when follow  '("--follow"))
+                         (if all-con
+                             '("--all-containers")
+                           (list "-c" container))))
+             (buf       (generate-new-buffer
+                         (format "*kubed-logs-filtered pods/%s@%s[%s]*"
+                                 pod (or ns "default") (or ctx "current")))))
+        (with-current-buffer buf (run-hooks 'kubed-logs-setup-hook))
+        (kubed-ext--launch-log-process buf args filt)
+        (display-buffer buf))
+    (user-error "No Kubernetes pod at point")))
 
-;;; ─── Standalone: Error Logs For Any Resource ──────────────────
+;;; ─── Standalone: error logs for any resource ──────────────────
 
-;;;###Autoload
-(Defun Kubed-Ext-Logs-Errors (&Optional Context Namespace)
-  "Show Error-Filtered Logs For A Kubernetes Resource (Context And Namespace)."
-  (Interactive
-   (Let* ((C (Kubed-Local-Context))
-          (C (If (Equal Current-Prefix-Arg '(16))
-                 (Kubed-Read-Context "Context" C) C))
-          (N (Kubed--Namespace C Current-Prefix-Arg)))
-         (List C N)))
-  (Let* ((Ctx    (Or Context (Kubed-Local-Context)))
-         (Ns     (Or Namespace (Kubed--Namespace Ctx)))
-         (Type   (Kubed-Read-Resource-Type "Resource Type" Nil Ctx))
-         (Res    (Kubed-Read-Resource-Name Type "Error Logs For" Nil Nil Ctx Ns))
-         (Since  (Read-String (Format-Prompt "Since" Kubed-Ext-Log-Default-Since)
-                              Nil Nil Kubed-Ext-Log-Default-Since))
-         (Follow (Y-Or-N-P "Follow (Stream) Logs? "))
-         (Args   (Append
-                  (List "Logs" (Concat Type "/" Res)
-                        "--Prefix"
-                        "--Since" Since)
-                  (When Ctx    (List "--Context" Ctx))
-                  (When Ns     (List "-N" Ns))
-                  (When Follow '("--Follow"))))
-         (Buf    (Generate-New-Buffer
-                  (Format "*Kubed-Logs-Errors %S/%S@%S[%S]*"
-                          Type Res (Or Ns "Default") Ctx))))
-        (With-Current-Buffer Buf (Run-Hooks 'Kubed-Logs-Setup-Hook))
-        (Kubed-Ext--Launch-Log-Process Buf Args Kubed-Ext-Log-Error-Pattern)
-        (Display-Buffer Buf)))
+;;;###autoload
+(defun kubed-ext-logs-errors (&optional context namespace)
+  "Show error-filtered logs for a Kubernetes resource (CONTEXT and NAMESPACE)."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg)))
+     (list c n)))
+  (let* ((ctx    (or context (kubed-local-context)))
+         (ns     (or namespace (kubed--namespace ctx)))
+         (type   (kubed-read-resource-type "Resource type" nil ctx))
+         (res    (kubed-read-resource-name type "Error logs for" nil nil ctx ns))
+         (since  (read-string (format-prompt "Since" kubed-ext-log-default-since)
+                              nil nil kubed-ext-log-default-since))
+         (follow (y-or-n-p "Follow (stream) logs? "))
+         (args   (append
+                  (list "logs" (concat type "/" res)
+                        "--prefix"
+                        "--since" since)
+                  (when ctx    (list "--context" ctx))
+                  (when ns     (list "-n" ns))
+                  (when follow '("--follow"))))
+         (buf    (generate-new-buffer
+                  (format "*kubed-logs-errors %s/%s@%s[%s]*"
+                          type res (or ns "default") ctx))))
+    (with-current-buffer buf (run-hooks 'kubed-logs-setup-hook))
+    (kubed-ext--launch-log-process buf args kubed-ext-log-error-pattern)
+    (display-buffer buf)))
 
-;;; ─── Standalone: Logs By Label With Filtering ─────────────────
+;;; ─── Standalone: logs by label with filtering ─────────────────
 
-;;;###Autoload
-(Defun Kubed-Ext-Logs-By-Label-Filtered (&Optional Context Namespace)
-  "Stream Filtered Logs For Pods Matching A Label Selector (Context And Namespace)."
-  (Interactive
-   (Let* ((C (Kubed-Local-Context))
-          (C (If (Equal Current-Prefix-Arg '(16))
-                 (Kubed-Read-Context "Context" C) C))
-          (N (Kubed--Namespace C Current-Prefix-Arg)))
-         (List C N)))
-  (Let* ((Ctx      (Or Context (Kubed-Local-Context)))
-         (Ns       (Or Namespace (Kubed--Namespace Ctx)))
-         (Labels   (Kubed-Ext-Discover-Labels "Pods" Ctx Ns))
-         (Selector (Completing-Read "Label Selector: " Labels Nil Nil
-                                    Nil 'Kubed-Ext-Label-Selector-History))
-         (Filt     (Kubed-Ext--Read-Log-Filter
-                    "Filter Pattern" Kubed-Ext-Log-Error-Pattern))
-         (Since    (Read-String (Format-Prompt "Since" Kubed-Ext-Log-Default-Since)
-                                Nil Nil Kubed-Ext-Log-Default-Since))
-         (Follow   (Y-Or-N-P "Follow (Stream) Logs? "))
-         (Args     (Append
-                    (List "Logs" "-L" Selector
-                          "--All-Containers=True"
-                          "--Prefix"
-                          "--Since" Since)
-                    (When Ctx    (List "--Context" Ctx))
-                    (When Ns     (List "-N" Ns))
-                    (When Follow '("--Follow"))))
-         (Buf      (Generate-New-Buffer
-                    (Format "*Kubed-Logs-Filtered -L %S@%S[%S]*"
-                            Selector (Or Ns "Default") Ctx))))
-        (With-Current-Buffer Buf (Run-Hooks 'Kubed-Logs-Setup-Hook))
-        (Kubed-Ext--Launch-Log-Process Buf Args Filt)
-        (Display-Buffer Buf)))
+;;;###autoload
+(defun kubed-ext-logs-by-label-filtered (&optional context namespace)
+  "Stream filtered logs for pods matching a label selector (CONTEXT and NAMESPACE)."
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg)))
+     (list c n)))
+  (let* ((ctx      (or context (kubed-local-context)))
+         (ns       (or namespace (kubed--namespace ctx)))
+         (labels   (kubed-ext-discover-labels "pods" ctx ns))
+         (selector (completing-read "Label selector: " labels nil nil
+                                    nil 'kubed-ext-label-selector-history))
+         (filt     (kubed-ext--read-log-filter
+                    "Filter pattern" kubed-ext-log-error-pattern))
+         (since    (read-string (format-prompt "Since" kubed-ext-log-default-since)
+                                nil nil kubed-ext-log-default-since))
+         (follow   (y-or-n-p "Follow (stream) logs? "))
+         (args     (append
+                    (list "logs" "-l" selector
+                          "--all-containers=true"
+                          "--prefix"
+                          "--since" since)
+                    (when ctx    (list "--context" ctx))
+                    (when ns     (list "-n" ns))
+                    (when follow '("--follow"))))
+         (buf      (generate-new-buffer
+                    (format "*kubed-logs-filtered -l %s@%s[%s]*"
+                            selector (or ns "default") ctx))))
+    (with-current-buffer buf (run-hooks 'kubed-logs-setup-hook))
+    (kubed-ext--launch-log-process buf args filt)
+    (display-buffer buf)))
 
-;;; ─── Pod Discovery By Selector ────────────────────────────────
+;;; ─── Pod discovery by selector ────────────────────────────────
 
-(Defun Kubed-Ext--Pods-By-Selector (Selector Context Namespace)
-  "Return Sorted Pod Names Matching Selector In Context/Namespace, Or Nil."
-  (Condition-Case Err
-                  (Let ((Output
-                         (With-Temp-Buffer
-                          (Apply #'Call-Process
-                                 Kubed-Kubectl-Program Nil '(T Nil) Nil
-                                 (Append
-                                  (List "Get" "Pods"
-                                        "-L"           Selector
-                                        "--No-Headers"
-                                        "-O"           "Custom-Columns=Name:.Metadata.Name")
-                                  (When Context   (List "--Context" Context))
-                                  (When Namespace (List "-N"        Namespace))))
-                          (Buffer-String))))
-                       (Sort (Seq-Filter (Lambda (S) (Not (String-Empty-P (String-Trim S))))
-                                         (Split-String Output "\N" T))
-                             #'String<))
-                  (Error
-                   (Message "Kubed-Ext: Cannot List Pods: %S" (Error-Message-String Err))
-                   Nil)))
+(defun kubed-ext--pods-by-selector (selector context namespace)
+  "Return sorted pod names matching SELECTOR in CONTEXT/NAMESPACE, or nil."
+  (condition-case err
+      (let ((output
+             (with-temp-buffer
+               (apply #'call-process
+                      kubed-kubectl-program nil '(t nil) nil
+                      (append
+                       (list "get" "pods"
+                             "-l"           selector
+                             "--no-headers"
+                             "-o"           "custom-columns=NAME:.metadata.name")
+                       (when context   (list "--context" context))
+                       (when namespace (list "-n"        namespace))))
+               (buffer-string))))
+        (sort (seq-filter (lambda (s) (not (string-empty-p (string-trim s))))
+                          (split-string output "\n" t))
+              #'string<))
+    (error
+     (message "kubed-ext: cannot list pods: %s" (error-message-string err))
+     nil)))
 
-;;; ─── Post-Hoc Filter On Existing Log Buffer ───────────────────
+;;; ─── Post-hoc filter on existing log buffer ───────────────────
 
-(Defun Kubed-Ext-Filter-Log-Buffer (Pattern)
-  "Show Lines From The Current Buffer Matching Pattern Using `Occur'."
-  (Interactive
-   (List (Kubed-Ext--Read-Log-Filter
-          "Filter Log Buffer" Kubed-Ext-Log-Error-Pattern)))
-  (When (Or (Null Pattern) (String-Empty-P (String-Trim Pattern)))
-        (User-Error "No Filter Pattern Specified"))
-  (Let ((Case-Fold-Search T))
-       (Occur Pattern)))
+(defun kubed-ext-filter-log-buffer (pattern)
+  "Show lines from the current buffer matching PATTERN using `occur'."
+  (interactive
+   (list (kubed-ext--read-log-filter
+          "Filter log buffer" kubed-ext-log-error-pattern)))
+  (when (or (null pattern) (string-empty-p (string-trim pattern)))
+    (user-error "No filter pattern specified"))
+  (let ((case-fold-search t))
+    (occur pattern)))
 
 ;;; ─── Keybindings § 22 ─────────────────────────────────────────
 
-(Keymap-Set Kubed-Pods-Mode-Map "E"   #'Kubed-Ext-Pods-Logs-Errors)
-(Keymap-Set Kubed-Pods-Mode-Map "H"   #'Kubed-Ext-Pods-Logs-Custom-Filter)
-(Keymap-Set Kubed-Prefix-Map    "E"   #'Kubed-Ext-Logs-Errors)
-(Keymap-Set Kubed-Prefix-Map    "L F" #'Kubed-Ext-Logs-By-Label-Filtered)
-(Keymap-Set Kubed-Prefix-Map    "L P" #'Kubed-Ext-Logs-Parallel-By-Label)
-(Keymap-Set Kubed-Prefix-Map    "L O" #'Kubed-Ext-Filter-Log-Buffer)
+(keymap-set kubed-pods-mode-map "E"   #'kubed-ext-pods-logs-errors)
+(keymap-set kubed-pods-mode-map "H"   #'kubed-ext-pods-logs-custom-filter)
+(keymap-set kubed-prefix-map    "e"   #'kubed-ext-logs-errors)
+(keymap-set kubed-prefix-map    "l f" #'kubed-ext-logs-by-label-filtered)
+(keymap-set kubed-prefix-map    "l p" #'kubed-ext-logs-parallel-by-label)
+(keymap-set kubed-prefix-map    "l o" #'kubed-ext-filter-log-buffer)
 
-;;; ─── Extend Pod Transient Suffixes ────────────────────────────
+;;; ─── Extend pod transient suffixes ────────────────────────────
 
-(Let ((Entry (Assoc "Pods" Kubed-Ext-Extra-Transient-Suffixes)))
-     (When Entry
-           (Setcdr Entry
-                   (Append (Cdr Entry)
-                           '(("Le" "Error Logs"
-                              Kubed-Ext-Pods-Logs-Errors)
-                             ("Lf" "Filter Logs (Custom)"
-                              Kubed-Ext-Pods-Logs-Custom-Filter)
-                             ("Lp" "Parallel Logs By Label"
-                              Kubed-Ext-Logs-Parallel-By-Label))))))
+(let ((entry (assoc "pods" kubed-ext-extra-transient-suffixes)))
+  (when entry
+    (setcdr entry
+            (append (cdr entry)
+                    '(("le" "Error logs"
+                       kubed-ext-pods-logs-errors)
+                      ("lf" "Filter logs (custom)"
+                       kubed-ext-pods-logs-custom-filter)
+                      ("lp" "Parallel logs by label"
+                       kubed-ext-logs-parallel-by-label))))))
 
 ;;; ═══════════════════════════════════════════════════════════════
-;;; § 22b.  Log Filtering For Deployments And Generic Workloads
+;;; § 22b.  Log Filtering for Deployments and Generic Workloads
 ;;; ═══════════════════════════════════════════════════════════════
 
-;;; ─── Matchexpression → Selector Segment ───────────────────────
+;;; ─── matchExpression → selector segment ───────────────────────
 
-(Defun Kubed-Ext--Matchexpr-To-Selector (Expr)
-  "Convert A Kubernetes Matchexpression Expr Alist To A Selector String.
-Returns Nil For Unsupported Operators."
-  (Let ((Key  (Alist-Get 'Key      Expr))
-        (Op   (Alist-Get 'Operator Expr))
-        (Vals (Alist-Get 'Values   Expr)))
-       (And (Stringp Key)
-            (Stringp Op)
-            (Pcase Op
-                   ("Exists"       Key)
-                   ("Doesnotexist" (Concat "!" Key))
-                   ("In"
-                    (When (And (Listp Vals) Vals)
-                          (Format "%S In (%S)" Key (Mapconcat #'Identity Vals ","))))
-                   ("Notin"
-                    (When (And (Listp Vals) Vals)
-                          (Format "%S Notin (%S)" Key (Mapconcat #'Identity Vals ","))))
-                   (_ Nil)))))
+(defun kubed-ext--matchexpr-to-selector (expr)
+  "Convert a Kubernetes matchExpression EXPR alist to a selector string.
+Returns nil for unsupported operators."
+  (let ((key  (alist-get 'key      expr))
+        (op   (alist-get 'operator expr))
+        (vals (alist-get 'values   expr)))
+    (and (stringp key)
+         (stringp op)
+         (pcase op
+           ("Exists"       key)
+           ("DoesNotExist" (concat "!" key))
+           ("In"
+            (when (and (listp vals) vals)
+              (format "%s in (%s)" key (mapconcat #'identity vals ","))))
+           ("NotIn"
+            (when (and (listp vals) vals)
+              (format "%s notin (%s)" key (mapconcat #'identity vals ","))))
+           (_ nil)))))
 
-;;; ─── Workload → Pod Label Selector ───────────────────────────
+;;; ─── Workload → pod label selector ───────────────────────────
 
-(Defun Kubed-Ext--Workload-Pod-Selector (Type Name Context Namespace)
-  "Return A Kubectl --Selector String For Pods.
-Owned By Type/Name In Context/Namespace.
-Returns Nil When The Selector Cannot Be Determined."
-  (Condition-Case Err
-                  (Let ((Json-Str
-                         (With-Temp-Buffer
-                          (When (Zerop
-                                 (Apply #'Call-Process
-                                        Kubed-Kubectl-Program Nil '(T Nil) Nil
-                                        (Append
-                                         (List "Get" Type Name "-O" "Json")
-                                         (When Context   (List "--Context" Context))
-                                         (When Namespace (List "-N"        Namespace)))))
-                                (String-Trim (Buffer-String))))))
-                       (When (And Json-Str
-                                  (Not (String-Empty-P Json-Str))
-                                  (String-Prefix-P "{" Json-Str))
-                             (Let* ((Obj      (Json-Parse-String Json-Str
-                                                                 :Object-Type 'Alist
-                                                                 :Array-Type  'List))
-                                    (Spec     (And (Listp Obj)  (Alist-Get 'Spec     Obj)))
-                                    (Selector (And (Listp Spec) (Alist-Get 'Selector Spec)))
-                                    (Result
-                                     (Cond
-                                      ;; Replicationcontrollers Use A Flat Label Map.
-                                      ((Member Type '("Replicationcontroller"
-                                                      "Replicationcontrollers"))
-                                       (When (And Selector (Listp Selector))
-                                             (Mapconcat (Lambda (Kv)
-                                                                (Format "%S=%S" (Car Kv) (Cdr Kv)))
-                                                        Selector ",")))
-                                      ;; All Other Workload Types Use Matchlabels/Matchexpressions.
-                                      ((And Selector
-                                            (Listp Selector)
-                                            (Not (Eq Selector :Null)))
-                                       (Let* ((Ml     (Alist-Get 'Matchlabels      Selector))
-                                              (Me     (Alist-Get 'Matchexpressions Selector))
-                                              (Lparts (When (And Ml (Listp Ml) (Not (Eq Ml :Null)))
-                                                            (Mapcar (Lambda (Kv)
-                                                                            (Format "%S=%S" (Car Kv) (Cdr Kv)))
-                                                                    Ml)))
-                                              (Eparts (When (And Me (Listp Me) (Not (Eq Me :Null)))
-                                                            (Delq Nil (Mapcar
-                                                                       #'Kubed-Ext--Matchexpr-To-Selector
-                                                                       Me))))
-                                              (All    (Append Lparts Eparts)))
-                                             (When All (Mapconcat #'Identity All ","))))
-                                      (T Nil))))
-                                   ;; Guard Against Empty String — That Would Match All Pods.
-                                   (And (Stringp Result) (Not (String-Empty-P Result)) Result))))
-                  (Error
-                   (Message "Kubed-Ext: Selector For %S/%S: %S"
-                            Type Name (Error-Message-String Err))
-                   Nil)))
+(defun kubed-ext--workload-pod-selector (type name context namespace)
+  "Return a kubectl --selector string for pods.
+owned by TYPE/NAME in CONTEXT/NAMESPACE.
+Returns nil when the selector cannot be determined."
+  (condition-case err
+      (let ((json-str
+             (with-temp-buffer
+               (when (zerop
+                      (apply #'call-process
+                             kubed-kubectl-program nil '(t nil) nil
+                             (append
+                              (list "get" type name "-o" "json")
+                              (when context   (list "--context" context))
+                              (when namespace (list "-n"        namespace)))))
+                 (string-trim (buffer-string))))))
+        (when (and json-str
+                   (not (string-empty-p json-str))
+                   (string-prefix-p "{" json-str))
+          (let* ((obj      (json-parse-string json-str
+                                              :object-type 'alist
+                                              :array-type  'list))
+                 (spec     (and (listp obj)  (alist-get 'spec     obj)))
+                 (selector (and (listp spec) (alist-get 'selector spec)))
+                 (result
+                  (cond
+                   ;; ReplicationControllers use a flat label map.
+                   ((member type '("replicationcontroller"
+                                   "replicationcontrollers"))
+                    (when (and selector (listp selector))
+                      (mapconcat (lambda (kv)
+                                   (format "%s=%s" (car kv) (cdr kv)))
+                                 selector ",")))
+                   ;; All other workload types use matchLabels/matchExpressions.
+                   ((and selector
+                         (listp selector)
+                         (not (eq selector :null)))
+                    (let* ((ml     (alist-get 'matchLabels      selector))
+                           (me     (alist-get 'matchExpressions selector))
+                           (lparts (when (and ml (listp ml) (not (eq ml :null)))
+                                     (mapcar (lambda (kv)
+                                               (format "%s=%s" (car kv) (cdr kv)))
+                                             ml)))
+                           (eparts (when (and me (listp me) (not (eq me :null)))
+                                     (delq nil (mapcar
+                                                #'kubed-ext--matchexpr-to-selector
+                                                me))))
+                           (all    (append lparts eparts)))
+                      (when all (mapconcat #'identity all ","))))
+                   (t nil))))
+            ;; Guard against empty string — that would match all pods.
+            (and (stringp result) (not (string-empty-p result)) result))))
+    (error
+     (message "kubed-ext: selector for %s/%s: %s"
+              type name (error-message-string err))
+     nil)))
 
-;;; ─── Shared Parallel Log Runner ───────────────────────────────
+;;; ─── Shared parallel log runner ───────────────────────────────
 
-(Defun Kubed-Ext--Parallel-Logs-Run
-  (Pods Context Namespace Filter Since Follow All-Containers Buf)
-  "Stream Logs From Pods Concurrently Into Buf.
+(defun kubed-ext--parallel-logs-run
+    (pods context namespace filter since follow all-containers buf)
+  "Stream logs from PODS concurrently into BUF.
 
-At Most `Kubed-Ext-Log-Parallel-Limit' Kubectl Processes Run At Once;
-New Ones Start As Slots Free.  Per-Process Emacs-Native Line Filters
-Are Always Used So N Independent Streams Do Not Corrupt Shared Output.
+At most `kubed-ext-log-parallel-limit' kubectl processes run at once;
+new ones start as slots free.  Per-process Emacs-native line filters
+are always used so N independent streams do not corrupt shared output.
 
-Pods           — List Of Pod-Name Strings.
-Context        — Kubectl Context, Or Nil For Current Context.
-Namespace      — Kubernetes Namespace, Or Nil For Current Namespace.
-Filter         — Case-Insensitive Regex; Nil Or Empty Passes All Lines.
-Since          — Kubectl --Since Value (E.G. \"1h\", \"30m\").
-Follow         — Non-Nil Appends --Follow Flag.
-All-Containers — Non-Nil Appends --All-Containers Flag.
-Buf            — Pre-Existing Output Buffer."
-  (If (Null Pods)
-      (With-Current-Buffer Buf
-                           (Let ((Inhibit-Read-Only T))
-                                (Insert "No Pods Found For The Given Selector.\N")))
-      (Message "Streaming From %D Pod%S (<=%D Parallel)..."
-               (Length Pods)
-               (If (= (Length Pods) 1) "" "S")
-               Kubed-Ext-Log-Parallel-Limit)
-      (Let ((Remaining (Copy-Sequence Pods))
-            (Active    0)
-            (Limit     Kubed-Ext-Log-Parallel-Limit))
-           (Cl-Labels
-            ((Maybe-Start ()
-                          (While (And Remaining (< Active Limit))
-                                 (Let ((Pod (Pop Remaining)))
-                                      (Condition-Case Start-Err
-                                                      (Let* ((Args (Append
-                                                                    (List "Logs" Pod
-                                                                          "--Prefix"
-                                                                          "--Since" Since)
-                                                                    (When Context        (List "--Context" Context))
-                                                                    (When Namespace      (List "-N" Namespace))
-                                                                    (When Follow         '("--Follow"))
-                                                                    (When All-Containers '("--All-Containers"))))
-                                                             (Proc (Apply #'Start-Process
-                                                                          (Format "*Kubed-Plog-%S*" Pod)
-                                                                          Buf
-                                                                          Kubed-Kubectl-Program Args)))
-                                                            (When (And (Stringp Filter) (Not (String-Empty-P Filter)))
-                                                                  (Set-Process-Filter Proc
-                                                                                      (Kubed-Ext--Make-Line-Filter Filter)))
-                                                            (Cl-Incf Active)
-                                                            (Set-Process-Sentinel Proc
-                                                                                  (Lambda (_P _Status)
-                                                                                          (Cl-Decf Active)
-                                                                                          (Maybe-Start))))
-                                                      (Error
-                                                       (Message "Kubed-Ext: Log Process For %S: %S"
-                                                                Pod (Error-Message-String Start-Err))))))))
-            (Maybe-Start)))))
+PODS           — list of pod-name strings.
+CONTEXT        — kubectl context, or nil for current context.
+NAMESPACE      — Kubernetes namespace, or nil for current namespace.
+FILTER         — case-insensitive regex; nil or empty passes all lines.
+SINCE          — kubectl --since value (e.g. \"1h\", \"30m\").
+FOLLOW         — non-nil appends --follow flag.
+ALL-CONTAINERS — non-nil appends --all-containers flag.
+BUF            — pre-existing output buffer."
+  (if (null pods)
+      (with-current-buffer buf
+        (let ((inhibit-read-only t))
+          (insert "No pods found for the given selector.\n")))
+    (message "Streaming from %d pod%s (<=%d parallel)..."
+             (length pods)
+             (if (= (length pods) 1) "" "s")
+             kubed-ext-log-parallel-limit)
+    (let ((remaining (copy-sequence pods))
+          (active    0)
+          (limit     kubed-ext-log-parallel-limit))
+      (cl-labels
+          ((maybe-start ()
+                        (while (and remaining (< active limit))
+                          (let ((pod (pop remaining)))
+                            (condition-case start-err
+                                (let* ((args (append
+                                              (list "logs" pod
+                                                    "--prefix"
+                                                    "--since" since)
+                                              (when context        (list "--context" context))
+                                              (when namespace      (list "-n" namespace))
+                                              (when follow         '("--follow"))
+                                              (when all-containers '("--all-containers"))))
+                                       (proc (apply #'start-process
+                                                    (format "*kubed-plog-%s*" pod)
+                                                    buf
+                                                    kubed-kubectl-program args)))
+                                  (when (and (stringp filter) (not (string-empty-p filter)))
+                                    (set-process-filter proc
+                                                        (kubed-ext--make-line-filter filter)))
+                                  (cl-incf active)
+                                  (set-process-sentinel proc
+                                                        (lambda (_p _status)
+                                                          (cl-decf active)
+                                                          (maybe-start))))
+                              (error
+                               (message "kubed-ext: log process for %s: %s"
+                                        pod (error-message-string start-err))))))))
+        (maybe-start)))))
 
-;;; ─── Standalone: Parallel By Label ───────────────────────────
+;;; ─── Standalone: parallel by label ───────────────────────────
 
-;;;###Autoload
-(Defun Kubed-Ext-Logs-Parallel-By-Label (&Optional Context Namespace)
-  "Stream Logs From Pods Matching A Label Selector, Up To N In Parallel.
+;;;###autoload
+(defun kubed-ext-logs-parallel-by-label (&optional context namespace)
+  "Stream logs from pods matching a label selector, up to N in parallel.
 
-Context And Namespace Are Optional; Defaults To Current Context/Namespace."
-  (Declare (Advertised-Calling-Convention (Context Namespace) "1.0"))
-  (Interactive
-   (Let* ((C (Kubed-Local-Context))
-          (C (If (Equal Current-Prefix-Arg '(16))
-                 (Kubed-Read-Context "Context" C) C))
-          (N (Kubed--Namespace C Current-Prefix-Arg)))
-         (List C N)))
-  (Let* ((Ctx      (Or Context (Kubed-Local-Context)))
-         (Ns       (Or Namespace (Kubed--Namespace Ctx)))
-         (Labels   (Kubed-Ext-Discover-Labels "Pods" Ctx Ns))
-         (Selector (Completing-Read "Label Selector: " Labels Nil Nil
-                                    Nil 'Kubed-Ext-Label-Selector-History))
-         (Filt     (Kubed-Ext--Read-Log-Filter
-                    "Filter Pattern" Kubed-Ext-Log-Error-Pattern))
-         (Since    (Read-String (Format-Prompt "Since" Kubed-Ext-Log-Default-Since)
-                                Nil Nil Kubed-Ext-Log-Default-Since))
-         (Follow   (Y-Or-N-P "Follow (Stream) Logs? "))
-         (All-Con  (Y-Or-N-P "All Containers? "))
-         (Pods     (Kubed-Ext--Pods-By-Selector Selector Ctx Ns))
-         (Buf      (Generate-New-Buffer
-                    (Format "*Kubed-Parallel-Logs -L %S@%S[%S]*"
-                            Selector (Or Ns "Default") Ctx))))
-        (With-Current-Buffer Buf (Run-Hooks 'Kubed-Logs-Setup-Hook))
-        (Kubed-Ext--Parallel-Logs-Run Pods Ctx Ns Filt Since Follow All-Con Buf)
-        (Display-Buffer Buf)))
+CONTEXT and NAMESPACE are optional; defaults to current context/namespace."
+  (declare (advertised-calling-convention (context namespace) "1.0"))
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg)))
+     (list c n)))
+  (let* ((ctx      (or context (kubed-local-context)))
+         (ns       (or namespace (kubed--namespace ctx)))
+         (labels   (kubed-ext-discover-labels "pods" ctx ns))
+         (selector (completing-read "Label selector: " labels nil nil
+                                    nil 'kubed-ext-label-selector-history))
+         (filt     (kubed-ext--read-log-filter
+                    "Filter pattern" kubed-ext-log-error-pattern))
+         (since    (read-string (format-prompt "Since" kubed-ext-log-default-since)
+                                nil nil kubed-ext-log-default-since))
+         (follow   (y-or-n-p "Follow (stream) logs? "))
+         (all-con  (y-or-n-p "All containers? "))
+         (pods     (kubed-ext--pods-by-selector selector ctx ns))
+         (buf      (generate-new-buffer
+                    (format "*kubed-parallel-logs -l %s@%s[%s]*"
+                            selector (or ns "default") ctx))))
+    (with-current-buffer buf (run-hooks 'kubed-logs-setup-hook))
+    (kubed-ext--parallel-logs-run pods ctx ns filt since follow all-con buf)
+    (display-buffer buf)))
 
-;;; ─── Deployment: Error Logs ───────────────────────────────────
+;;; ─── Deployment: error logs ───────────────────────────────────
 
-(Defun Kubed-Ext-Deployments-Logs-Errors (Click)
-  "Show Error-Filtered Logs For The Deployment At Click Position."
-  (Interactive (List Last-Nonmenu-Event) Kubed-Deployments-Mode)
-  (If-Let ((Dep (Kubed-Ext--Resource-At-Event Click)))
-          (Let* ((Ctx  Kubed-List-Context)
-                 (Ns   Kubed-List-Namespace)
-                 (Args (Append
-                        (List "Logs" (Concat "Deployment/" Dep)
-                              "--All-Containers"
-                              "--Prefix"
-                              "--Since" Kubed-Ext-Log-Default-Since)
-                        (When Ctx (List "--Context" Ctx))
-                        (When Ns  (List "-N" Ns))))
-                 (Buf  (Generate-New-Buffer
-                        (Format "*Kubed-Logs-Errors Deployments/%S@%S[%S]*"
-                                Dep (Or Ns "Default") (Or Ctx "Current")))))
-                (With-Current-Buffer Buf (Run-Hooks 'Kubed-Logs-Setup-Hook))
-                (Kubed-Ext--Launch-Log-Process Buf Args Kubed-Ext-Log-Error-Pattern)
-                (Display-Buffer Buf))
-          (User-Error "No Kubernetes Deployment At Point")))
+(defun kubed-ext-deployments-logs-errors (click)
+  "Show error-filtered logs for the deployment at CLICK position."
+  (interactive (list last-nonmenu-event) kubed-deployments-mode)
+  (if-let ((dep (kubed-ext--resource-at-event click)))
+      (let* ((ctx  kubed-list-context)
+             (ns   kubed-list-namespace)
+             (args (append
+                    (list "logs" (concat "deployment/" dep)
+                          "--all-containers"
+                          "--prefix"
+                          "--since" kubed-ext-log-default-since)
+                    (when ctx (list "--context" ctx))
+                    (when ns  (list "-n" ns))))
+             (buf  (generate-new-buffer
+                    (format "*kubed-logs-errors deployments/%s@%s[%s]*"
+                            dep (or ns "default") (or ctx "current")))))
+        (with-current-buffer buf (run-hooks 'kubed-logs-setup-hook))
+        (kubed-ext--launch-log-process buf args kubed-ext-log-error-pattern)
+        (display-buffer buf))
+    (user-error "No Kubernetes deployment at point")))
 
-;;; ─── Deployment: Custom-Filtered Logs ────────────────────────
+;;; ─── Deployment: custom-filtered logs ────────────────────────
 
-(Defun Kubed-Ext-Deployments-Logs-Custom-Filter (Click)
-  "Show Filtered Logs For The Deployment At Click, Prompting For Options."
-  (Interactive (List Last-Nonmenu-Event) Kubed-Deployments-Mode)
-  (If-Let ((Dep (Kubed-Ext--Resource-At-Event Click)))
-          (Let* ((Ctx    Kubed-List-Context)
-                 (Ns     Kubed-List-Namespace)
-                 (Filt   (Kubed-Ext--Read-Log-Filter
-                          "Filter Pattern" Kubed-Ext-Log-Error-Pattern))
-                 (Since  (Read-String (Format-Prompt "Since" Kubed-Ext-Log-Default-Since)
-                                      Nil Nil Kubed-Ext-Log-Default-Since))
-                 (Follow (Y-Or-N-P "Follow (Stream) Logs? "))
-                 (Args   (Append
-                          (List "Logs" (Concat "Deployment/" Dep)
-                                "--All-Containers"
-                                "--Prefix"
-                                "--Since" Since)
-                          (When Ctx    (List "--Context" Ctx))
-                          (When Ns     (List "-N" Ns))
-                          (When Follow '("--Follow"))))
-                 (Buf    (Generate-New-Buffer
-                          (Format "*Kubed-Logs-Filtered Deployments/%S@%S[%S]*"
-                                  Dep (Or Ns "Default") (Or Ctx "Current")))))
-                (With-Current-Buffer Buf (Run-Hooks 'Kubed-Logs-Setup-Hook))
-                (Kubed-Ext--Launch-Log-Process Buf Args Filt)
-                (Display-Buffer Buf))
-          (User-Error "No Kubernetes Deployment At Point")))
+(defun kubed-ext-deployments-logs-custom-filter (click)
+  "Show filtered logs for the deployment at CLICK, prompting for options."
+  (interactive (list last-nonmenu-event) kubed-deployments-mode)
+  (if-let ((dep (kubed-ext--resource-at-event click)))
+      (let* ((ctx    kubed-list-context)
+             (ns     kubed-list-namespace)
+             (filt   (kubed-ext--read-log-filter
+                      "Filter pattern" kubed-ext-log-error-pattern))
+             (since  (read-string (format-prompt "Since" kubed-ext-log-default-since)
+                                  nil nil kubed-ext-log-default-since))
+             (follow (y-or-n-p "Follow (stream) logs? "))
+             (args   (append
+                      (list "logs" (concat "deployment/" dep)
+                            "--all-containers"
+                            "--prefix"
+                            "--since" since)
+                      (when ctx    (list "--context" ctx))
+                      (when ns     (list "-n" ns))
+                      (when follow '("--follow"))))
+             (buf    (generate-new-buffer
+                      (format "*kubed-logs-filtered deployments/%s@%s[%s]*"
+                              dep (or ns "default") (or ctx "current")))))
+        (with-current-buffer buf (run-hooks 'kubed-logs-setup-hook))
+        (kubed-ext--launch-log-process buf args filt)
+        (display-buffer buf))
+    (user-error "No Kubernetes deployment at point")))
 
-;;; ─── Deployment: Parallel Logs ────────────────────────────────
+;;; ─── Deployment: parallel logs ────────────────────────────────
 
-(Defun Kubed-Ext-Deployments-Logs-Parallel (Click)
-  "Stream Filtered Logs From All Pods Of The Deployment At Click."
-  (Interactive (List Last-Nonmenu-Event) Kubed-Deployments-Mode)
-  (If-Let ((Dep (Kubed-Ext--Resource-At-Event Click)))
-          (Let* ((Ctx Kubed-List-Context)
-                 (Ns  Kubed-List-Namespace)
-                 (Sel (Kubed-Ext--Workload-Pod-Selector "Deployments" Dep Ctx Ns)))
-                (Unless Sel
-                        (User-Error "Cannot Determine Pod Selector For Deployment `%S'" Dep))
-                (Let* ((Filt   (Kubed-Ext--Read-Log-Filter
-                                "Filter Pattern" Kubed-Ext-Log-Error-Pattern))
-                       (Since  (Read-String (Format-Prompt "Since" Kubed-Ext-Log-Default-Since)
-                                            Nil Nil Kubed-Ext-Log-Default-Since))
-                       (Follow (Y-Or-N-P "Follow (Stream) Logs? "))
-                       (All-C  (Y-Or-N-P "All Containers Per Pod? "))
-                       (Pods   (Kubed-Ext--Pods-By-Selector Sel Ctx Ns))
-                       (Buf    (Generate-New-Buffer
-                                (Format "*Kubed-Parallel-Logs Deployments/%S@%S[%S]*"
-                                        Dep (Or Ns "Default") (Or Ctx "Current")))))
-                      (With-Current-Buffer Buf (Run-Hooks 'Kubed-Logs-Setup-Hook))
-                      (Kubed-Ext--Parallel-Logs-Run Pods Ctx Ns Filt Since Follow All-C Buf)
-                      (Display-Buffer Buf)))
-          (User-Error "No Kubernetes Deployment At Point")))
+(defun kubed-ext-deployments-logs-parallel (click)
+  "Stream filtered logs from ALL pods of the deployment at CLICK."
+  (interactive (list last-nonmenu-event) kubed-deployments-mode)
+  (if-let ((dep (kubed-ext--resource-at-event click)))
+      (let* ((ctx kubed-list-context)
+             (ns  kubed-list-namespace)
+             (sel (kubed-ext--workload-pod-selector "deployments" dep ctx ns)))
+        (unless sel
+          (user-error "Cannot determine pod selector for deployment `%s'" dep))
+        (let* ((filt   (kubed-ext--read-log-filter
+                        "Filter pattern" kubed-ext-log-error-pattern))
+               (since  (read-string (format-prompt "Since" kubed-ext-log-default-since)
+                                    nil nil kubed-ext-log-default-since))
+               (follow (y-or-n-p "Follow (stream) logs? "))
+               (all-c  (y-or-n-p "All containers per pod? "))
+               (pods   (kubed-ext--pods-by-selector sel ctx ns))
+               (buf    (generate-new-buffer
+                        (format "*kubed-parallel-logs deployments/%s@%s[%s]*"
+                                dep (or ns "default") (or ctx "current")))))
+          (with-current-buffer buf (run-hooks 'kubed-logs-setup-hook))
+          (kubed-ext--parallel-logs-run pods ctx ns filt since follow all-c buf)
+          (display-buffer buf)))
+    (user-error "No Kubernetes deployment at point")))
 
-;;; ─── Standalone: Parallel For Any Workload ────────────────────
+;;; ─── Standalone: parallel for any workload ────────────────────
 
-;;;###Autoload
-(Defun Kubed-Ext-Logs-Parallel-For-Workload (&Optional Context Namespace)
-  "Stream Parallel Filtered Logs From Pods Of Any Workload Resource.
+;;;###autoload
+(defun kubed-ext-logs-parallel-for-workload (&optional context namespace)
+  "Stream parallel filtered logs from pods of any workload resource.
 
-Context And Namespace Are Optional; Defaults To Current Context/Namespace."
-  (Declare (Advertised-Calling-Convention (Context Namespace) "1.0"))
-  (Interactive
-   (Let* ((C (Kubed-Local-Context))
-          (C (If (Equal Current-Prefix-Arg '(16))
-                 (Kubed-Read-Context "Context" C) C))
-          (N (Kubed--Namespace C Current-Prefix-Arg)))
-         (List C N)))
-  (Let* ((Ctx  (Or Context (Kubed-Local-Context)))
-         (Ns   (Or Namespace (Kubed--Namespace Ctx)))
-         (Type (Completing-Read "Workload Type: "
-                                '("Deployments" "Statefulsets" "Daemonsets"
-                                  "Replicasets" "Jobs")
-                                Nil T Nil Nil "Deployments"))
-         (Name (Kubed-Read-Resource-Name Type "Parallel Logs For" Nil Nil Ctx Ns))
-         (Sel  (Kubed-Ext--Workload-Pod-Selector Type Name Ctx Ns)))
-        (Unless Sel
-                (User-Error "Cannot Determine Pod Selector For %S/%S" Type Name))
-        (Let* ((Filt   (Kubed-Ext--Read-Log-Filter
-                        "Filter Pattern" Kubed-Ext-Log-Error-Pattern))
-               (Since  (Read-String (Format-Prompt "Since" Kubed-Ext-Log-Default-Since)
-                                    Nil Nil Kubed-Ext-Log-Default-Since))
-               (Follow (Y-Or-N-P "Follow (Stream) Logs? "))
-               (All-C  (Y-Or-N-P "All Containers Per Pod? "))
-               (Pods   (Kubed-Ext--Pods-By-Selector Sel Ctx Ns))
-               (Buf    (Generate-New-Buffer
-                        (Format "*Kubed-Parallel-Logs %S/%S@%S[%S]*"
-                                Type Name (Or Ns "Default") Ctx))))
-              (With-Current-Buffer Buf (Run-Hooks 'Kubed-Logs-Setup-Hook))
-              (Kubed-Ext--Parallel-Logs-Run Pods Ctx Ns Filt Since Follow All-C Buf)
-              (Display-Buffer Buf))))
+CONTEXT and NAMESPACE are optional; defaults to current context/namespace."
+  (declare (advertised-calling-convention (context namespace) "1.0"))
+  (interactive
+   (let* ((c (kubed-local-context))
+          (c (if (equal current-prefix-arg '(16))
+                 (kubed-read-context "Context" c) c))
+          (n (kubed--namespace c current-prefix-arg)))
+     (list c n)))
+  (let* ((ctx  (or context (kubed-local-context)))
+         (ns   (or namespace (kubed--namespace ctx)))
+         (type (completing-read "Workload type: "
+                                '("deployments" "statefulsets" "daemonsets"
+                                  "replicasets" "jobs")
+                                nil t nil nil "deployments"))
+         (name (kubed-read-resource-name type "Parallel logs for" nil nil ctx ns))
+         (sel  (kubed-ext--workload-pod-selector type name ctx ns)))
+    (unless sel
+      (user-error "Cannot determine pod selector for %s/%s" type name))
+    (let* ((filt   (kubed-ext--read-log-filter
+                    "Filter pattern" kubed-ext-log-error-pattern))
+           (since  (read-string (format-prompt "Since" kubed-ext-log-default-since)
+                                nil nil kubed-ext-log-default-since))
+           (follow (y-or-n-p "Follow (stream) logs? "))
+           (all-c  (y-or-n-p "All containers per pod? "))
+           (pods   (kubed-ext--pods-by-selector sel ctx ns))
+           (buf    (generate-new-buffer
+                    (format "*kubed-parallel-logs %s/%s@%s[%s]*"
+                            type name (or ns "default") ctx))))
+      (with-current-buffer buf (run-hooks 'kubed-logs-setup-hook))
+      (kubed-ext--parallel-logs-run pods ctx ns filt since follow all-c buf)
+      (display-buffer buf))))
 
 ;;; ─── Keybindings § 22b ────────────────────────────────────────
 
-(Keymap-Set Kubed-Deployments-Mode-Map "E" #'Kubed-Ext-Deployments-Logs-Errors)
-(Keymap-Set Kubed-Deployments-Mode-Map "H" #'Kubed-Ext-Deployments-Logs-Custom-Filter)
-(Keymap-Set Kubed-Prefix-Map           "W" #'Kubed-Ext-Logs-Parallel-For-Workload)
+(keymap-set kubed-deployments-mode-map "E" #'kubed-ext-deployments-logs-errors)
+(keymap-set kubed-deployments-mode-map "H" #'kubed-ext-deployments-logs-custom-filter)
+(keymap-set kubed-prefix-map           "w" #'kubed-ext-logs-parallel-for-workload)
 
-;;; ─── Extend Deployment Transient Suffixes ─────────────────────
+;;; ─── Extend deployment transient suffixes ─────────────────────
 
-(Let ((Entry (Assoc "Deployments" Kubed-Ext-Extra-Transient-Suffixes)))
-     (When Entry
-           (Setcdr Entry
-                   (Append (Cdr Entry)
-                           '(("Le" "Error Logs (Stream)"
-                              Kubed-Ext-Deployments-Logs-Errors)
-                             ("Lf" "Filter Logs (Custom)"
-                              Kubed-Ext-Deployments-Logs-Custom-Filter)
-                             ("Lp" "Parallel Logs (All Pods)"
-                              Kubed-Ext-Deployments-Logs-Parallel))))))
+(let ((entry (assoc "deployments" kubed-ext-extra-transient-suffixes)))
+  (when entry
+    (setcdr entry
+            (append (cdr entry)
+                    '(("le" "Error logs (stream)"
+                       kubed-ext-deployments-logs-errors)
+                      ("lf" "Filter logs (custom)"
+                       kubed-ext-deployments-logs-custom-filter)
+                      ("lp" "Parallel logs (all pods)"
+                       kubed-ext-deployments-logs-parallel))))))
 
 ;;;; ═══════════════════════════════════════════════════════════════
 ;;; § 23.  Setup
 ;;; ═══════════════════════════════════════════════════════════════
 
-(Defun Kubed-Ext-Setup ()
-  "Initialize Kubed-Ext Functionality."
-  (Message "Kubed-Ext: Setup Complete."))
+(defun kubed-ext-setup ()
+  "Initialize kubed-ext functionality."
+  (message "Kubed-ext: setup complete."))
 
-(Provide 'Kubed-Ext)
-;;; Kubed-Ext.El Ends Here
+(provide 'kubed-ext)
+;;; kubed-ext.el ends here
