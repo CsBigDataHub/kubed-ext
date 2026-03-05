@@ -50,6 +50,23 @@
       (string= s "nil")
       (string-match-p "\\`[ \t]*\'" s)))
 
+(defun kubed-ext--resource-at-event (event)
+  "Return the tabulated-list resource ID at EVENT.
+Works for mouse clicks, keyboard invocations, and context-menu events.
+For mouse events the window and buffer-position are read from the event
+itself so point is never moved as a side-effect.  For keyboard events
+the resource at the current point position is returned.
+Returns nil when no resource is found."
+  (if (mouse-event-p event)
+      (let* ((start  (event-start event))
+             (window (posn-window start))
+             (pt     (posn-point  start)))
+        (when (and (windowp window) (numberp pt))
+          (with-current-buffer (window-buffer window)
+            (tabulated-list-get-id pt))))
+    ;; Keyboard / non-mouse path — use current point.
+    (tabulated-list-get-id)))
+
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 0b.  Defcustoms: Status Faces, Output Format, Shell
 ;;; ═══════════════════════════════════════════════════════════════
@@ -93,6 +110,15 @@ Customize this to change colors for different Kubernetes statuses."
 (defcustom kubed-ext-pod-shell "/bin/sh"
   "Shell to run when opening a terminal in a Kubernetes pod."
   :type 'string
+  :group 'kubed-ext)
+
+(defcustom kubed-ext-production-context-regexp "\\bprod\\b"
+  "Regexp matched against a kubectl context name to flag it as production.
+When matched the mode line shows the context in red with a ☢ prefix and
+suffix.  The default pattern matches the word `prod' but not `preprod'.
+Set to nil to disable production highlighting entirely."
+  :type '(choice (regexp :tag "Regexp")
+                 (const  :tag "Disabled" nil))
   :group 'kubed-ext)
 
 ;;; ═══════════════════════════════════════════════════════════════
@@ -529,7 +555,7 @@ ORIG-FN TYPE CONTEXT/NAMESPACE."
 (defun kubed-ext-pods-forward-port (click)
   "Forward local network port to remote port of pod at CLICK position."
   (interactive (list last-nonmenu-event) kubed-pods-mode)
-  (if-let ((pod (tabulated-list-get-id (mouse-set-point click))))
+  (if-let ((pod (kubed-ext--resource-at-event click)))
       (let* ((r (kubed-ext-read-resource-port
                  "pods" pod "Remote port"
                  kubed-list-context kubed-list-namespace))
@@ -556,7 +582,7 @@ ORIG-FN TYPE CONTEXT/NAMESPACE."
 (defun kubed-ext-services-forward-port (click)
   "Forward local port to Kubernetes service at CLICK position."
   (interactive (list last-nonmenu-event) kubed-services-mode)
-  (if-let ((service (tabulated-list-get-id (mouse-set-point click))))
+  (if-let ((service (kubed-ext--resource-at-event click)))
       (let* ((r (kubed-ext-read-service-port
                  service "Remote port"
                  kubed-list-context kubed-list-namespace))
@@ -583,7 +609,7 @@ ORIG-FN TYPE CONTEXT/NAMESPACE."
 (defun kubed-ext-deployments-forward-port (click)
   "Forward local port to Kubernetes deployment at CLICK position."
   (interactive (list last-nonmenu-event) kubed-deployments-mode)
-  (if-let ((deployment (tabulated-list-get-id (mouse-set-point click))))
+  (if-let ((deployment (kubed-ext--resource-at-event click)))
       (let* ((r (kubed-ext-read-resource-port
                  "deployments" deployment "Remote port"
                  kubed-list-context kubed-list-namespace))
@@ -666,7 +692,7 @@ DESC format: type/name local:remote in namespace[context]."
 (defun kubed-ext-port-forwards-stop (click)
   "Stop port-forward at CLICK position."
   (interactive (list last-nonmenu-event) kubed-ext-port-forwards-mode)
-  (if-let ((desc (tabulated-list-get-id (mouse-set-point click))))
+  (if-let ((desc (kubed-ext--resource-at-event click)))
       (when (y-or-n-p (format "Stop port-forward: %s?" desc))
         (kubed-stop-port-forward desc)
         (tabulated-list-print t))
@@ -2602,7 +2628,7 @@ ERRBACK is called with error message on failure."
   (interactive (list last-nonmenu-event) kubed-pods-mode)
   (unless (require 'vterm nil t)
     (user-error "This command requires the `vterm' package"))
-  (if-let ((pod (tabulated-list-get-id (mouse-set-point click))))
+  (if-let ((pod (kubed-ext--resource-at-event click)))
       (let* ((container (kubed-read-container pod "Container" t
                                               kubed-list-context kubed-list-namespace))
              (vterm-shell (kubed-ext--kubectl-exec-command
@@ -2641,7 +2667,7 @@ ERRBACK is called with error message on failure."
   (interactive (list last-nonmenu-event) kubed-pods-mode)
   (unless (require 'eat nil t)
     (user-error "This command requires the `eat' package"))
-  (if-let ((pod (tabulated-list-get-id (mouse-set-point click))))
+  (if-let ((pod (kubed-ext--resource-at-event click)))
       (let* ((container (kubed-read-container pod "Container" t
                                               kubed-list-context kubed-list-namespace))
              (cmd (kubed-ext--kubectl-exec-command
@@ -2679,7 +2705,7 @@ ERRBACK is called with error message on failure."
   "Open eshell in Kubernetes pod at CLICK position."
   (interactive (list last-nonmenu-event) kubed-pods-mode)
   (require 'kubed-tramp) (kubed-tramp-assert-support)
-  (if-let ((pod (tabulated-list-get-id (mouse-set-point click))))
+  (if-let ((pod (kubed-ext--resource-at-event click)))
       (let* ((default-directory
                (kubed-remote-file-name
                 kubed-list-context kubed-list-namespace pod))
@@ -2711,7 +2737,7 @@ ERRBACK is called with error message on failure."
 (defun kubed-ext-pods-ansi-term (click)
   "Open `ansi-term' in Kubernetes pod at CLICK position."
   (interactive (list last-nonmenu-event) kubed-pods-mode)
-  (if-let ((pod (tabulated-list-get-id (mouse-set-point click))))
+  (if-let ((pod (kubed-ext--resource-at-event click)))
       (let* ((container (kubed-read-container pod "Container" t
                                               kubed-list-context kubed-list-namespace))
              (cmd (kubed-ext--kubectl-exec-command
@@ -2728,7 +2754,7 @@ ERRBACK is called with error message on failure."
 (defun kubed-ext-pods-shell-command (click)
   "Run a shell command via kubectl exec in pod at CLICK position."
   (interactive (list last-nonmenu-event) kubed-pods-mode)
-  (if-let ((pod (tabulated-list-get-id (mouse-set-point click))))
+  (if-let ((pod (kubed-ext--resource-at-event click)))
       (let* ((container (kubed-read-container pod "Container" t
                                               kubed-list-context kubed-list-namespace))
              (prefix (concat
@@ -2753,7 +2779,7 @@ ERRBACK is called with error message on failure."
 (defun kubed-ext-list-describe-resource (click)
   "Describe Kubernetes resource at CLICK position using kubectl describe."
   (interactive (list last-nonmenu-event) kubed-list-mode)
-  (if-let ((name (tabulated-list-get-id (mouse-set-point click))))
+  (if-let ((name (kubed-ext--resource-at-event click)))
       (let* ((type kubed-list-type)
              (namespace kubed-list-namespace)
              (context kubed-list-context)
@@ -2844,7 +2870,7 @@ ERRBACK is called with error message on failure."
 (defun kubed-ext-pods-logs-init-container (click)
   "Show init container logs for pod at CLICK position."
   (interactive (list last-nonmenu-event) kubed-pods-mode)
-  (if-let ((pod (tabulated-list-get-id (mouse-set-point click))))
+  (if-let ((pod (kubed-ext--resource-at-event click)))
       (let ((init-containers (kubed-ext-pod-init-containers
                               pod kubed-list-context kubed-list-namespace)))
         (unless init-containers
@@ -3022,7 +3048,7 @@ ERRBACK is called with error message on failure."
 (defun kubed-ext-deployments-rollout-history (click)
   "Show rollout history for deployment at CLICK position."
   (interactive (list last-nonmenu-event) kubed-deployments-mode)
-  (if-let ((dep (tabulated-list-get-id (mouse-set-point click))))
+  (if-let ((dep (kubed-ext--resource-at-event click)))
       (kubed-ext-rollout-history "deployment" dep
                                  kubed-list-context kubed-list-namespace)
     (user-error "No Kubernetes deployment at point")))
@@ -3030,7 +3056,7 @@ ERRBACK is called with error message on failure."
 (defun kubed-ext-deployments-rollout-undo (click)
   "Undo rollout for deployment at CLICK position."
   (interactive (list last-nonmenu-event) kubed-deployments-mode)
-  (if-let ((dep (tabulated-list-get-id (mouse-set-point click))))
+  (if-let ((dep (kubed-ext--resource-at-event click)))
       (let ((rev (when (y-or-n-p "Specify target revision? ")
                    (read-number "To revision: "))))
         (when (y-or-n-p (format "Undo rollout for %s?" dep))
@@ -3067,7 +3093,7 @@ ERRBACK is called with error message on failure."
 (defun kubed-ext-deployments-jab (click)
   "Jab deployment at CLICK position to force a rolling update."
   (interactive (list last-nonmenu-event) kubed-deployments-mode)
-  (if-let ((dep (tabulated-list-get-id (mouse-set-point click))))
+  (if-let ((dep (kubed-ext--resource-at-event click)))
       (progn (kubed-ext-jab-deployment dep kubed-list-context
                                        kubed-list-namespace)
              (kubed-list-update t))
@@ -3083,7 +3109,7 @@ ERRBACK is called with error message on failure."
 (defun kubed-ext-list-copy-log-command (click)
   "Copy `kubectl logs -f' command for resource at CLICK position."
   (interactive (list last-nonmenu-event) kubed-list-mode)
-  (if-let ((name (tabulated-list-get-id (mouse-set-point click))))
+  (if-let ((name (kubed-ext--resource-at-event click)))
       (let ((cmd (format "%s logs -f --tail=100 %s%s%s"
                          kubed-kubectl-program
                          (if (string= kubed-list-type "pods")
@@ -3122,7 +3148,7 @@ ERRBACK is called with error message on failure."
 (defun kubed-ext-list-copy-resource-as-yaml (click)
   "Copy YAML of resource at CLICK position."
   (interactive (list last-nonmenu-event) kubed-list-mode)
-  (if-let ((name (tabulated-list-get-id (mouse-set-point click))))
+  (if-let ((name (kubed-ext--resource-at-event click)))
       (let* ((type kubed-list-type)
              (namespace kubed-list-namespace)
              (context kubed-list-context)
@@ -4236,44 +4262,70 @@ Reschedules itself after each tick with a fresh random delay."
                (reason   (and ctx (kubed-ext--cb-open-p ctx)))
                (updating (process-live-p
                           (alist-get 'process
-                                     (kubed--alist kubed-list-type ctx
-                                                   kubed-list-namespace)))))
-          (cond
-           (updating
-            (propertize " [...]" 'help-echo "Updating…"))
+                                     (kubed--alist kubed-list-type
+                                                   ctx
+                                                   kubed-list-namespace))))
+               (is-prod  (and ctx
+                              (bound-and-true-p
+                               kubed-ext-production-context-regexp)
+                              (stringp
+                               kubed-ext-production-context-regexp)
+                              (string-match-p
+                               kubed-ext-production-context-regexp ctx))))
+          (concat
+           ;; ── Context badge ──────────────────────────────────
+           (when ctx
+             (propertize
+              (if is-prod
+                  (format " [☢ %s ☢]" ctx)
+                (format " [%s]" ctx))
+              'face      (if is-prod 'error 'success)
+              'help-echo (format "Context: %s  (%s)"
+                                 ctx
+                                 (if is-prod "PRODUCTION" "non-prod"))))
+           ;; ── Status indicators ──────────────────────────────
+           (cond
+            (updating
+             (propertize " [...]"
+                         'help-echo "kubectl update in progress…"))
 
-           ((eq reason 'network)
-            (let ((secs (round (kubed-ext--cb-backoff-for ctx))))
-              (propertize (format " ⚡~%ds" secs)
-                          'face      'error
-                          'help-echo (format (concat "Network unreachable for `%s'.\n"
-                                                     "Auto-refresh paused; probing every ~%ds.\n"
-                                                     "Press `g' or `Z' to retry immediately.")
-                                             ctx secs))))
+            ((eq reason 'network)
+             (let ((secs (round (kubed-ext--cb-backoff-for ctx))))
+               (propertize (format " ⚡~%ds" secs)
+                           'face      'error
+                           'help-echo
+                           (format (concat "Network unreachable for `%s'.\n"
+                                           "Auto-refresh paused; probing in ~%ds.\n"
+                                           "Press `g' or `Z' to retry immediately.")
+                                   ctx secs))))
 
-           ((eq reason 'auth)
-            (propertize " 🔑 re-auth"
-                        'face      'warning
-                        'help-echo (format (concat "Credentials expired for `%s'.\n"
-                                                   "Re-authenticate, then press `g' or `Z'.")
-                                           ctx)))
+            ((eq reason 'auth)
+             (propertize " 🔑 re-auth"
+                         'face      'warning
+                         'help-echo
+                         (format (concat "Credentials expired for `%s'.\n"
+                                         "Re-authenticate, then press `g' or `Z'.")
+                                 ctx)))
 
-           (t
-            (concat
-             (when kubed-list-filter
-               (propertize
-                (format " [%s]" (mapconcat #'prin1-to-string
-                                           kubed-list-filter " "))
-                'help-echo "Active filter"))
-             (when (bound-and-true-p kubed-ext-list-label-selector)
-               (propertize (format " {%s}" kubed-ext-list-label-selector)
-                           'help-echo "Label selector"
-                           'face      'warning))
-             (when (and (bound-and-true-p kubed-ext-resource-filter)
-                        (not (string-empty-p kubed-ext-resource-filter)))
-               (propertize (format " /%s/" kubed-ext-resource-filter)
-                           'help-echo "Substring filter"
-                           'face      'italic))))))))
+            (t
+             (concat
+              (when kubed-list-filter
+                (propertize
+                 (format " [%s]"
+                         (mapconcat #'prin1-to-string
+                                    kubed-list-filter " "))
+                 'help-echo "Active s-expression filter"))
+              (when (bound-and-true-p kubed-ext-list-label-selector)
+                (propertize
+                 (format " {%s}" kubed-ext-list-label-selector)
+                 'help-echo "Active label selector"
+                 'face      'warning))
+              (when (and (bound-and-true-p kubed-ext-resource-filter)
+                         (not (string-empty-p kubed-ext-resource-filter)))
+                (propertize
+                 (format " /%s/" kubed-ext-resource-filter)
+                 'help-echo "Active substring filter"
+                 'face      'italic)))))))))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 22.  Enhanced Log Filtering and Parallel Streaming
@@ -4446,7 +4498,7 @@ FILTER-PATTERN is a regex string, or nil/empty for no filtering."
 (defun kubed-ext-pods-logs-errors (click)
   "Show error-filtered logs for the pod at CLICK position."
   (interactive (list last-nonmenu-event) kubed-pods-mode)
-  (if-let ((pod (tabulated-list-get-id (mouse-set-point click))))
+  (if-let ((pod (kubed-ext--resource-at-event click)))
       (let* ((ctx  kubed-list-context)
              (ns   kubed-list-namespace)
              (args (append
@@ -4469,7 +4521,7 @@ FILTER-PATTERN is a regex string, or nil/empty for no filtering."
 (defun kubed-ext-pods-logs-custom-filter (click)
   "Show filtered logs for the pod at CLICK, prompting for options."
   (interactive (list last-nonmenu-event) kubed-pods-mode)
-  (if-let ((pod (tabulated-list-get-id (mouse-set-point click))))
+  (if-let ((pod (kubed-ext--resource-at-event click)))
       (let* ((ctx       kubed-list-context)
              (ns        kubed-list-namespace)
              (filt      (kubed-ext--read-log-filter
@@ -4617,16 +4669,13 @@ FILTER-PATTERN is a regex string, or nil/empty for no filtering."
 (let ((entry (assoc "pods" kubed-ext-extra-transient-suffixes)))
   (when entry
     (setcdr entry
-            (apply #'vector
-                   (append
-                    (append (cdr entry) nil)
-                    (list
-                     '("le" "Error logs"
+            (append (cdr entry)
+                    '(("le" "Error logs"
                        kubed-ext-pods-logs-errors)
-                     '("lf" "Filter logs (custom)"
+                      ("lf" "Filter logs (custom)"
                        kubed-ext-pods-logs-custom-filter)
-                     '("lp" "Parallel logs by label"
-                       kubed-ext-logs-parallel-by-label)))))))
+                      ("lp" "Parallel logs by label"
+                       kubed-ext-logs-parallel-by-label))))))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 22b.  Log Filtering for Deployments and Generic Workloads
@@ -4808,7 +4857,7 @@ CONTEXT and NAMESPACE are optional; defaults to current context/namespace."
 (defun kubed-ext-deployments-logs-errors (click)
   "Show error-filtered logs for the deployment at CLICK position."
   (interactive (list last-nonmenu-event) kubed-deployments-mode)
-  (if-let ((dep (tabulated-list-get-id (mouse-set-point click))))
+  (if-let ((dep (kubed-ext--resource-at-event click)))
       (let* ((ctx  kubed-list-context)
              (ns   kubed-list-namespace)
              (args (append
@@ -4831,7 +4880,7 @@ CONTEXT and NAMESPACE are optional; defaults to current context/namespace."
 (defun kubed-ext-deployments-logs-custom-filter (click)
   "Show filtered logs for the deployment at CLICK, prompting for options."
   (interactive (list last-nonmenu-event) kubed-deployments-mode)
-  (if-let ((dep (tabulated-list-get-id (mouse-set-point click))))
+  (if-let ((dep (kubed-ext--resource-at-event click)))
       (let* ((ctx    kubed-list-context)
              (ns     kubed-list-namespace)
              (filt   (kubed-ext--read-log-filter
@@ -4860,7 +4909,7 @@ CONTEXT and NAMESPACE are optional; defaults to current context/namespace."
 (defun kubed-ext-deployments-logs-parallel (click)
   "Stream filtered logs from ALL pods of the deployment at CLICK."
   (interactive (list last-nonmenu-event) kubed-deployments-mode)
-  (if-let ((dep (tabulated-list-get-id (mouse-set-point click))))
+  (if-let ((dep (kubed-ext--resource-at-event click)))
       (let* ((ctx kubed-list-context)
              (ns  kubed-list-namespace)
              (sel (kubed-ext--workload-pod-selector "deployments" dep ctx ns)))
@@ -4930,16 +4979,13 @@ CONTEXT and NAMESPACE are optional; defaults to current context/namespace."
 (let ((entry (assoc "deployments" kubed-ext-extra-transient-suffixes)))
   (when entry
     (setcdr entry
-            (apply #'vector
-                   (append
-                    (append (cdr entry) nil)
-                    (list
-                     '("le" "Error logs (stream)"
+            (append (cdr entry)
+                    '(("le" "Error logs (stream)"
                        kubed-ext-deployments-logs-errors)
-                     '("lf" "Filter logs (custom)"
+                      ("lf" "Filter logs (custom)"
                        kubed-ext-deployments-logs-custom-filter)
-                     '("lp" "Parallel logs (all pods)"
-                       kubed-ext-deployments-logs-parallel)))))))
+                      ("lp" "Parallel logs (all pods)"
+                       kubed-ext-deployments-logs-parallel))))))
 
 ;;;; ═══════════════════════════════════════════════════════════════
 ;;; § 23.  Setup
