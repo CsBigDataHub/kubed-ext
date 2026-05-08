@@ -1,7 +1,7 @@
 ;;; kubed-ext.el --- Extensions for Kubed with Async Metrics -*- lexical-binding: t; -*-
 
 ;; Author: Chetan Koneru
-;; Version: 0.5.1
+;; Version: 0.6.0
 ;; URL: https://github.com/CsBigDataHub/kubed-ext
 ;; Keywords: tools, kubernetes
 ;; Package-Requires: ((emacs "29.1") (kubed "0.6.1") (transient "0.13.2"))
@@ -17,6 +17,8 @@
 (require 'kubed-transient)
 (require 'cl-lib)
 (require 'json)
+(require 'seq)
+(require 'subr-x)
 (require 'ansi-color)
 (require 'parse-time)
 
@@ -140,6 +142,16 @@ Set to nil to disable production highlighting entirely."
                  (const  :tag "Disabled" nil))
   :group 'kubed-ext)
 
+(defcustom kubed-ext-command-log-enabled t
+  "Non-nil means log kubectl process invocations to `*kubed-command-log*'."
+  :type 'boolean
+  :group 'kubed-ext)
+
+(defcustom kubed-ext-auto-discover-crds t
+  "Non-nil means discover cluster CRDs asynchronously for resource switching."
+  :type 'boolean
+  :group 'kubed-ext)
+
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 0c.  Buffer-Local Variables
 ;;; ═══════════════════════════════════════════════════════════════
@@ -195,7 +207,8 @@ This function intentionally never waits for kubectl output."
 (defun kubed-ext--prefetch-namespaces-hook ()
   "Prefetch namespaces when a kubed list buffer is created."
   (when (bound-and-true-p kubed-list-context)
-    (kubed-ext-prefetch-namespaces kubed-list-context)))
+    (kubed-ext-prefetch-namespaces kubed-list-context)
+    (kubed-ext-discover-crds-async kubed-list-context)))
 
 (add-hook 'kubed-list-mode-hook #'kubed-ext--prefetch-namespaces-hook)
 
@@ -204,7 +217,8 @@ This function intentionally never waits for kubectl output."
   (when-let ((ctx (car-safe (kubed-default-context-and-namespace))))
     ;; Clear prefetch flag so the new context gets a fresh fetch.
     (remhash ctx kubed-ext--namespace-prefetch-contexts)
-    (kubed-ext-prefetch-namespaces ctx)))
+    (kubed-ext-prefetch-namespaces ctx)
+    (kubed-ext-discover-crds-async ctx t)))
 
 (advice-add 'kubed-use-context :after #'kubed-ext--prefetch-after-use-context)
 
@@ -314,13 +328,20 @@ ORIG-FN TYPE CONTEXT/NAMESPACE/HOST."
 (defvar kubed-ext--crd-column-processes (make-hash-table :test 'equal)
   "Track in-flight CRD column discovery processes.")
 
+(defvar kubed-ext--crd-discovery-state (make-hash-table :test 'equal)
+  "Discovery state by Kubernetes context.")
+
+(defvar kubed-ext--crd-resource-registry (make-hash-table :test 'equal)
+  "Known CRD resource metadata keyed by fully qualified resource type.")
+
 (defun kubed-ext--crd-name-from-api-resources (resource-plural text)
   "Return CRD name for RESOURCE-PLURAL from api-resources TEXT."
   (catch 'found
     (dolist (line (split-string text "\n" t))
-      (when (string-match-p
-             (concat "\\`" (regexp-quote resource-plural) "\\.")
-             line)
+      (when (or (string= line resource-plural)
+                (string-match-p
+                 (concat "\\`" (regexp-quote resource-plural) "\\.")
+                 line))
         (throw 'found (string-trim line))))))
 
 (defun kubed-ext--parse-crd-printer-columns (text)
@@ -353,6 +374,162 @@ ORIG-FN TYPE CONTEXT/NAMESPACE/HOST."
              (when errback
                (funcall errback
                         (format "%s exited %d" (car command) code))))))))))
+
+(defun kubed-ext--crd-context-key (context)
+  "Return a stable cache key for CONTEXT."
+  (or context ""))
+
+(defun kubed-ext--crd-safe-symbol (name)
+  "Return a readable symbol for CRD field NAME."
+  (intern
+   (replace-regexp-in-string
+    "-+" "-"
+    (replace-regexp-in-string
+     "\\`-\\|-\\'" ""
+     (downcase
+      (replace-regexp-in-string "[^[:alnum:]]+" "-" (or name "field")))))))
+
+(defun kubed-ext--crd-storage-version (versions)
+  "Return the storage version alist from VERSIONS, or the first version."
+  (or (seq-find (lambda (version) (alist-get 'storage version)) versions)
+      (car versions)))
+
+(defun kubed-ext--crd-printer-columns (crd)
+  "Return the preferred additionalPrinterColumns list for CRD."
+  (let* ((spec (alist-get 'spec crd))
+         (versions (alist-get 'versions spec))
+         (version (and (listp versions)
+                       (kubed-ext--crd-storage-version versions))))
+    (or (alist-get 'additionalPrinterColumns version)
+        (alist-get 'additionalPrinterColumns spec)
+        '())))
+
+(defun kubed-ext--crd-column-width (name)
+  "Return a pragmatic display width for CRD printer column NAME."
+  (pcase (downcase (or name ""))
+    ((or "ready" "status" "phase" "state") 14)
+    ((or "age" "version") 12)
+    ((or "conditions" "message" "reason") 36)
+    (_ (max 12 (min 32 (+ 2 (length (or name ""))))))))
+
+(defun kubed-ext--crd-column-specs (columns)
+  "Convert CRD printer COLUMNS to `kubed-define-resource' property specs."
+  (delq
+   nil
+   (mapcar
+    (lambda (column)
+      (let ((name (alist-get 'name column))
+            (json-path (alist-get 'jsonPath column)))
+        (unless (or (not (stringp name))
+                    (not (stringp json-path))
+                    (member-ignore-case name '("name" "age")))
+          (list (kubed-ext--crd-safe-symbol name)
+                json-path
+                (kubed-ext--crd-column-width name)))))
+    columns)))
+
+(defun kubed-ext--crd-type (crd)
+  "Return the fully qualified kubectl resource type for CRD."
+  (let* ((spec (alist-get 'spec crd))
+         (names (alist-get 'names spec))
+         (plural (alist-get 'plural names))
+         (group (alist-get 'group spec)))
+    (when (and (stringp plural) (stringp group))
+      (concat plural "." group))))
+
+(defun kubed-ext--crd-display-name (metadata)
+  "Return a completion label for CRD METADATA."
+  (format "%s  %s  %s"
+          (plist-get metadata :kind)
+          (plist-get metadata :type)
+          (if (plist-get metadata :namespaced) "Namespaced" "Cluster")))
+
+(defun kubed-ext--crd-mode-map-symbol (type)
+  "Return the generated Kubed mode-map symbol for resource TYPE."
+  (intern (format "kubed-%s-mode-map" type)))
+
+(defun kubed-ext--define-crd-resource (crd)
+  "Define or update a Kubed resource from CRD metadata."
+  (when-let* ((type (kubed-ext--crd-type crd))
+              (spec (alist-get 'spec crd))
+              (names (alist-get 'names spec))
+              (kind (alist-get 'kind names))
+              (group (alist-get 'group spec))
+              (plural (alist-get 'plural names)))
+    (let* ((namespaced (string= (alist-get 'scope spec) "Namespaced"))
+           (resource-symbol (intern type))
+           (plural-symbol (intern type))
+           (columns (kubed-ext--crd-column-specs
+                     (kubed-ext--crd-printer-columns crd)))
+           (metadata (list :type type
+                           :kind kind
+                           :group group
+                           :plural plural
+                           :namespaced namespaced
+                           :columns columns)))
+      (puthash type metadata kubed-ext--crd-resource-registry)
+      (if (fboundp (intern (format "kubed-list-%s" type)))
+          (kubed-ext-enrich-columns type nil
+                                    (kubed-ext--crd-printer-columns crd))
+        (eval `(kubed-define-resource ,resource-symbol
+                   ,columns
+                 :plural ,plural-symbol
+                 :namespaced ,namespaced)
+              t))
+      (when (fboundp 'kubed-ext--patch-type-timestamp-columns)
+        (kubed-ext--patch-type-timestamp-columns type))
+      (when (fboundp 'kubed-ext--install-domain-actions)
+        (kubed-ext--install-domain-actions type))
+      metadata)))
+
+(defun kubed-ext--parse-crd-list (json-text)
+  "Parse kubectl CRD list JSON-TEXT into CRD item alists."
+  (let* ((json-object-type 'alist)
+         (json-array-type 'list)
+         (obj (json-read-from-string json-text)))
+    (or (alist-get 'items obj) '())))
+
+(defun kubed-ext-discover-crds-async (&optional context force callback)
+  "Discover CRDs in CONTEXT asynchronously and define Kubed resources.
+Non-nil FORCE ignores the cached discovery state.  CALLBACK receives the
+number of CRD resources defined or updated."
+  (when kubed-ext-auto-discover-crds
+    (let* ((ctx (or context (ignore-errors (kubed-local-context))))
+           (key (kubed-ext--crd-context-key ctx))
+           (state (gethash key kubed-ext--crd-discovery-state)))
+      (when (or force (not (memq state '(inflight done))))
+        (puthash key 'inflight kubed-ext--crd-discovery-state)
+        (kubed-ext--async-process
+         "kubed-ext-crd-discovery"
+         (append (list kubed-kubectl-program
+                       "get" "customresourcedefinitions.apiextensions.k8s.io"
+                       "-o" "json")
+                 (when ctx (list "--context" ctx)))
+         (lambda (output)
+           (condition-case err
+               (let ((count 0))
+                 (dolist (crd (kubed-ext--parse-crd-list output))
+                   (when (kubed-ext--define-crd-resource crd)
+                     (cl-incf count)))
+                 (puthash key 'done kubed-ext--crd-discovery-state)
+                 (when callback (funcall callback count))
+                 (message "Kubed-ext discovered %d CRD resource%s."
+                          count (if (= count 1) "" "s")))
+             (error
+              (remhash key kubed-ext--crd-discovery-state)
+              (message "Kubed-ext CRD discovery parse failed: %s" err))))
+         (lambda (err)
+           (remhash key kubed-ext--crd-discovery-state)
+           (message "Kubed-ext CRD discovery failed: %s" err)))))))
+
+(defun kubed-ext-crd-resource-choices ()
+  "Return completion choices for discovered CRD resources."
+  (let (choices)
+    (maphash
+     (lambda (type metadata)
+       (push (cons (kubed-ext--crd-display-name metadata) type) choices))
+     kubed-ext--crd-resource-registry)
+    (sort choices (lambda (a b) (string< (car a) (car b))))))
 
 (defun kubed-ext--defer-minibuffer-callback (callback &rest args)
   "Call CALLBACK with ARGS when the minibuffer is not active."
@@ -495,10 +672,16 @@ ATTEMPTS bounds retries while an upstream kubed update is still running."
 (advice-add 'kubed-list-update :before #'kubed-ext--maybe-enrich-columns)
 
 (defun kubed-ext-refresh-crd-columns ()
-  "Force re-discovery of CRD columns after switching context."
+  "Force re-discovery of CRDs and CRD columns for the current context."
   (interactive)
   (clrhash kubed-ext-enriched-resources)
-  (message "CRD column cache cleared."))
+  (clrhash kubed-ext--crd-discovery-state)
+  (kubed-ext-discover-crds-async
+   (ignore-errors (kubed-local-context))
+   t
+   (lambda (count)
+     (message "CRD cache refreshed: %d resource%s."
+              count (if (= count 1) "" "s")))))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 2.  Port-Forward with Auto-Complete
@@ -1063,8 +1246,15 @@ HEADERS is a list of strings, ROWS is a list of lists of strings."
 (defvar-local kubed-ext-wide--context   nil "`kubectl' context used in this wide view buffer.")
 (defvar-local kubed-ext-wide--namespace nil "Namespace used in this wide view buffer.")
 (defvar-local kubed-ext-wide--name nil "Resource name shown in this wide view buffer, or nil for all.")
+(defvar-local kubed-ext-wide--request-token 0
+  "Monotonic token used to ignore stale async wide-view responses.")
 
-(dolist (sym '(kubed-ext-wide--type kubed-ext-wide--context kubed-ext-wide--namespace kubed-ext-wide--name))
+(defvar-local kubed-ext-display--request-token 0
+  "Monotonic token used to ignore stale async `display-buffer' responses.")
+
+(dolist (sym '(kubed-ext-wide--type kubed-ext-wide--context
+                                    kubed-ext-wide--namespace kubed-ext-wide--name
+                                    kubed-ext-wide--request-token))
   (put sym 'permanent-local t))
 
 (defun kubed-ext--colorize-wide-cell (header value)
@@ -1075,7 +1265,7 @@ HEADERS is a list of strings, ROWS is a list of lists of strings."
       (let ((face (cdr (assoc value kubed-ext-status-faces))))
         (if face (propertize value 'face face) value)))
      ((string= h "READY")
-      (if (string-match "$[0-9]+$/$[0-9]+$" value)
+      (if (string-match "\\`\\([0-9]+\\)/\\([0-9]+\\)\\'" value)
           (let* ((r    (string-to-number (match-string 1 value)))
                  (tot  (string-to-number (match-string 2 value)))
                  (face (cond ((and (= r 0) (= tot 0)) 'shadow)
@@ -1105,7 +1295,7 @@ Name column.  We treat rows with a non-empty Name column as primary."
            (not (string-empty-p (string-trim name)))))))
 
 (defun kubed-ext--wide-populate-kubectl-wide-from-output (type raw)
-  "Populate current buffer from raw `kubectl get -o wide' output for TYPE."
+  "Populate current buffer from RAW `kubectl get -o wide' output for TYPE."
   (let* ((parsed (kubed-ext--parse-kubectl-table raw))
          (headers (car parsed))
          (rows (cdr parsed)))
@@ -1271,7 +1461,8 @@ This runs `kubectl' asynchronously."
         kubed-ext-wide--context   ctx
         kubed-ext-wide--namespace ns
         kubed-ext-wide--name      name)
-  (let ((target (current-buffer)))
+  (let ((target (current-buffer))
+        (token (cl-incf kubed-ext-wide--request-token)))
     (let ((inhibit-read-only t))
       (erase-buffer)
       (insert (format "Loading %s wide view...\n" type))
@@ -1286,16 +1477,19 @@ This runs `kubectl' asynchronously."
          (lambda (json-str)
            (when (buffer-live-p target)
              (with-current-buffer target
-               (let ((inhibit-read-only t))
-                 (kubed-ext-wide-mode)
-                 (kubed-ext--wide-populate-deployments-from-json json-str name)))))
+               (when (= token kubed-ext-wide--request-token)
+                 (let ((inhibit-read-only t))
+                   (kubed-ext-wide-mode)
+                   (kubed-ext--wide-populate-deployments-from-json
+                    json-str name))))))
          (lambda (err)
            (when (buffer-live-p target)
              (with-current-buffer target
-               (let ((inhibit-read-only t))
-                 (erase-buffer)
-                 (insert (format "Failed to load %s wide view: %s\n"
-                                 type err)))))))
+               (when (= token kubed-ext-wide--request-token)
+                 (let ((inhibit-read-only t))
+                   (erase-buffer)
+                   (insert (format "Failed to load %s wide view: %s\n"
+                                   type err))))))))
       (kubed-ext--async-kubectl
        (append (list "get" type)
                (when name (list name))
@@ -1305,16 +1499,19 @@ This runs `kubectl' asynchronously."
        (lambda (raw)
          (when (buffer-live-p target)
            (with-current-buffer target
-             (let ((inhibit-read-only t))
-               (kubed-ext-wide-mode)
-               (kubed-ext--wide-populate-kubectl-wide-from-output type raw)))))
+             (when (= token kubed-ext-wide--request-token)
+               (let ((inhibit-read-only t))
+                 (kubed-ext-wide-mode)
+                 (kubed-ext--wide-populate-kubectl-wide-from-output
+                  type raw))))))
        (lambda (err)
          (when (buffer-live-p target)
            (with-current-buffer target
-             (let ((inhibit-read-only t))
-               (erase-buffer)
-               (insert (format "Failed to load %s wide view: %s\n"
-                               type err))))))))))
+             (when (= token kubed-ext-wide--request-token)
+               (let ((inhibit-read-only t))
+                 (erase-buffer)
+                 (insert (format "Failed to load %s wide view: %s\n"
+                                 type err)))))))))))
 
 (defun kubed-ext-list-wide ()
   "Display the current resource list in kubectl wide format with color coding.
@@ -1447,36 +1644,45 @@ ORIG-FN is the original function, ARGS its arguments."
     (seq-let (type name context namespace)
         kubed-display-resource-info
       (let ((inhibit-read-only t)
-            (target (current-buffer)))
+            (target (current-buffer))
+            (token (cl-incf kubed-ext-display--request-token))
+            (format kubed-ext-output-format)
+            (info (copy-sequence kubed-display-resource-info)))
         (buffer-disable-undo)
         (erase-buffer)
         (insert (format "Loading %s/%s as %s...\n"
-                        type name kubed-ext-output-format))
+                        type name format))
         (set-buffer-modified-p nil)
         (kubed-ext--async-kubectl
          (append (list "get" type
-                       (concat "--output=" kubed-ext-output-format)
+                       (concat "--output=" format)
                        name)
                  (when namespace (list "-n" namespace))
                  (when context (list "--context" context)))
          (lambda (output)
            (when (buffer-live-p target)
              (with-current-buffer target
-               (let ((inhibit-read-only t))
-                 (erase-buffer)
-                 (insert output)
-                 (goto-char (point-min))
-                 (set-buffer-modified-p nil)
-                 (buffer-enable-undo)))))
+               (when (and (= token kubed-ext-display--request-token)
+                          (equal info kubed-display-resource-info)
+                          (string= format kubed-ext-output-format))
+                 (let ((inhibit-read-only t))
+                   (erase-buffer)
+                   (insert output)
+                   (goto-char (point-min))
+                   (set-buffer-modified-p nil)
+                   (buffer-enable-undo))))))
          (lambda (err)
            (when (buffer-live-p target)
              (with-current-buffer target
-               (let ((inhibit-read-only t))
-                 (erase-buffer)
-                 (insert (format "Failed to display Kubernetes resource `%s': %s\n"
-                                 name err))
-                 (set-buffer-modified-p nil)
-                 (buffer-enable-undo))))))))))
+               (when (and (= token kubed-ext-display--request-token)
+                          (equal info kubed-display-resource-info)
+                          (string= format kubed-ext-output-format))
+                 (let ((inhibit-read-only t))
+                   (erase-buffer)
+                   (insert (format "Failed to display Kubernetes resource `%s': %s\n"
+                                   name err))
+                   (set-buffer-modified-p nil)
+                   (buffer-enable-undo)))))))))))
 
 (advice-add 'kubed-display-resource-revert :around
             #'kubed-ext--display-revert-format)
@@ -1511,6 +1717,48 @@ ORIG-FN is the original function, ARGS its arguments."
 ;;; § 4.  Strimzi Operation Helpers
 ;;; ═══════════════════════════════════════════════════════════════
 
+(defconst kubed-ext-strimzi-reconciliation-types
+  '("kafkas" "kafkaconnects" "kafkabridges" "kafkamirrormakers"
+    "kafkamirrormaker2s")
+  "Strimzi resource plural names that support reconciliation pause.")
+
+(defun kubed-ext--resource-plural-name (type)
+  "Return the plural resource name from possibly fully-qualified TYPE."
+  (car (split-string type "\\." t)))
+
+(defun kubed-ext--strimzi-type-p (type)
+  "Return non-nil when TYPE is a Strimzi CRD resource type."
+  (string-suffix-p ".strimzi.io" type))
+
+(defun kubed-ext--strimzi-plural-p (type plurals)
+  "Return non-nil if TYPE has a plural name in PLURALS."
+  (member (kubed-ext--resource-plural-name type) plurals))
+
+(defun kubed-ext--strimzi-resource-at-point ()
+  "Return current Strimzi list context as (TYPE NAME CONTEXT NAMESPACE)."
+  (unless (derived-mode-p 'kubed-list-mode)
+    (user-error "Not in a Kubed list buffer"))
+  (unless (kubed-ext--strimzi-type-p kubed-list-type)
+    (user-error "Not a Strimzi resource: %s" kubed-list-type))
+  (if-let ((name (tabulated-list-get-id)))
+      (list kubed-list-type name kubed-list-context kubed-list-namespace)
+    (user-error "No Strimzi resource at point")))
+
+(defun kubed-ext--kubectl-patch-merge-async
+    (type name patch context namespace success-message)
+  "Patch TYPE/NAME with PATCH asynchronously in CONTEXT/NAMESPACE.
+SUCCESS-MESSAGE is formatted with TYPE and NAME after success."
+  (kubed-ext--async-kubectl
+   (append (list "patch" type name "--type" "merge" "-p" patch)
+           (when namespace (list "-n" namespace))
+           (when context (list "--context" context)))
+   (lambda (_)
+     (message success-message type name)
+     (when (derived-mode-p 'kubed-list-mode)
+       (kubed-list-update)))
+   (lambda (err)
+     (message "Failed to patch %s/%s: %s" type name err))))
+
 (defun kubed-ext-strimzi-pause-reconciliation
     (type name &optional context namespace)
   "Pause Strimzi reconciliation for resource NAME of TYPE in CONTEXT."
@@ -1519,12 +1767,17 @@ ORIG-FN is the original function, ARGS its arguments."
           (c (if (equal current-prefix-arg '(16))
                  (kubed-read-context "Context" c) c))
           (n (kubed--namespace c current-prefix-arg))
-          (type (completing-read "Resource type: "
-                                 '("kafka" "kafkaconnect" "kafkabridge"
-                                   "kafkamirrormaker2" "kafkamirrormaker")
-                                 nil t))
+          (_ (kubed-ext-discover-crds-async c))
+          (choices (seq-filter
+                    (lambda (choice)
+                      (kubed-ext--strimzi-plural-p
+                       (cdr choice)
+                       kubed-ext-strimzi-reconciliation-types))
+                    (kubed-ext-crd-resource-choices)))
+          (label (completing-read "Resource type: " choices nil t))
+          (type (alist-get label choices nil nil #'string=))
           (name (kubed-read-resource-name
-                 (concat type "s") "Pause reconciliation for" nil nil c n)))
+                 type "Pause reconciliation for" nil nil c n)))
      (list type name c n)))
   (let ((context (or context (kubed-local-context)))
         (namespace (or namespace
@@ -1549,12 +1802,17 @@ ORIG-FN is the original function, ARGS its arguments."
           (c (if (equal current-prefix-arg '(16))
                  (kubed-read-context "Context" c) c))
           (n (kubed--namespace c current-prefix-arg))
-          (type (completing-read "Resource type: "
-                                 '("kafka" "kafkaconnect" "kafkabridge"
-                                   "kafkamirrormaker2" "kafkamirrormaker")
-                                 nil t))
+          (_ (kubed-ext-discover-crds-async c))
+          (choices (seq-filter
+                    (lambda (choice)
+                      (kubed-ext--strimzi-plural-p
+                       (cdr choice)
+                       kubed-ext-strimzi-reconciliation-types))
+                    (kubed-ext-crd-resource-choices)))
+          (label (completing-read "Resource type: " choices nil t))
+          (type (alist-get label choices nil nil #'string=))
           (name (kubed-read-resource-name
-                 (concat type "s") "Resume reconciliation for" nil nil c n)))
+                 type "Resume reconciliation for" nil nil c n)))
      (list type name c n)))
   (let ((context (or context (kubed-local-context)))
         (namespace (or namespace
@@ -1580,14 +1838,15 @@ ORIG-FN is the original function, ARGS its arguments."
                  (kubed-read-context "Context" c) c))
           (n (kubed--namespace c current-prefix-arg)))
      (list (kubed-read-resource-name
-            "kafkaconnectors" "Restart connector" nil nil c n)
+            "kafkaconnectors.kafka.strimzi.io"
+            "Restart connector" nil nil c n)
            c n)))
   (let ((context (or context (kubed-local-context)))
         (namespace (or namespace
                        (kubed--namespace (or context
                                              (kubed-local-context))))))
     (kubed-ext--async-kubectl
-     (append (list "annotate" "kafkaconnector" name
+     (append (list "annotate" "kafkaconnectors.kafka.strimzi.io" name
                    "strimzi.io/restart=true" "--overwrite")
              (when namespace (list "-n" namespace))
              (when context (list "--context" context)))
@@ -1605,16 +1864,110 @@ ORIG-FN is the original function, ARGS its arguments."
                  (kubed-read-context "Context" c) c))
           (n (kubed--namespace c current-prefix-arg)))
      (list (kubed-read-resource-name
-            "kafkaconnects" "Scale KafkaConnect" nil nil c n)
+            "kafkaconnects.kafka.strimzi.io"
+            "Scale KafkaConnect" nil nil c n)
            (read-number "Number of replicas: ")
            c n)))
   (let* ((context (or context (kubed-local-context)))
          (namespace (or namespace (kubed--namespace context))))
-    (kubed-patch "kafkaconnects" name
-                 (kubed-ext--json-patch "replicas" (number-to-string replicas))
-                 context namespace "merge")
-    (message "Scaled KafkaConnect %s to %d replicas." name replicas)
-    (kubed-update "kafkaconnects" context namespace)))
+    (kubed-ext--kubectl-patch-merge-async
+     "kafkaconnects.kafka.strimzi.io" name
+     (kubed-ext--json-patch "replicas" (number-to-string replicas))
+     context namespace
+     (format "Scaled %%s/%%s to %d replicas." replicas))))
+
+(defun kubed-ext-strimzi-pause-at-point ()
+  "Pause reconciliation for the Strimzi resource at point."
+  (interactive nil kubed-list-mode)
+  (pcase-let ((`(,type ,name ,context ,namespace)
+               (kubed-ext--strimzi-resource-at-point)))
+    (unless (kubed-ext--strimzi-plural-p
+             type kubed-ext-strimzi-reconciliation-types)
+      (user-error "Pause reconciliation is not supported for %s" type))
+    (kubed-ext-strimzi-pause-reconciliation type name context namespace)))
+
+(defun kubed-ext-strimzi-resume-at-point ()
+  "Resume reconciliation for the Strimzi resource at point."
+  (interactive nil kubed-list-mode)
+  (pcase-let ((`(,type ,name ,context ,namespace)
+               (kubed-ext--strimzi-resource-at-point)))
+    (unless (kubed-ext--strimzi-plural-p
+             type kubed-ext-strimzi-reconciliation-types)
+      (user-error "Resume reconciliation is not supported for %s" type))
+    (kubed-ext-strimzi-resume-reconciliation type name context namespace)))
+
+(defun kubed-ext-strimzi-restart-connector-at-point ()
+  "Restart the Strimzi KafkaConnector at point."
+  (interactive nil kubed-list-mode)
+  (pcase-let ((`(,type ,name ,context ,namespace)
+               (kubed-ext--strimzi-resource-at-point)))
+    (unless (string= (kubed-ext--resource-plural-name type) "kafkaconnectors")
+      (user-error "Restart is only supported for KafkaConnector resources"))
+    (kubed-ext--async-kubectl
+     (append (list "annotate" type name
+                   "strimzi.io/restart=true" "--overwrite")
+             (when namespace (list "-n" namespace))
+             (when context (list "--context" context)))
+     (lambda (_)
+       (message "Triggered restart of %s/%s." type name)
+       (kubed-list-update))
+     (lambda (err)
+       (message "Failed to restart %s/%s: %s" type name err)))))
+
+(defun kubed-ext-strimzi-scale-kafkaconnect-at-point (replicas)
+  "Scale the Strimzi KafkaConnect at point to REPLICAS."
+  (interactive
+   (list (read-number "Number of replicas: "))
+   kubed-list-mode)
+  (pcase-let ((`(,type ,name ,context ,namespace)
+               (kubed-ext--strimzi-resource-at-point)))
+    (unless (string= (kubed-ext--resource-plural-name type) "kafkaconnects")
+      (user-error "Scale is only supported for KafkaConnect resources"))
+    (kubed-ext--kubectl-patch-merge-async
+     type name
+     (kubed-ext--json-patch "replicas" (number-to-string replicas))
+     context namespace
+     (format "Scaled %%s/%%s to %d replicas." replicas))))
+
+(defun kubed-ext-strimzi-set-topic-partitions-at-point (partitions)
+  "Set the Strimzi KafkaTopic at point to PARTITIONS partitions."
+  (interactive
+   (list (read-number "Number of partitions: "))
+   kubed-list-mode)
+  (pcase-let ((`(,type ,name ,context ,namespace)
+               (kubed-ext--strimzi-resource-at-point)))
+    (unless (string= (kubed-ext--resource-plural-name type) "kafkatopics")
+      (user-error "Partitions are only supported for KafkaTopic resources"))
+    (kubed-ext--kubectl-patch-merge-async
+     type name
+     (kubed-ext--json-patch "partitions" (number-to-string partitions))
+     context namespace
+     (format "Set %%s/%%s to %d partitions." partitions))))
+
+(defun kubed-ext--install-strimzi-actions (type)
+  "Install Strimzi action keybindings for discovered CRD TYPE."
+  (when (kubed-ext--strimzi-type-p type)
+    (let ((map-symbol (kubed-ext--crd-mode-map-symbol type))
+          (plural (kubed-ext--resource-plural-name type)))
+      (when (boundp map-symbol)
+        (let ((map (symbol-value map-symbol)))
+          (when (kubed-ext--strimzi-plural-p
+                 type kubed-ext-strimzi-reconciliation-types)
+            (keymap-set map "P" #'kubed-ext-strimzi-pause-at-point)
+            (keymap-set map "R" #'kubed-ext-strimzi-resume-at-point))
+          (pcase plural
+            ("kafkaconnects"
+             (keymap-set map "$" #'kubed-ext-strimzi-scale-kafkaconnect-at-point))
+            ("kafkaconnectors"
+             (keymap-set map "X"
+                         #'kubed-ext-strimzi-restart-connector-at-point))
+            ("kafkatopics"
+             (keymap-set map "p"
+                         #'kubed-ext-strimzi-set-topic-partitions-at-point))))))))
+
+(defun kubed-ext--install-domain-actions (type)
+  "Install domain-specific action keybindings for discovered CRD TYPE."
+  (kubed-ext--install-strimzi-actions type))
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 5.  Column Helpers, Metrics, Pod/Deployment Formatting
@@ -2056,7 +2409,7 @@ Name, Ready(x/y), Status, Restarts, Age, IP, Node."
                    (lambda (s)
                      (let ((roles nil) (pos 0))
                        (while (string-match
-                               "node-role\\.kubernetes\\.io/$[^:=, ]+$"
+                               "node-role\\.kubernetes\\.io/\\([^:=, ]+\\)"
                                s pos)
                          (push (match-string 1 s) roles)
                          (setq pos (match-end 0)))
@@ -2285,82 +2638,8 @@ Name, Ready(x/y), Status, Restarts, Age, IP, Node."
       t)
 
 ;;; ═══════════════════════════════════════════════════════════════
-;;; § 8–9.  Strimzi + Plain Resources
+;;; § 8–9.  Plain Resources
 ;;; ═══════════════════════════════════════════════════════════════
-
-(eval '(kubed-define-resource kafka ()
-         :suffixes ([("P" "Pause Reconciliation"  kubed-kafkas-pause)
-                     ("R" "Resume Reconciliation" kubed-kafkas-resume)])
-         (pause "P" "Pause reconciliation for"
-                (kubed-ext-strimzi-pause-reconciliation
-                 "kafka" kafka kubed-list-context kubed-list-namespace)
-                (kubed-list-update t))
-         (resume "R" "Resume reconciliation for"
-                 (kubed-ext-strimzi-resume-reconciliation
-                  "kafka" kafka kubed-list-context kubed-list-namespace)
-                 (kubed-list-update t)))
-      t)
-
-(eval '(kubed-define-resource kafkaconnect ()
-         :plural kafkaconnects
-         :prefix (("$" "Scale" kubed-scale-kafkaconnect))
-         :suffixes ([("$" "Scale"                 kubed-kafkaconnects-scale)
-                     ("P" "Pause Reconciliation"  kubed-kafkaconnects-pause)
-                     ("R" "Resume Reconciliation" kubed-kafkaconnects-resume)])
-         (scale "$" "Scale"
-                (kubed-ext-scale-kafkaconnect
-                 kafkaconnect
-                 (if current-prefix-arg
-                     (prefix-numeric-value current-prefix-arg)
-                   (read-number "Number of replicas: "))
-                 kubed-list-context kubed-list-namespace))
-         (pause "P" "Pause reconciliation for"
-                (kubed-ext-strimzi-pause-reconciliation
-                 "kafkaconnect" kafkaconnect
-                 kubed-list-context kubed-list-namespace)
-                (kubed-list-update t))
-         (resume "R" "Resume reconciliation for"
-                 (kubed-ext-strimzi-resume-reconciliation
-                  "kafkaconnect" kafkaconnect
-                  kubed-list-context kubed-list-namespace)
-                 (kubed-list-update t)))
-      t)
-
-(eval '(kubed-define-resource kafkaconnector ()
-         :suffixes ([("P" "Pause"   kubed-kafkaconnectors-pause)
-                     ("R" "Resume"  kubed-kafkaconnectors-resume)
-                     ("X" "Restart" kubed-kafkaconnectors-restart)])
-         (pause "P" "Pause"
-                (kubed-patch "kafkaconnectors" kafkaconnector
-                             (kubed-ext--json-patch "pause" "true")
-                             kubed-list-context kubed-list-namespace "merge")
-                (kubed-list-update t))
-         (resume "R" "Resume"
-                 (kubed-patch "kafkaconnectors" kafkaconnector
-                              (kubed-ext--json-patch "pause" "false")
-                              kubed-list-context kubed-list-namespace "merge")
-                 (kubed-list-update t))
-         (restart "X" "Restart"
-                  (kubed-ext-strimzi-restart-connector
-                   kafkaconnector kubed-list-context kubed-list-namespace)
-                  (kubed-list-update t)))
-      t)
-
-(eval '(kubed-define-resource kafkatopic ()
-         :suffixes ([("p" "Set Partitions" kubed-kafkatopics-set-partitions)])
-         (set-partitions "p" "Set partitions for"
-                         (let ((n (read-number "Number of partitions: ")))
-                           (kubed-patch "kafkatopics" kafkatopic
-                                        (kubed-ext--json-patch "partitions"
-                                                               (number-to-string n))
-                                        kubed-list-context kubed-list-namespace
-                                        "merge"))
-                         (kubed-list-update t)))
-      t)
-
-(dolist (spec '((kafkabridge) (kafkamirrormaker2) (kafkamirrormaker)
-                (kafkanodepool) (kafkarebalance) (kafkauser) (strimzipodset)))
-  (eval (cons 'kubed-define-resource spec) t))
 
 (dolist (spec '((endpoint) (limitrange) (podtemplate) (replicationcontroller)
                 (resourcequota) (serviceaccount) (controllerrevision) (lease)
@@ -3017,14 +3296,17 @@ ERRBACK is called with error message on failure."
    (let* ((c (kubed-local-context))
           (c (if (equal current-prefix-arg '(16))
                  (kubed-read-context "Context" c) c))
-          (type (kubed-read-resource-type "Type to describe" nil c))
-          (ns (when (kubed-namespaced-p type c)
+          (_ (kubed-ext-discover-crds-async c))
+          (choices (kubed-ext--resource-choices))
+          (label (completing-read "Type to describe: " choices nil t))
+          (type (alist-get label choices nil nil #'string=))
+          (ns (when (kubed-ext--resource-namespaced-p type c)
                 (kubed--namespace c current-prefix-arg)))
           (name (kubed-read-resource-name type "Describe" nil nil c ns)))
      (list type name c ns)))
   (let* ((ctx (or context (kubed-local-context)))
          (ns (or namespace
-                 (when (kubed-namespaced-p type ctx)
+                 (when (kubed-ext--resource-namespaced-p type ctx)
                    (kubed--namespace ctx))))
          (buf (get-buffer-create
                (format "*Kubed describe %s/%s@%s[%s]*"
@@ -3440,7 +3722,7 @@ ERRBACK is called with error message on failure."
 
 (defun kubed-ext-update-with-selector
     (orig-fn type context &optional namespace host)
-  "Advice for ORIG-FN: inject --selector for TYPE/CONTEXT/NAMESPACE."
+  "Advice for ORIG-FN: inject --selector for TYPE/CONTEXT/NAMESPACE/HOST."
   (let ((sel (kubed-ext--find-active-selector type context namespace)))
     (if (null sel)
         (funcall orig-fn type context namespace host)
@@ -3565,7 +3847,8 @@ Handles two forms:
   Wrapped: (:command (/bin/sh -c \"kubectl get pods ...\"))
 
 ORIG-FN is the advised function, ARGS its arguments."
-  (let ((cmd (plist-get args :command)))
+  (let ((cmd (and kubed-ext-command-log-enabled
+                  (plist-get args :command))))
     (when (and (consp cmd) (stringp (car cmd)))
       (let ((prog (file-name-nondirectory
                    (file-name-sans-extension (car cmd)))))
@@ -3587,7 +3870,8 @@ ORIG-FN is the advised function, ARGS its arguments."
 (defun kubed-ext--call-process-logger (orig-fn program &rest args)
   "Log kubectl `call-process'.
 ORIG-FN is the advised function.  PROGRAM and ARGS are passed through."
-  (when (and (stringp program)
+  (when (and kubed-ext-command-log-enabled
+             (stringp program)
              (string-suffix-p
               "kubectl"
               (file-name-sans-extension
@@ -3604,7 +3888,8 @@ ORIG-FN is the advised function.  PROGRAM and ARGS are passed through."
     (orig-fn start end program &rest args)
   "Log kubectl `call-process-region'.
 ORIG-FN is advised.  START END PROGRAM ARGS are passed through."
-  (when (and (stringp program)
+  (when (and kubed-ext-command-log-enabled
+             (stringp program)
              (string-suffix-p
               "kubectl"
               (file-name-sans-extension
@@ -3743,7 +4028,7 @@ ORIG-FN is advised.  START END PROGRAM ARGS are passed through."
           (when (fboundp fn)
             (cond
              ;; Non-namespaced resource type.
-             ((not (kubed-namespaced-p type ctx))
+             ((not (kubed-ext--resource-namespaced-p type ctx))
               (funcall fn ctx))
              ;; Reuse current namespace.
              (ns (funcall fn ctx ns))
@@ -3763,7 +4048,7 @@ ORIG-FN is advised.  START END PROGRAM ARGS are passed through."
       (when type
         (let ((fn (intern (format "kubed-list-%s" type))))
           (when (fboundp fn)
-            (if (kubed-namespaced-p type ctx)
+            (if (kubed-ext--resource-namespaced-p type ctx)
                 (funcall fn ctx ns)
               (funcall fn ctx))))))))
 
@@ -3785,15 +4070,29 @@ ORIG-FN is advised.  START END PROGRAM ARGS are passed through."
     ("namespaces" . "Namespaces")
     ("events" . "Events")
     ("networkpolicies" . "NetworkPolicies")
-    ("horizontalpodautoscalers" . "HPAs")
-    ("kafkas" . "Kafkas")
-    ("kafkaconnects" . "KafkaConnects")
-    ("strimzipodsets" . "StrimziPodSets")
-    ("kafkanodepools" . "KafkaNodePools")
-    ("kafkarebalances" . "KafkaRebalances")
-    ("kafkaconnectors" . "KafkaConnectors")
-    ("kafkatopics" . "KafkaTopics"))
+    ("horizontalpodautoscalers" . "HPAs"))
   "Common resources for quick switching.")
+
+(defconst kubed-ext-cluster-scoped-resources
+  '("customresourcedefinitions" "ingressclasses" "namespaces" "nodes"
+    "persistentvolumes" "storageclasses")
+  "Resource types known to be cluster-scoped without calling kubectl.")
+
+(defun kubed-ext--resource-choices ()
+  "Return completion choices for built-in and discovered CRD resources."
+  (sort
+   (append (mapcar (lambda (resource)
+                     (cons (cdr resource) (car resource)))
+                   kubed-ext-common-resources)
+           (kubed-ext-crd-resource-choices))
+   (lambda (a b) (string< (car a) (car b)))))
+
+(defun kubed-ext--resource-namespaced-p (type context)
+  "Return non-nil if TYPE should be listed with a namespace in CONTEXT."
+  (ignore context)
+  (if-let ((metadata (gethash type kubed-ext--crd-resource-registry)))
+      (plist-get metadata :namespaced)
+    (not (member type kubed-ext-cluster-scoped-resources))))
 
 (defun kubed-ext-switch-resource ()
   "Switch to a different resource type in the same context/namespace."
@@ -3801,14 +4100,14 @@ ORIG-FN is advised.  START END PROGRAM ARGS are passed through."
   (when (derived-mode-p 'kubed-list-mode)
     (let* ((ctx kubed-list-context)
            (ns kubed-list-namespace)
-           (choices (mapcar (lambda (r) (cons (cdr r) (car r)))
-                            kubed-ext-common-resources))
+           (_ (kubed-ext-discover-crds-async ctx))
+           (choices (kubed-ext--resource-choices))
            (sel (completing-read "Switch to resource: " choices nil t))
            (type (alist-get sel choices nil nil #'string=)))
       (when type
         (let ((fn (intern (format "kubed-list-%s" type))))
           (when (fboundp fn)
-            (if (kubed-namespaced-p type ctx)
+            (if (kubed-ext--resource-namespaced-p type ctx)
                 (funcall fn ctx (or ns (kubed--namespace ctx)))
               (funcall fn ctx))))))))
 
@@ -4606,7 +4905,10 @@ Reschedules itself after each tick with a fresh random delay."
     (type name context namespace follow prefix since tail timestamps
           &optional container all-containers selector)
   "Build kubectl-log-shaped args for stern.
-TYPE and NAME identify a resource unless SELECTOR is non-nil."
+TYPE and NAME identify a resource unless SELECTOR is non-nil.
+CONTEXT and NAMESPACE select the cluster scope.  FOLLOW, PREFIX, SINCE,
+TAIL, and TIMESTAMPS map to their stern equivalents.  CONTAINER and
+ALL-CONTAINERS choose which container streams to include."
   (append
    (if selector
        (list "logs" "-l" selector)
@@ -4630,13 +4932,15 @@ TYPE and NAME identify a resource unless SELECTOR is non-nil."
     (type name context namespace follow prefix since tail timestamps
           &optional container all-containers)
   "Build safe stern args for TYPE/NAME in CONTEXT/NAMESPACE.
+FOLLOW, PREFIX, SINCE, TAIL, and TIMESTAMPS map to stern flags.
+CONTAINER and ALL-CONTAINERS choose which container streams to include.
 Pods are queried directly.  Unsupported resource types signal
 `user-error' instead of guessing pod names."
   (if (member type '("pod" "pods"))
       (kubed-ext--stern-log-args
        "pods" name context namespace follow prefix since tail timestamps
        container all-containers)
-    (user-error "stern logs require a pod or explicit selector, not %s/%s"
+    (user-error "Stern logs require a pod or explicit selector, not %s/%s"
                 type name)))
 
 (defun kubed-ext--read-stern-selector (type name)
@@ -4647,7 +4951,10 @@ Pods are queried directly.  Unsupported resource types signal
 (defun kubed-ext--stern-resource-or-selector-args
     (type name context namespace follow prefix since tail timestamps
           &optional container all-containers)
-  "Build stern args for TYPE/NAME or prompt for a selector for non-pods."
+  "Build stern args for TYPE/NAME or prompt for a selector for non-pods.
+CONTEXT and NAMESPACE select the cluster scope.  FOLLOW, PREFIX, SINCE,
+TAIL, and TIMESTAMPS map to stern flags.  CONTAINER and ALL-CONTAINERS
+choose which container streams to include."
   (if (member type '("pod" "pods"))
       (kubed-ext--stern-resource-args
        type name context namespace follow prefix since tail timestamps
@@ -4763,7 +5070,9 @@ FILTER-PATTERN is a regex string, or nil/empty for no filtering."
 (defun kubed-ext-stern-logs
     (type resource &optional context namespace
           container follow limit prefix since tail timestamps)
-  "Show Kubernetes logs for TYPE/RESOURCE using `stern'."
+  "Show Kubernetes logs for TYPE/RESOURCE using `stern'.
+CONTEXT and NAMESPACE select the cluster scope.  CONTAINER, FOLLOW,
+LIMIT, PREFIX, SINCE, TAIL, and TIMESTAMPS match `kubed-logs'."
   (let ((context (or context (kubed-local-context))))
     (setq namespace (or namespace (kubed--namespace context)))
     (if (eq container kubed-ext--read-container-marker)
@@ -4818,7 +5127,9 @@ FILTER-PATTERN is a regex string, or nil/empty for no filtering."
 
 (defun kubed-ext-logs-for-pod
     (pod &optional context namespace container follow limit prefix since tail timestamps)
-  "Show stern logs for Kubernetes pod POD with async container completion."
+  "Show stern logs for Kubernetes pod POD with async container completion.
+CONTEXT and NAMESPACE select the cluster scope.  CONTAINER, FOLLOW,
+LIMIT, PREFIX, SINCE, TAIL, and TIMESTAMPS match `kubed-logs'."
   (interactive
    (pcase-let ((`(,pod ,context ,namespace ,container ,follow ,limit
                        ,prefix ,since ,tail ,timestamps)
