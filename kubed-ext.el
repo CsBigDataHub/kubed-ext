@@ -308,15 +308,6 @@ when an update is already in progress or the minibuffer is active."
                  line))
         (throw 'found (string-trim line))))))
 
-(defun kubed-ext--parse-crd-printer-columns (text)
-  "Parse CRD additionalPrinterColumns JSON from TEXT."
-  (when (and (stringp text)
-             (not (string-empty-p (string-trim text)))
-             (not (string= (string-trim text) "null")))
-    (seq-remove
-     (lambda (c) (string= (alist-get 'name c) "Age"))
-     (json-parse-string text :array-type 'list :object-type 'alist))))
-
 (defun kubed-ext--async-process (name command callback &optional errback)
   "Run COMMAND asynchronously under NAME and call CALLBACK with output."
   (let ((buf (generate-new-buffer (format " *%s*" name))))
@@ -373,20 +364,76 @@ when an update is already in progress or the minibuffer is active."
          (versions (alist-get 'versions spec))
          (version (and (listp versions)
                        (kubed-ext--crd-storage-version versions))))
-    (or (alist-get 'additionalPrinterColumns version)
-        (alist-get 'additionalPrinterColumns spec)
-        '())))
+    (kubed-ext--normalize-crd-printer-columns
+     (kubed-ext--crd-type crd)
+     (or (alist-get 'additionalPrinterColumns version)
+         (alist-get 'additionalPrinterColumns spec)
+         '()))))
 
 (defun kubed-ext--crd-column-width (name)
   "Return a pragmatic display width for CRD printer column NAME."
   (pcase (downcase (or name ""))
     ((or "ready" "status" "phase" "state") 14)
+    ("metadata state" 18)
+    ("warnings" 24)
     ((or "age" "version") 12)
     ((or "conditions" "message" "reason") 36)
     (_ (max 12 (min 32 (+ 2 (length (or name ""))))))))
 
-(defun kubed-ext--crd-column-specs (columns)
-  "Convert CRD printer COLUMNS to `kubed-define-resource' property specs."
+(defun kubed-ext--strimzi-kafka-resource-p (resource)
+  "Return non-nil when RESOURCE names the Strimzi Kafka CRD."
+  (member (downcase (or resource ""))
+          '("kafkas" "kafkas.kafka.strimzi.io")))
+
+(defun kubed-ext--crd-column-name (column)
+  "Return printer COLUMN name."
+  (and (consp column) (alist-get 'name column)))
+
+(defun kubed-ext--crd-column-named-p (column name)
+  "Return non-nil when printer COLUMN is named NAME."
+  (let ((column-name (kubed-ext--crd-column-name column)))
+    (and (stringp column-name)
+         (string= (downcase column-name) (downcase name)))))
+
+(defun kubed-ext--crd-has-column-p (columns name)
+  "Return non-nil when COLUMNS include NAME."
+  (seq-some (lambda (column)
+              (kubed-ext--crd-column-named-p column name))
+            columns))
+
+(defun kubed-ext--insert-crd-column-before (columns column before-name)
+  "Return COLUMNS with COLUMN inserted before BEFORE-NAME when present."
+  (let (result inserted)
+    (dolist (existing columns)
+      (when (and (not inserted)
+                 (kubed-ext--crd-column-named-p existing before-name))
+        (push column result)
+        (setq inserted t))
+      (push existing result))
+    (unless inserted
+      (push column result))
+    (nreverse result)))
+
+(defun kubed-ext--normalize-crd-printer-columns (resource columns)
+  "Return RESOURCE printer COLUMNS adjusted for known kubectl/k9s parity gaps."
+  (let ((columns (seq-remove
+                  (lambda (c) (string= (or (kubed-ext--crd-column-name c) "")
+                                        "Age"))
+                  (or columns '()))))
+    (when (and (kubed-ext--strimzi-kafka-resource-p resource)
+               (not (kubed-ext--crd-has-column-p columns "Metadata State")))
+      (setq columns
+            (kubed-ext--insert-crd-column-before
+             columns
+             '((name . "Metadata State")
+               (type . "string")
+               (jsonPath . ".status.kafkaMetadataState"))
+             "Warnings")))
+    columns))
+
+(defun kubed-ext--crd-column-specs (columns &optional resource)
+  "Convert CRD printer COLUMNS to `kubed-define-resource' property specs.
+RESOURCE enables resource-specific display formatting."
   (delq
    nil
    (mapcar
@@ -400,10 +447,11 @@ when an update is already in progress or the minibuffer is active."
                 json-path
                 (kubed-ext--crd-column-width name)
                 nil
-                (when (or (kubed-ext--status-column-p name)
-                          (kubed-ext--ready-column-p name)
-                          (kubed-ext--restart-column-p name))
-                  (kubed-ext--column-value-formatter name nil))))))
+	        (when (or (kubed-ext--status-column-p name)
+	                  (kubed-ext--ready-column-p name)
+	                  (kubed-ext--restart-column-p name)
+	                  (kubed-ext--warnings-column-p name))
+	          (kubed-ext--column-value-formatter name nil resource))))))
     columns)))
 
 (defun kubed-ext--crd-type (crd)
@@ -436,9 +484,10 @@ when an update is already in progress or the minibuffer is active."
               (plural (alist-get 'plural names)))
     (let* ((namespaced (string= (alist-get 'scope spec) "Namespaced"))
            (resource-symbol (intern type))
-           (plural-symbol (intern type))
-           (columns (kubed-ext--crd-column-specs
-                     (kubed-ext--crd-printer-columns crd)))
+	   (plural-symbol (intern type))
+	   (columns (kubed-ext--crd-column-specs
+	             (kubed-ext--crd-printer-columns crd)
+	             type))
            (metadata (list :type type
                            :kind kind
                            :group group
@@ -450,9 +499,9 @@ when an update is already in progress or the minibuffer is active."
           (kubed-ext-enrich-columns type nil
                                     (kubed-ext--crd-printer-columns crd))
         (eval `(kubed-define-resource ,resource-symbol
-                   ,columns
-                 :plural ,plural-symbol
-                 :namespaced ,namespaced)
+				      ,columns
+				      :plural ,plural-symbol
+				      :namespaced ,namespaced)
               t))
       (when (fboundp 'kubed-ext--patch-type-timestamp-columns)
         (kubed-ext--patch-type-timestamp-columns type))
@@ -466,6 +515,12 @@ when an update is already in progress or the minibuffer is active."
          (json-array-type 'list)
          (obj (json-read-from-string json-text)))
     (or (alist-get 'items obj) '())))
+
+(defun kubed-ext--parse-crd (json-text)
+  "Parse one kubectl CRD JSON-TEXT into an alist."
+  (let ((json-object-type 'alist)
+        (json-array-type 'list))
+    (json-read-from-string json-text)))
 
 (defun kubed-ext-discover-crds-async (&optional context force callback)
   "Discover CRDs in CONTEXT asynchronously and define Kubed resources.
@@ -490,9 +545,7 @@ number of CRD resources defined or updated."
                    (when (kubed-ext--define-crd-resource crd)
                      (cl-incf count)))
                  (puthash key 'done kubed-ext--crd-discovery-state)
-                 (when callback (funcall callback count))
-                 (message "Kubed-ext discovered %d CRD resource%s."
-                          count (if (= count 1) "" "s")))
+                 (when callback (funcall callback count)))
              (error
               (remhash key kubed-ext--crd-discovery-state)
               (message "Kubed-ext CRD discovery parse failed: %s" err))))
@@ -561,45 +614,50 @@ Refresh BUFFER if it is still displaying RESOURCE-PLURAL."
                      "api-resources" "--no-headers" "-o" "name")
                (when context (list "--context" context)))
        (lambda (api-output)
-         (if-let ((crd-name
-                   (kubed-ext--crd-name-from-api-resources
-                    resource-plural api-output)))
-             (kubed-ext--async-process
-              "kubed-ext-crd-columns"
-              (append (list kubed-kubectl-program
-                            "get" "crd" crd-name "-o"
-                            "jsonpath={.spec.versions[0].additionalPrinterColumns}")
-                      (when context (list "--context" context)))
-              (lambda (columns-output)
-                (remhash key kubed-ext--crd-column-processes)
-                (when-let ((cols (kubed-ext--parse-crd-printer-columns
-                                  columns-output)))
-                  (kubed-ext-enrich-columns resource-plural context cols)
-                  (kubed-ext--refresh-list-after-column-change
-                   buffer resource-plural context 10))))
-           (lambda (err)
-             (remhash key kubed-ext--crd-column-processes)
-             (message "kubed-ext CRD column discovery failed: %s" err)))
-         (remhash key kubed-ext--crd-column-processes)))
-      (lambda (err)
-        (remhash key kubed-ext--crd-column-processes)
-        (message "kubed-ext api-resources failed: %s" err)))))
+	 (if-let ((crd-name
+	           (kubed-ext--crd-name-from-api-resources
+	            resource-plural api-output)))
+	     (kubed-ext--async-process
+	      "kubed-ext-crd-columns"
+	      (append (list kubed-kubectl-program
+	                    "get" "crd" crd-name "-o" "json")
+	              (when context (list "--context" context)))
+	      (lambda (crd-output)
+	        (remhash key kubed-ext--crd-column-processes)
+	        (condition-case err
+	            (let* ((crd (kubed-ext--parse-crd crd-output))
+	                   (cols (kubed-ext--crd-printer-columns crd)))
+	              (when cols
+	                (kubed-ext-enrich-columns resource-plural context cols)
+	                (kubed-ext--refresh-list-after-column-change
+	                 buffer resource-plural context 10)))
+	          (error
+	           (message "kubed-ext CRD column parse failed: %s" err))))
+	      (lambda (err)
+	        (remhash key kubed-ext--crd-column-processes)
+	        (message "kubed-ext CRD column discovery failed: %s" err)))
+	   (remhash key kubed-ext--crd-column-processes)))
+       (lambda (err)
+	 (remhash key kubed-ext--crd-column-processes)
+	 (message "kubed-ext api-resources failed: %s" err))))))
 
 (defun kubed-ext-enrich-columns (resource-plural context columns)
   "Inject CRD printer COLUMNS into kubed for RESOURCE-PLURAL in CONTEXT."
   (ignore context)
-  (when-let ((cols columns))
+  (when-let ((cols (kubed-ext--normalize-crd-printer-columns
+                    resource-plural columns)))
     (setf (alist-get resource-plural kubed--columns nil nil #'string=)
           (cons '("NAME:.metadata.name")
-                (kubed-ext--colorize-fetch-columns
-                 (mapcar
-                  (lambda (c)
-                    (cons (format "%s:%s"
-                                  (upcase (replace-regexp-in-string
-                                           "[ /]" "_" (alist-get 'name c)))
-                                  (alist-get 'jsonPath c))
-                          nil))
-                  cols))))
+	        (kubed-ext--colorize-fetch-columns
+	         (mapcar
+	          (lambda (c)
+	            (cons (format "%s:%s"
+	                          (upcase (replace-regexp-in-string
+	                                   "[ /]" "_" (alist-get 'name c)))
+	                          (alist-get 'jsonPath c))
+	                  nil))
+	          cols)
+	         resource-plural)))
     (let ((fmt-var (intern (format "kubed-%s-columns" resource-plural))))
       (when (boundp fmt-var)
         (set fmt-var
@@ -1278,8 +1336,22 @@ Set to nil to render every container, selector, and label row."
   "Return non-nil if HEADER is a Kubernetes restart count column."
   (member (upcase (string-trim (or header ""))) '("RESTARTS" "RESTART")))
 
-(defun kubed-ext--colorize-column-value (header value)
-  "Return VALUE propertized with a face based on column HEADER name."
+(defun kubed-ext--warnings-column-p (header)
+  "Return non-nil if HEADER is a warning summary column."
+  (string= (upcase (string-trim (or header ""))) "WARNINGS"))
+
+(defun kubed-ext--boolean-list-value-p (value)
+  "Return non-nil when VALUE is only comma-separated Kubernetes booleans."
+  (let ((parts (split-string (or value "") "," t "[[:space:]\n\r]+")))
+    (and parts
+         (seq-every-p
+          (lambda (part)
+            (member (downcase (string-trim part))
+                    '("true" "false" "unknown")))
+          parts))))
+
+(defun kubed-ext--colorize-column-value (header value &optional resource)
+  "Return VALUE propertized with a face based on HEADER and RESOURCE."
   (let ((h (upcase (string-trim (or header ""))))
         (value (if (stringp value) value (format "%s" value))))
     (cond
@@ -1310,37 +1382,49 @@ Set to nil to render every container, selector, and label row."
              (face (cond ((= n 0) nil)
                          ((< n 5) 'warning)
                          (t       'error))))
-        (if face
-            (propertize value 'face face 'kubed-sort-value n)
-          (propertize value 'kubed-sort-value n))))
+	(if face
+	    (propertize value 'face face 'kubed-sort-value n)
+	  (propertize value 'kubed-sort-value n))))
+     ((kubed-ext--warnings-column-p h)
+      (if (and (kubed-ext--strimzi-kafka-resource-p resource)
+	       (kubed-ext--boolean-list-value-p value))
+	  (propertize "" 'face 'shadow)
+	(propertize value 'face 'warning)))
      (t value))))
 
 (defun kubed-ext--colorize-wide-cell (header value)
   "Return VALUE propertized with a face based on column HEADER name."
   (kubed-ext--colorize-column-value header value))
 
-(defun kubed-ext--column-value-formatter (header formatter)
-  "Return a formatter that applies FORMATTER then colorizes HEADER value."
+(defun kubed-ext--column-value-formatter (header formatter &optional resource)
+  "Return a formatter that applies FORMATTER then colorizes HEADER value.
+RESOURCE enables resource-specific display formatting."
   (lambda (value)
     (kubed-ext--colorize-column-value
      header
-     (if formatter (funcall formatter value) value))))
+     (if formatter (funcall formatter value) value)
+     resource)))
 
-(defun kubed-ext--colorize-fetch-column (column)
-  "Attach generic status color formatting to COLUMN when appropriate."
+(defun kubed-ext--colorize-fetch-column (column &optional resource)
+  "Attach generic status color formatting to COLUMN when appropriate.
+RESOURCE enables resource-specific display formatting."
   (let* ((spec (if (consp column) (car column) column))
-         (header (kubed-ext--column-header spec)))
+	 (header (kubed-ext--column-header spec)))
     (if (or (kubed-ext--status-column-p header)
-            (kubed-ext--ready-column-p header)
-            (kubed-ext--restart-column-p header))
-        (cons spec
-              (kubed-ext--column-value-formatter
-               header (and (consp column) (cdr column))))
+	    (kubed-ext--ready-column-p header)
+	    (kubed-ext--restart-column-p header)
+	    (kubed-ext--warnings-column-p header))
+	(cons spec
+	      (kubed-ext--column-value-formatter
+	       header (and (consp column) (cdr column)) resource))
       column)))
 
-(defun kubed-ext--colorize-fetch-columns (columns)
-  "Attach status color formatting to matching COLUMNS."
-  (mapcar #'kubed-ext--colorize-fetch-column columns))
+(defun kubed-ext--colorize-fetch-columns (columns &optional resource)
+  "Attach status color formatting to matching COLUMNS.
+RESOURCE enables resource-specific display formatting."
+  (mapcar (lambda (column)
+	    (kubed-ext--colorize-fetch-column column resource))
+	  columns))
 
 ;; NOTE: Callees defined BEFORE the caller to satisfy the byte-compiler.
 
@@ -2917,7 +3001,7 @@ ERRBACK is called with error message on failure."
   "Refresh the current top buffer asynchronously."
   (interactive)
   (if kubed-ext-top--fetching
-      (message "Metrics fetch already in progress...")
+      (kubed-ext-top--set-status "Metrics fetch already in progress." 'shadow)
     (setq kubed-ext-top--fetching t)
     (kubed-ext-top--set-status "Fetching metrics..." 'shadow)
     (force-mode-line-update)
