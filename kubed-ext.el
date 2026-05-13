@@ -451,7 +451,8 @@ RESOURCE enables resource-specific display formatting."
 	                  (kubed-ext--ready-column-p name)
 	                  (kubed-ext--restart-column-p name)
 	                  (kubed-ext--warnings-column-p name))
-	          (kubed-ext--column-value-formatter name nil resource))))))
+	          (kubed-ext--column-value-formatter-for-resource
+	           name nil resource))))))
     columns)))
 
 (defun kubed-ext--crd-type (crd)
@@ -648,7 +649,7 @@ Refresh BUFFER if it is still displaying RESOURCE-PLURAL."
                     resource-plural columns)))
     (setf (alist-get resource-plural kubed--columns nil nil #'string=)
           (cons '("NAME:.metadata.name")
-	        (kubed-ext--colorize-fetch-columns
+	        (kubed-ext--colorize-fetch-columns-for-resource
 	         (mapcar
 	          (lambda (c)
 	            (cons (format "%s:%s"
@@ -1396,18 +1397,24 @@ Set to nil to render every container, selector, and label row."
   "Return VALUE propertized with a face based on column HEADER name."
   (kubed-ext--colorize-column-value header value))
 
-(defun kubed-ext--column-value-formatter (header formatter &optional resource)
-  "Return a formatter that applies FORMATTER then colorizes HEADER value.
-RESOURCE enables resource-specific display formatting."
+(defun kubed-ext--column-value-formatter (header formatter)
+  "Return a formatter that applies FORMATTER then colorizes HEADER value."
+  (lambda (value)
+    (kubed-ext--colorize-column-value
+     header
+     (if formatter (funcall formatter value) value))))
+
+(defun kubed-ext--column-value-formatter-for-resource
+    (header formatter resource)
+  "Return a formatter that colorizes HEADER value for RESOURCE."
   (lambda (value)
     (kubed-ext--colorize-column-value
      header
      (if formatter (funcall formatter value) value)
      resource)))
 
-(defun kubed-ext--colorize-fetch-column (column &optional resource)
-  "Attach generic status color formatting to COLUMN when appropriate.
-RESOURCE enables resource-specific display formatting."
+(defun kubed-ext--colorize-fetch-column (column)
+  "Attach generic status color formatting to COLUMN when appropriate."
   (let* ((spec (if (consp column) (car column) column))
 	 (header (kubed-ext--column-header spec)))
     (if (or (kubed-ext--status-column-p header)
@@ -1416,14 +1423,30 @@ RESOURCE enables resource-specific display formatting."
 	    (kubed-ext--warnings-column-p header))
 	(cons spec
 	      (kubed-ext--column-value-formatter
+	       header (and (consp column) (cdr column))))
+      column)))
+
+(defun kubed-ext--colorize-fetch-column-for-resource (column resource)
+  "Attach generic status color formatting to COLUMN for RESOURCE."
+  (let* ((spec (if (consp column) (car column) column))
+	 (header (kubed-ext--column-header spec)))
+    (if (or (kubed-ext--status-column-p header)
+	    (kubed-ext--ready-column-p header)
+	    (kubed-ext--restart-column-p header)
+	    (kubed-ext--warnings-column-p header))
+	(cons spec
+	      (kubed-ext--column-value-formatter-for-resource
 	       header (and (consp column) (cdr column)) resource))
       column)))
 
-(defun kubed-ext--colorize-fetch-columns (columns &optional resource)
-  "Attach status color formatting to matching COLUMNS.
-RESOURCE enables resource-specific display formatting."
+(defun kubed-ext--colorize-fetch-columns (columns)
+  "Attach status color formatting to matching COLUMNS."
+  (mapcar #'kubed-ext--colorize-fetch-column columns))
+
+(defun kubed-ext--colorize-fetch-columns-for-resource (columns resource)
+  "Attach status color formatting to matching COLUMNS for RESOURCE."
   (mapcar (lambda (column)
-	    (kubed-ext--colorize-fetch-column column resource))
+	    (kubed-ext--colorize-fetch-column-for-resource column resource))
 	  columns))
 
 ;; NOTE: Callees defined BEFORE the caller to satisfy the byte-compiler.
