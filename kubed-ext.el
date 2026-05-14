@@ -41,7 +41,7 @@
 (defvar read-eval)
 
 (defconst kubed-ext--display-buffer-rules
-  '(("\\`\\*Kubed [a-z][a-z0-9]*[@[]" (display-buffer-same-window))
+  '(("\\`\\*Kubed [a-z][a-z0-9.-]*[@[]" (display-buffer-same-window))
     ("\\`\\*kubed-top-" (display-buffer-same-window)))
   "Display rules installed by kubed-ext.")
 
