@@ -22,7 +22,8 @@ and native Emacs processes.
   ingresses, PVs/PVCs, workloads, events, autoscalers, PDBs, and CRDs.
 - *CRD auto-discovery*: reads =additionalPrinterColumns= from CRDs and injects
   them into kubed list buffers.  Strimzi Kafka views include k9s-like metadata
-  state and quieter warning display.
+  state and quieter warning display.  CRD metadata is cached on disk so resource
+  switching has custom resources immediately after startup.
 - *Async top*: non-blocking pod/node metrics buffers backed by =kubectl top=.
 - *Port-forwards*: discover ports from pods, services, and deployments; manage
   active forwards from one buffer; highlight rows with active forwards.
@@ -171,12 +172,21 @@ are tracked and highlighted in list buffers.
 
 ;; Enable command log when you want audit/debug detail.
 (setq kubed-ext-command-log-enabled t)
+
+;; CRD metadata cache.  Default:
+;; ~/.emacs.d/.cache/kubed-ext/crds/
+(setq kubed-ext-crd-cache-enabled t)
+(setq kubed-ext-crd-cache-directory
+      (expand-file-name ".cache/kubed-ext/crds/" user-emacs-directory))
 #+end_src
 
 * Notes
 
-- CRD discovery is cached by context/resource.  Use
-  =M-x kubed-ext-refresh-crd-columns= after installing or changing CRDs.
+- CRD discovery is cached in memory and on disk by context.  Cached CRDs load
+  first, then kubed-ext refreshes from the cluster asynchronously and rewrites
+  the cache when CRD metadata changes.
+- Use =M-x kubed-ext-refresh-crd-columns= when you want an immediate manual CRD
+  refresh.  It does not delete the disk cache.
 - Label selectors are sent to kubectl as =--selector=, so large lists filter on
   the API server.
 - Substring filtering is visual only: non-matching rows are dimmed, not removed.
