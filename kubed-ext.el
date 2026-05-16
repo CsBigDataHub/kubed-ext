@@ -219,7 +219,8 @@ Set to nil to disable production highlighting entirely."
   "Asynchronously prefetch namespace list for CONTEXT.
 Does nothing if namespaces are already cached or a fetch is in progress.
 This ensures `kubed-read-namespace' completions appear without delay."
-  (let ((ctx (or context (ignore-errors (kubed-local-context)))))
+  (let ((ctx (kubed-ext--usable-context
+              (or context (ignore-errors (kubed-local-context))))))
     (when ctx
       (condition-case nil
           (when (and (not (alist-get 'resources
@@ -692,7 +693,7 @@ RESOURCE enables resource-specific display formatting."
         (with-temp-buffer
           (insert-file-contents (kubed-ext--crd-cache-file context))
           (let ((payload
-                 (cl-letf (((symbol-value 'read-eval) nil))
+                 (let ((read-eval nil))
                    (read (current-buffer)))))
             (when (kubed-ext--crd-cache-payload-valid-p payload context)
               payload)))
@@ -761,7 +762,8 @@ Non-nil FORCE reloads even when this context was already loaded."
 Non-nil FORCE ignores the cached discovery state.  CALLBACK receives the
 number of CRD resources defined or updated."
   (when kubed-ext-auto-discover-crds
-    (let ((ctx (or context (ignore-errors (kubed-local-context)))))
+    (let ((ctx (kubed-ext--usable-context
+                (or context (ignore-errors (kubed-local-context))))))
       (when force
         (kubed-ext--forget-crd-context-state ctx))
       (let* ((key (kubed-ext--crd-context-key ctx))
@@ -1000,7 +1002,8 @@ ATTEMPTS bounds retries while an upstream kubed update is still running."
 (defun kubed-ext-refresh-crd-columns ()
   "Force re-discovery of CRDs and CRD columns for the current context."
   (interactive)
-  (let ((context (ignore-errors (kubed-local-context))))
+  (let ((context (kubed-ext--usable-context
+                  (ignore-errors (kubed-local-context)))))
     (clrhash kubed-ext-enriched-resources)
     (kubed-ext--forget-crd-context-state context)
     (kubed-ext-discover-crds-async
@@ -1013,7 +1016,8 @@ ATTEMPTS bounds retries while an upstream kubed update is still running."
 (defun kubed-ext-warm-crd-cache (&optional context)
   "Load cached CRDs for CONTEXT immediately, then refresh them asynchronously."
   (interactive)
-  (let ((ctx (or context (ignore-errors (kubed-local-context)))))
+  (let ((ctx (kubed-ext--usable-context
+              (or context (ignore-errors (kubed-local-context))))))
     (when ctx
       (kubed-ext--load-crd-cache ctx)
       (kubed-ext-discover-crds-async ctx))))
@@ -4860,12 +4864,21 @@ auto-refresh timer if it is running."
        (string-match-p kubed-ext--context-error-regexp context)))
 
 (defun kubed-ext--current-context-safe ()
-  "Return current kubectl context, or nil if it cannot be trusted."
-  (let ((context (ignore-errors (kubed-current-context))))
-    (when (and (stringp context)
-               (not (string-empty-p (string-trim context)))
-               (not (kubed-ext--context-error-string-p context)))
-      context)))
+  "Return current kubectl context, ignoring any auth noise in output."
+  (let* ((contexts (ignore-errors (kubed-contexts)))
+         (lines (ignore-errors
+                  (with-temp-buffer
+                    (process-file (kubed-kubectl-program) nil t nil
+                                  "config" "current-context")
+                    (string-lines (buffer-string) t)))))
+    (or (seq-find
+         (lambda (line)
+           (and (stringp line)
+                (not (string-empty-p (string-trim line)))
+                (not (kubed-ext--context-error-string-p line))
+                (or (null contexts) (member line contexts))))
+         lines)
+        (car contexts))))
 
 (defun kubed-ext--usable-context (context)
   "Return a context safe to pass to kubectl.
