@@ -4529,16 +4529,29 @@ Creates the buffer if it does not exist."
   (when (derived-mode-p 'kubed-list-mode)
     (let* ((ctx kubed-list-context)
            (ns kubed-list-namespace)
+           ;; Ensure the CRD cache is loaded for this context before building
+           ;; the choices list.  This is a no-op when already loaded, but it
+           ;; matters for freshly-opened cluster buffers where async discovery
+           ;; may not have completed yet.
+           (_ (kubed-ext--load-crd-cache ctx))
            (_ (kubed-ext-discover-crds-async ctx))
            (choices (kubed-ext--resource-choices ctx))
            (sel (completing-read "Switch to resource: " choices nil t))
            (type (alist-get sel choices nil nil #'string=)))
       (when type
         (let ((fn (intern (format "kubed-list-%s" type))))
-          (when (fboundp fn)
-            (if (kubed-ext--resource-namespaced-p type ctx)
-                (funcall fn ctx (or ns (kubed--namespace ctx)))
-              (funcall fn ctx))))))))
+          (if (fboundp fn)
+              (if (kubed-ext--resource-namespaced-p type ctx)
+                  (funcall fn ctx (or ns (kubed--namespace ctx)))
+                (funcall fn ctx))
+            ;; CRD function not yet defined — cache may still be loading.
+            ;; Trigger a forced refresh so subsequent attempts succeed.
+            (message "kubed-ext: resource `%s' not ready; refreshing CRD cache..." type)
+            (kubed-ext-discover-crds-async
+             ctx t
+             (lambda (count)
+               (message "kubed-ext: CRD cache refreshed (%d resource%s); try switching again."
+                        count (if (= count 1) "" "s"))))))))))
 
 (defun kubed-ext-jump-pods ()
   "Jump to Pods."
