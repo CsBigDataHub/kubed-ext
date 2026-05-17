@@ -219,7 +219,8 @@ Set to nil to disable production highlighting entirely."
   "Asynchronously prefetch namespace list for CONTEXT.
 Does nothing if namespaces are already cached or a fetch is in progress.
 This ensures `kubed-read-namespace' completions appear without delay."
-  (let ((ctx (or context (ignore-errors (kubed-local-context)))))
+  (let ((ctx (kubed-ext--usable-context
+              (or context (ignore-errors (kubed-local-context))))))
     (when ctx
       (condition-case nil
           (when (and (not (alist-get 'resources
@@ -378,7 +379,13 @@ cleanup.")
                (funcall callback output)
              (when errback
                (funcall errback
-                        (format "%s exited %d" (car command) code))))))))))
+                        (string-trim
+                         (format "%s exited %d%s"
+                                 (car command)
+                                 code
+                                 (if (string-empty-p (string-trim output))
+                                     ""
+                                   (concat ": " output)))))))))))))
 
 (defun kubed-ext--crd-context-key (context)
   "Return a stable cache key for CONTEXT."
@@ -692,7 +699,7 @@ RESOURCE enables resource-specific display formatting."
         (with-temp-buffer
           (insert-file-contents (kubed-ext--crd-cache-file context))
           (let ((payload
-                 (cl-letf (((symbol-value 'read-eval) nil))
+                 (let ((read-eval nil))
                    (read (current-buffer)))))
             (when (kubed-ext--crd-cache-payload-valid-p payload context)
               payload)))
@@ -756,12 +763,18 @@ Non-nil FORCE reloads even when this context was already loaded."
         (json-array-type 'list))
     (json-read-from-string json-text)))
 
+(defun kubed-ext--expected-crd-discovery-error-p (err)
+  "Return non-nil if ERR is an expected CRD discovery startup failure."
+  (or (kubed-ext--auth-error-p err)
+      (kubed-ext--context-error-string-p err)))
+
 (defun kubed-ext-discover-crds-async (&optional context force callback)
   "Discover CRDs in CONTEXT asynchronously and define Kubed resources.
 Non-nil FORCE ignores the cached discovery state.  CALLBACK receives the
 number of CRD resources defined or updated."
   (when kubed-ext-auto-discover-crds
-    (let ((ctx (or context (ignore-errors (kubed-local-context)))))
+    (let ((ctx (kubed-ext--usable-context
+                (or context (ignore-errors (kubed-local-context))))))
       (when force
         (kubed-ext--forget-crd-context-state ctx))
       (let* ((key (kubed-ext--crd-context-key ctx))
@@ -796,7 +809,8 @@ number of CRD resources defined or updated."
                 (message "Kubed-ext CRD discovery parse failed: %s" err))))
            (lambda (err)
              (remhash key kubed-ext--crd-discovery-state)
-             (unless cache-count
+             (unless (or cache-count
+                         (kubed-ext--expected-crd-discovery-error-p err))
                (message "Kubed-ext CRD discovery failed: %s" err)))))))))
 
 (defun kubed-ext-crd-resource-choices (&optional context)
@@ -1000,7 +1014,8 @@ ATTEMPTS bounds retries while an upstream kubed update is still running."
 (defun kubed-ext-refresh-crd-columns ()
   "Force re-discovery of CRDs and CRD columns for the current context."
   (interactive)
-  (let ((context (ignore-errors (kubed-local-context))))
+  (let ((context (kubed-ext--usable-context
+                  (ignore-errors (kubed-local-context)))))
     (clrhash kubed-ext-enriched-resources)
     (kubed-ext--forget-crd-context-state context)
     (kubed-ext-discover-crds-async
@@ -1013,7 +1028,8 @@ ATTEMPTS bounds retries while an upstream kubed update is still running."
 (defun kubed-ext-warm-crd-cache (&optional context)
   "Load cached CRDs for CONTEXT immediately, then refresh them asynchronously."
   (interactive)
-  (let ((ctx (or context (ignore-errors (kubed-local-context)))))
+  (let ((ctx (kubed-ext--usable-context
+              (or context (ignore-errors (kubed-local-context))))))
     (when ctx
       (kubed-ext--load-crd-cache ctx)
       (kubed-ext-discover-crds-async ctx))))
@@ -3304,18 +3320,18 @@ ERRBACK is called with error message on failure."
         (failed nil)
         (called nil))
     (cl-labels ((maybe-finish ()
-                  (when (and (not failed)
-                             (not called)
-                             (aref done 0)
-                             (aref done 1))
-                    (setq called t)
-                    (funcall callback
-                             (list (aref results 0) (aref results 1)))))
+                              (when (and (not failed)
+                                         (not called)
+                                         (aref done 0)
+                                         (aref done 1))
+                                (setq called t)
+                                (funcall callback
+                                         (list (aref results 0) (aref results 1)))))
                 (fail (err)
-                  (unless failed
-                    (setq failed t)
-                    (when errback
-                      (funcall errback err)))))
+                      (unless failed
+                        (setq failed t)
+                        (when errback
+                          (funcall errback err)))))
       (kubed-ext--async-kubectl
        args1
        (lambda (out)
@@ -4513,16 +4529,29 @@ Creates the buffer if it does not exist."
   (when (derived-mode-p 'kubed-list-mode)
     (let* ((ctx kubed-list-context)
            (ns kubed-list-namespace)
+           ;; Ensure the CRD cache is loaded for this context before building
+           ;; the choices list.  This is a no-op when already loaded, but it
+           ;; matters for freshly-opened cluster buffers where async discovery
+           ;; may not have completed yet.
+           (_ (kubed-ext--load-crd-cache ctx))
            (_ (kubed-ext-discover-crds-async ctx))
            (choices (kubed-ext--resource-choices ctx))
            (sel (completing-read "Switch to resource: " choices nil t))
            (type (alist-get sel choices nil nil #'string=)))
       (when type
         (let ((fn (intern (format "kubed-list-%s" type))))
-          (when (fboundp fn)
-            (if (kubed-ext--resource-namespaced-p type ctx)
-                (funcall fn ctx (or ns (kubed--namespace ctx)))
-              (funcall fn ctx))))))))
+          (if (fboundp fn)
+              (if (kubed-ext--resource-namespaced-p type ctx)
+                  (funcall fn ctx (or ns (kubed--namespace ctx)))
+                (funcall fn ctx))
+            ;; CRD function not yet defined — cache may still be loading.
+            ;; Trigger a forced refresh so subsequent attempts succeed.
+            (message "kubed-ext: resource `%s' not ready; refreshing CRD cache..." type)
+            (kubed-ext-discover-crds-async
+             ctx t
+             (lambda (count)
+               (message "kubed-ext: CRD cache refreshed (%d resource%s); try switching again."
+                        count (if (= count 1) "" "s"))))))))))
 
 (defun kubed-ext-jump-pods ()
   "Jump to Pods."
@@ -4753,21 +4782,19 @@ auto-refresh timer if it is running."
 ;;; § 21.  Circuit Breaker — Intelligent VPN / Network Recovery
 ;;; ═══════════════════════════════════════════════════════════════
 ;;
-;; Each kubectl context has an independent circuit in one of three states:
+;; Each kubectl context has an independent circuit in one of two states:
 ;;
 ;;   closed  — normal; auto-refresh runs freely.
 ;;   network — cluster unreachable (VPN, DNS, TLS, timeout).
 ;;             Trips after `kubed-ext-cb-threshold' consecutive network
 ;;             errors.  Recovery probes with exponential back-off are
 ;;             scheduled automatically; circuit closes on probe success.
-;;   auth    — credentials expired (kubelogin, AADSTS, az-cli).
-;;             Trips after `kubed-ext-cb-auth-threshold' consecutive auth
-;;             errors.  No automatic probing — user must re-authenticate
-;;             then press `g' or `Z' to resume.
 ;;
-;; Both open states suppress auto-refresh.  Mode-line indicators:
+;; Network outages suppress auto-refresh.  Authentication failures are shown
+;; as transient headers only; each refresh runs a new kubectl process, so exec
+;; credential plugins such as kubelogin/Azure CLI get a fresh chance to renew.
+;; Mode-line indicator:
 ;;   ⚡~Xs     network outage  (X = seconds until next probe)
-;;   🔑 re-auth  credential issue
 
 (defgroup kubed-ext-circuit-breaker nil
   "Per-context circuit breaker for kubed-ext auto-refresh."
@@ -4775,11 +4802,6 @@ auto-refresh timer if it is running."
 
 (defcustom kubed-ext-cb-threshold 3
   "Consecutive network failures before the circuit opens for a context."
-  :type 'natnum
-  :group 'kubed-ext-circuit-breaker)
-
-(defcustom kubed-ext-cb-auth-threshold 2
-  "Consecutive auth failures before auto-refresh is paused for a context."
   :type 'natnum
   :group 'kubed-ext-circuit-breaker)
 
@@ -4802,15 +4824,11 @@ auto-refresh timer if it is running."
 
 (defvar kubed-ext--cb-open
   (make-hash-table :test 'equal)
-  "Circuit state per context: nil (closed), `network', or `auth'.")
+  "Circuit state per context: nil (closed) or `network'.")
 
 (defvar kubed-ext--cb-net-failures
   (make-hash-table :test 'equal)
   "Consecutive network-error count per context.")
-
-(defvar kubed-ext--cb-auth-failures
-  (make-hash-table :test 'equal)
-  "Consecutive auth-error count per context.")
 
 (defvar kubed-ext--cb-backoff
   (make-hash-table :test 'equal)
@@ -4838,9 +4856,22 @@ auto-refresh timer if it is running."
   '("AzureCLICredential" "kubelogin failed" "AADSTS"
     "failed to get token" "getting credentials: exec"
     "exec: executable kubelogin" "TokenRequestError"
+    "Run the command below" "authenticate interactively"
+    "additional arguments may be added"
     "invalid_client" "Unauthorized" "unauthorized"
     "az login" "az logout")
   "Kubectl error substrings indicating expired or invalid credentials.")
+
+(defconst kubed-ext--context-error-patterns
+  '("Error:" "failed to get token" "AzureCLICredential" "AADSTS"
+    "kubelogin failed" "Run the command below"
+    "authenticate interactively" "additional arguments may be added"
+    "context \"" "does not exist")
+  "Substrings that indicate a value is an error, not a context name.")
+
+(defconst kubed-ext--context-error-regexp
+  (regexp-opt kubed-ext--context-error-patterns)
+  "Regexp matching error strings that are not valid context names.")
 
 (defun kubed-ext--network-error-p (msg)
   "Return non-nil if MSG indicates a transient network or VPN failure."
@@ -4856,10 +4887,117 @@ auto-refresh timer if it is running."
                    (string-match-p (regexp-quote pat) msg))
                  kubed-ext--auth-error-patterns)))
 
+(defun kubed-ext--context-error-string-p (context)
+  "Return non-nil if CONTEXT is an error string."
+  (and (stringp context)
+       (string-match-p kubed-ext--context-error-regexp context)))
+
+(defun kubed-ext--current-context-safe ()
+  "Return current kubectl context, ignoring any auth noise in output."
+  (let* ((contexts (seq-filter
+                    (lambda (context)
+                      (and (stringp context)
+                           (not (string-empty-p (string-trim context)))
+                           (not (kubed-ext--context-error-string-p context))))
+                    (or (ignore-errors (kubed-contexts)) '())))
+         (lines (ignore-errors
+                  (with-temp-buffer
+                    (process-file (kubed-kubectl-program) nil t nil
+                                  "config" "current-context")
+                    (string-lines (buffer-string) t)))))
+    (or (seq-find
+         (lambda (line)
+           (and (stringp line)
+                (not (string-empty-p (string-trim line)))
+                (not (kubed-ext--context-error-string-p line))
+                (or (null contexts) (member line contexts))))
+         lines)
+        (car contexts))))
+
+(defun kubed-ext--usable-context (context)
+  "Return a context safe to pass to kubectl.
+If CONTEXT has been poisoned with an error string, fall back to the
+current kubectl context.  If no safe context can be found, return nil so
+kubectl can use its configured current context without `--context'."
+  (if (kubed-ext--context-error-string-p context)
+      (kubed-ext--current-context-safe)
+    context))
+
+(defun kubed-ext--repair-current-list-context ()
+  "Repair current list buffer if its context has an error string."
+  (when (and (derived-mode-p 'kubed-list-mode)
+             (kubed-ext--context-error-string-p kubed-list-context))
+    (setq kubed-list-context (kubed-ext--usable-context kubed-list-context))))
+
+(defvar kubed-ext--context-namespace-poisoned nil
+  "Non-nil when a poisoned context/namespace cache entry has been detected.
+Set by the `kubed-default-context-and-namespace' advice after a failed
+resolution so the next call knows to re-sanitize.  Reset to nil once
+sanitization runs successfully with nothing found.")
+
+(defun kubed-ext--sanitize-cached-context-namespace ()
+  "Clear poisoned entries from `kubed-default-context-and-namespace-alist'.
+When kubectl fails (e.g. expired Azure token during `az login'), kubed
+caches the error string as both the context and namespace.  This function
+detects those poisoned entries and removes them so kubed will re-resolve
+on the next call.  Return non-nil when any entries were cleared."
+  (when (boundp 'kubed-default-context-and-namespace-alist)
+    (let ((poisoned nil))
+      (dolist (entry kubed-default-context-and-namespace-alist)
+        (let ((ctx-ns (cdr entry)))
+          (when (and (consp ctx-ns)
+                     (or (kubed-ext--context-error-string-p (car ctx-ns))
+                         (kubed-ext--context-error-string-p (cdr ctx-ns))))
+            (push entry poisoned))))
+      (cond
+       (poisoned
+        (dolist (bad poisoned)
+          (setf (alist-get (car bad)
+                           kubed-default-context-and-namespace-alist
+                           nil 'remove)
+                nil))
+        (message "Kubed-ext: cleared %d poisoned context/namespace cache %s"
+                 (length poisoned)
+                 (if (= (length poisoned) 1) "entry" "entries"))
+        t)
+       (t
+        (setq kubed-ext--context-namespace-poisoned nil)
+        nil)))))
+
+(defun kubed-ext--around-default-context-and-namespace (orig-fn &rest args)
+  "Advice around `kubed-default-context-and-namespace'.
+Before calling ORIG-FN, clear any cached entries where the context or
+namespace is actually a kubectl error string.  If the fresh result is
+still poisoned (kubectl failed again), clear it and return nil so the
+caller can retry later.
+
+Sanitization is skipped when no poisoning has been detected, keeping the
+hot path (cache hit with valid data) free of extra work."
+  (when kubed-ext--context-namespace-poisoned
+    (kubed-ext--sanitize-cached-context-namespace))
+  (let ((result (apply orig-fn args)))
+    (if (and (consp result)
+             (or (kubed-ext--context-error-string-p (car result))
+                 (kubed-ext--context-error-string-p (cdr result))))
+        ;; Result is poisoned — flag it so the next call re-sanitizes,
+        ;; and clear the cached entry now.
+        (progn
+          (setq kubed-ext--context-namespace-poisoned t)
+          (kubed-ext--sanitize-cached-context-namespace)
+          nil)
+      result)))
+
+(advice-add 'kubed-default-context-and-namespace
+            :around #'kubed-ext--around-default-context-and-namespace)
+
+;; Arm the flag at load time so the first call checks for a poisoned cache
+;; inherited from a previous Emacs session or an earlier failed kubectl call.
+(setq kubed-ext--context-namespace-poisoned t)
+
 ;; ── State accessors ───────────────────────────────────────────────
 
 (defun kubed-ext--cb-open-p (context)
-  "Return open reason for CONTEXT (`network' or `auth'), or nil if closed."
+  "Return open reason for CONTEXT, or nil if closed."
   (gethash (or context "") kubed-ext--cb-open))
 
 (defun kubed-ext--cb-backoff-for (context)
@@ -4943,7 +5081,6 @@ Tries several buffer-naming conventions that kubed may use."
   (let* ((ctx   (or context ""))
          (timer (gethash ctx kubed-ext--cb-probe-timers)))
     (puthash ctx 0   kubed-ext--cb-net-failures)
-    (puthash ctx 0   kubed-ext--cb-auth-failures)
     (puthash ctx nil kubed-ext--cb-open)
     (puthash ctx kubed-ext-cb-initial-backoff kubed-ext--cb-backoff)
     (when (timerp timer) (cancel-timer timer))
@@ -4974,35 +5111,29 @@ Tries several buffer-naming conventions that kubed may use."
     (kubed-ext--cb-refresh-mode-lines ctx)
     (kubed-ext--cb-schedule-probe ctx delay)))
 
-(defun kubed-ext--cb-trip-auth (context err-msg)
-  "Open the circuit with reason `auth' for CONTEXT/ERR-MSG."
+(defun kubed-ext--show-auth-error (context err-msg)
+  "Show an auth error for CONTEXT ERR-MSG without opening the refresh circuit."
   (let* ((ctx     (or context ""))
          (summary (kubed-ext--cb-auth-summary err-msg)))
-    (puthash ctx 'auth kubed-ext--cb-open)
-    (puthash ctx kubed-ext-cb-initial-backoff kubed-ext--cb-backoff)
-    (message "Kubed 🔑 [%s]: auth paused — %s  [re-auth then press `g' or `Z']"
+    (kubed-ext--cb-reset-state ctx)
+    (message "Kubed 🔑 [%s]: auth error — %s  [refresh retries credentials]"
              ctx summary)
     (kubed-ext--cb-set-header
-     ctx (format "🔑 Auth expired — %s  [Press `g' or `Z' to resume]" summary))
+     ctx (format "🔑 Auth error — %s  [Refresh will retry credentials]"
+                 summary))
     (kubed-ext--cb-refresh-mode-lines ctx)))
 
 (defun kubed-ext--cb-on-failure (context err-msg)
   "Record a kubectl failure for CONTEXT with error message ERR-MSG.
-Auth and network errors are counted toward separate thresholds.
-When either threshold is reached the circuit opens, suppressing
-auto-refresh.  Unknown errors are silently ignored."
+Network errors are counted toward the circuit threshold.  Auth errors
+are displayed but do not pause refresh; the next kubectl call can renew
+exec credentials.  Unknown errors are silently ignored."
   (let ((ctx (or context "")))
     (cond
-     ;; ── Auth / credential error ───────────────────────────────
-     ;; Only act while the circuit is not already in `auth' state.
-     ((and (kubed-ext--auth-error-p err-msg)
-           (not (eq (kubed-ext--cb-open-p ctx) 'auth)))
-      (let* ((n   (1+ (gethash ctx kubed-ext--cb-auth-failures 0)))
-             (thr kubed-ext-cb-auth-threshold))
-        (puthash ctx n kubed-ext--cb-auth-failures)
-        (if (>= n thr)
-            (kubed-ext--cb-trip-auth ctx err-msg)
-          nil)))
+     ;; Auth / credential error: let the next refresh retry kubectl's
+     ;; exec credential flow instead of blocking the view.
+     ((kubed-ext--auth-error-p err-msg)
+      (kubed-ext--show-auth-error ctx err-msg))
 
      ;; ── Network / transport error ─────────────────────────────
      ;; Only act while the circuit is fully closed.
@@ -5030,8 +5161,8 @@ auto-refresh.  Unknown errors are silently ignored."
   "Run a `kubectl api-versions' connectivity probe for CONTEXT.
 
 exit 0         → success; close circuit.
-auth error     → network is up but credentials expired; switch to
-                 `auth' state and stop scheduling further probes.
+auth error     → network is up but credentials failed; close circuit and
+                 let normal refresh retry the exec credential flow.
 network error  → still unreachable; double back-off and reschedule.
 other error    → server responded; close circuit."
   (let ((ctx (or context "")))
@@ -5060,17 +5191,10 @@ other error    → server responded; close circuit."
                 ((zerop code)
                  (kubed-ext--cb-on-success ctx))
 
-                ;; Network is up but credentials have expired.
-                ;; Switch to `auth' state — no more probes until manual reset.
+                ;; Network is up but credentials failed.  Close the network
+                ;; circuit and let normal refresh retry authentication.
                 ((kubed-ext--auth-error-p output)
-                 (puthash ctx 'auth kubed-ext--cb-open)
-                 (kubed-ext--cb-set-header
-                  ctx (concat "🔑 Network restored but credentials expired"
-                              "  [Re-auth, then press `g' or `Z']"))
-                 (kubed-ext--cb-refresh-mode-lines ctx)
-                 (message
-                  "Kubed 🔑 [%s]: network OK but credentials expired — re-auth then press `g'."
-                  ctx))
+                 (kubed-ext--show-auth-error ctx output))
 
                 ;; Cluster still unreachable — exponential back-off.
                 ((kubed-ext--network-error-p output)
@@ -5115,6 +5239,7 @@ routine refresh messages."
   (kubed-ext--patch-type-timestamp-columns type)
   (unless host
     (setq host (file-remote-p default-directory)))
+  (setq context (kubed-ext--usable-context context))
   (when (process-live-p
          (alist-get 'process (kubed--alist host type context namespace)))
     (user-error "Update in progress"))
@@ -5214,9 +5339,9 @@ the custom-column parser layout."
       (walk-windows
        (lambda (win)
          (let ((buf (window-buffer win)))
-             (when (memq buf bufs)
-               (set-window-point
-                win (with-current-buffer buf (point))))))))))
+           (when (memq buf bufs)
+             (set-window-point
+              win (with-current-buffer buf (point))))))))))
 
 (defun kubed-ext--kubed-package-version ()
   "Return installed kubed package version string when available."
@@ -5278,6 +5403,7 @@ the custom-column parser layout."
 (defun kubed-ext--cb-before-manual-refresh (&rest _)
   "Before-advice on `kubed-list-update': clear an open circuit on `g'.
 This gives the cluster an immediate retry without waiting for a probe."
+  (kubed-ext--repair-current-list-context)
   (when (and (derived-mode-p 'kubed-list-mode)
              (kubed-ext--cb-open-p kubed-list-context))
     (kubed-ext--cb-reset-state kubed-list-context)
@@ -5394,14 +5520,6 @@ Reschedules itself after each tick with a fresh random delay."
                                            "Auto-refresh paused; probing in ~%ds.\n"
                                            "Press `g' or `Z' to retry immediately.")
                                    ctx secs))))
-
-            ((eq reason 'auth)
-             (propertize " 🔑 re-auth"
-                         'face      'warning
-                         'help-echo
-                         (format (concat "Credentials expired for `%s'.\n"
-                                         "Re-authenticate, then press `g' or `Z'.")
-                                 ctx)))
 
             (t
              (concat
@@ -6163,6 +6281,8 @@ CONTEXT and NAMESPACE are optional; defaults to current context/namespace."
   (advice-remove 'kubed-display-resource-revert
                  #'kubed-ext--display-revert-format)
   (advice-remove 'kubed-update #'kubed-ext--kubed-update)
+  (advice-remove 'kubed-default-context-and-namespace
+                 #'kubed-ext--around-default-context-and-namespace)
   (advice-remove 'kubed-logs #'kubed-ext-stern-logs)
   (advice-remove 'make-process 'kubed-ext--make-process-logger)
   (advice-remove 'call-process 'kubed-ext--call-process-logger)
