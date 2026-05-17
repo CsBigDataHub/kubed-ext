@@ -379,7 +379,13 @@ cleanup.")
                (funcall callback output)
              (when errback
                (funcall errback
-                        (format "%s exited %d" (car command) code))))))))))
+                        (string-trim
+                         (format "%s exited %d%s"
+                                 (car command)
+                                 code
+                                 (if (string-empty-p (string-trim output))
+                                     ""
+                                   (concat ": " output)))))))))))))
 
 (defun kubed-ext--crd-context-key (context)
   "Return a stable cache key for CONTEXT."
@@ -757,6 +763,11 @@ Non-nil FORCE reloads even when this context was already loaded."
         (json-array-type 'list))
     (json-read-from-string json-text)))
 
+(defun kubed-ext--expected-crd-discovery-error-p (err)
+  "Return non-nil if ERR is an expected CRD discovery startup failure."
+  (or (kubed-ext--auth-error-p err)
+      (kubed-ext--context-error-string-p err)))
+
 (defun kubed-ext-discover-crds-async (&optional context force callback)
   "Discover CRDs in CONTEXT asynchronously and define Kubed resources.
 Non-nil FORCE ignores the cached discovery state.  CALLBACK receives the
@@ -798,7 +809,8 @@ number of CRD resources defined or updated."
                 (message "Kubed-ext CRD discovery parse failed: %s" err))))
            (lambda (err)
              (remhash key kubed-ext--crd-discovery-state)
-             (unless cache-count
+             (unless (or cache-count
+                         (kubed-ext--expected-crd-discovery-error-p err))
                (message "Kubed-ext CRD discovery failed: %s" err)))))))))
 
 (defun kubed-ext-crd-resource-choices (&optional context)
@@ -3308,18 +3320,18 @@ ERRBACK is called with error message on failure."
         (failed nil)
         (called nil))
     (cl-labels ((maybe-finish ()
-                  (when (and (not failed)
-                             (not called)
-                             (aref done 0)
-                             (aref done 1))
-                    (setq called t)
-                    (funcall callback
-                             (list (aref results 0) (aref results 1)))))
+                              (when (and (not failed)
+                                         (not called)
+                                         (aref done 0)
+                                         (aref done 1))
+                                (setq called t)
+                                (funcall callback
+                                         (list (aref results 0) (aref results 1)))))
                 (fail (err)
-                  (unless failed
-                    (setq failed t)
-                    (when errback
-                      (funcall errback err)))))
+                      (unless failed
+                        (setq failed t)
+                        (when errback
+                          (funcall errback err)))))
       (kubed-ext--async-kubectl
        args1
        (lambda (out)
@@ -4831,13 +4843,17 @@ auto-refresh timer if it is running."
   '("AzureCLICredential" "kubelogin failed" "AADSTS"
     "failed to get token" "getting credentials: exec"
     "exec: executable kubelogin" "TokenRequestError"
+    "Run the command below" "authenticate interactively"
+    "additional arguments may be added"
     "invalid_client" "Unauthorized" "unauthorized"
     "az login" "az logout")
   "Kubectl error substrings indicating expired or invalid credentials.")
 
 (defconst kubed-ext--context-error-patterns
   '("Error:" "failed to get token" "AzureCLICredential" "AADSTS"
-    "kubelogin failed" "context \"" "does not exist")
+    "kubelogin failed" "Run the command below"
+    "authenticate interactively" "additional arguments may be added"
+    "context \"" "does not exist")
   "Substrings that indicate a value is an error, not a context name.")
 
 (defconst kubed-ext--context-error-regexp
@@ -4859,13 +4875,18 @@ auto-refresh timer if it is running."
                  kubed-ext--auth-error-patterns)))
 
 (defun kubed-ext--context-error-string-p (context)
-  "Return non-nil when CONTEXT looks like an error string."
+  "Return non-nil if CONTEXT is an error string."
   (and (stringp context)
        (string-match-p kubed-ext--context-error-regexp context)))
 
 (defun kubed-ext--current-context-safe ()
   "Return current kubectl context, ignoring any auth noise in output."
-  (let* ((contexts (ignore-errors (kubed-contexts)))
+  (let* ((contexts (seq-filter
+                    (lambda (context)
+                      (and (stringp context)
+                           (not (string-empty-p (string-trim context)))
+                           (not (kubed-ext--context-error-string-p context))))
+                    (or (ignore-errors (kubed-contexts)) '())))
          (lines (ignore-errors
                   (with-temp-buffer
                     (process-file (kubed-kubectl-program) nil t nil
@@ -4883,18 +4904,82 @@ auto-refresh timer if it is running."
 (defun kubed-ext--usable-context (context)
   "Return a context safe to pass to kubectl.
 If CONTEXT has been poisoned with an error string, fall back to the
-current kubectl context."
+current kubectl context.  If no safe context can be found, return nil so
+kubectl can use its configured current context without `--context'."
   (if (kubed-ext--context-error-string-p context)
-      (or (kubed-ext--current-context-safe)
-          (user-error (concat "Kubed context is an auth error and no current "
-                              "kubectl context is available")))
+      (kubed-ext--current-context-safe)
     context))
 
 (defun kubed-ext--repair-current-list-context ()
-  "Repair current list buffer when its context contains an error string."
+  "Repair current list buffer if its context has an error string."
   (when (and (derived-mode-p 'kubed-list-mode)
              (kubed-ext--context-error-string-p kubed-list-context))
     (setq kubed-list-context (kubed-ext--usable-context kubed-list-context))))
+
+(defvar kubed-ext--context-namespace-poisoned nil
+  "Non-nil when a poisoned context/namespace cache entry has been detected.
+Set by the `kubed-default-context-and-namespace' advice after a failed
+resolution so the next call knows to re-sanitize.  Reset to nil once
+sanitization runs successfully with nothing found.")
+
+(defun kubed-ext--sanitize-cached-context-namespace ()
+  "Clear poisoned entries from `kubed-default-context-and-namespace-alist'.
+When kubectl fails (e.g. expired Azure token during `az login'), kubed
+caches the error string as both the context and namespace.  This function
+detects those poisoned entries and removes them so kubed will re-resolve
+on the next call.  Return non-nil when any entries were cleared."
+  (when (boundp 'kubed-default-context-and-namespace-alist)
+    (let ((poisoned nil))
+      (dolist (entry kubed-default-context-and-namespace-alist)
+        (let ((ctx-ns (cdr entry)))
+          (when (and (consp ctx-ns)
+                     (or (kubed-ext--context-error-string-p (car ctx-ns))
+                         (kubed-ext--context-error-string-p (cdr ctx-ns))))
+            (push entry poisoned))))
+      (cond
+       (poisoned
+        (dolist (bad poisoned)
+          (setf (alist-get (car bad)
+                           kubed-default-context-and-namespace-alist
+                           nil 'remove)
+                nil))
+        (message "Kubed-ext: cleared %d poisoned context/namespace cache %s"
+                 (length poisoned)
+                 (if (= (length poisoned) 1) "entry" "entries"))
+        t)
+       (t
+        (setq kubed-ext--context-namespace-poisoned nil)
+        nil)))))
+
+(defun kubed-ext--around-default-context-and-namespace (orig-fn &rest args)
+  "Advice around `kubed-default-context-and-namespace'.
+Before calling ORIG-FN, clear any cached entries where the context or
+namespace is actually a kubectl error string.  If the fresh result is
+still poisoned (kubectl failed again), clear it and return nil so the
+caller can retry later.
+
+Sanitization is skipped when no poisoning has been detected, keeping the
+hot path (cache hit with valid data) free of extra work."
+  (when kubed-ext--context-namespace-poisoned
+    (kubed-ext--sanitize-cached-context-namespace))
+  (let ((result (apply orig-fn args)))
+    (if (and (consp result)
+             (or (kubed-ext--context-error-string-p (car result))
+                 (kubed-ext--context-error-string-p (cdr result))))
+        ;; Result is poisoned — flag it so the next call re-sanitizes,
+        ;; and clear the cached entry now.
+        (progn
+          (setq kubed-ext--context-namespace-poisoned t)
+          (kubed-ext--sanitize-cached-context-namespace)
+          nil)
+      result)))
+
+(advice-add 'kubed-default-context-and-namespace
+            :around #'kubed-ext--around-default-context-and-namespace)
+
+;; Arm the flag at load time so the first call checks for a poisoned cache
+;; inherited from a previous Emacs session or an earlier failed kubectl call.
+(setq kubed-ext--context-namespace-poisoned t)
 
 ;; ── State accessors ───────────────────────────────────────────────
 
@@ -5014,7 +5099,7 @@ Tries several buffer-naming conventions that kubed may use."
     (kubed-ext--cb-schedule-probe ctx delay)))
 
 (defun kubed-ext--show-auth-error (context err-msg)
-  "Show an auth error for CONTEXT without opening the refresh circuit."
+  "Show an auth error for CONTEXT ERR-MSG without opening the refresh circuit."
   (let* ((ctx     (or context ""))
          (summary (kubed-ext--cb-auth-summary err-msg)))
     (kubed-ext--cb-reset-state ctx)
@@ -5241,9 +5326,9 @@ the custom-column parser layout."
       (walk-windows
        (lambda (win)
          (let ((buf (window-buffer win)))
-             (when (memq buf bufs)
-               (set-window-point
-                win (with-current-buffer buf (point))))))))))
+           (when (memq buf bufs)
+             (set-window-point
+              win (with-current-buffer buf (point))))))))))
 
 (defun kubed-ext--kubed-package-version ()
   "Return installed kubed package version string when available."
@@ -6183,6 +6268,8 @@ CONTEXT and NAMESPACE are optional; defaults to current context/namespace."
   (advice-remove 'kubed-display-resource-revert
                  #'kubed-ext--display-revert-format)
   (advice-remove 'kubed-update #'kubed-ext--kubed-update)
+  (advice-remove 'kubed-default-context-and-namespace
+                 #'kubed-ext--around-default-context-and-namespace)
   (advice-remove 'kubed-logs #'kubed-ext-stern-logs)
   (advice-remove 'make-process 'kubed-ext--make-process-logger)
   (advice-remove 'call-process 'kubed-ext--call-process-logger)
