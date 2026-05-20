@@ -224,6 +224,37 @@
       (should (equal called
                      '("pods" "pod-a" "ctx" "ns" nil nil nil nil nil nil nil))))))
 
+(ert-deftest kubed-ext-marked-items-includes-selected-and-delete-marks ()
+  "Delete helpers should honor both `*' and upstream `D' marks."
+  (with-temp-buffer
+    (insert "* pod-a\nD pod-b\n  pod-c\n")
+    (goto-char (point-min))
+    (cl-letf (((symbol-function 'tabulated-list-get-id)
+               (lambda ()
+                 (pcase (line-number-at-pos)
+                   (1 "pod-a")
+                   (2 "pod-b")
+                   (_ nil)))))
+      (should (equal (kubed-ext-marked-items)
+                     '("pod-a" "pod-b"))))))
+
+(ert-deftest kubed-ext-log-ansi-filter-preserves-colored-output ()
+  "Stern ANSI sequences should be rendered, not left raw in the buffer."
+  (let ((buf (generate-new-buffer " *kubed-log-ansi-test*")))
+    (unwind-protect
+        (let ((proc (make-process :name "kubed-ext-log-ansi-test"
+                                  :buffer buf
+                                  :command '("cat")
+                                  :noquery t)))
+          (set-marker (process-mark proc) (point-min) buf)
+          (with-current-buffer buf
+            (kubed-ext--log-ansi-filter proc "\x1b[31mERR\x1b[0m\n")
+            (should (equal (buffer-string) "ERR\n"))
+            (should (or (get-text-property (point-min) 'face)
+                        (get-text-property (point-min) 'font-lock-face)))))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
 (ert-deftest kubed-ext-keybinding-snapshots-restore-old-binding ()
   "Overwritten keybindings should be restored, not merely unset."
   (let ((test-map (make-sparse-keymap))

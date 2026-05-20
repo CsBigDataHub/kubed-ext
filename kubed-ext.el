@@ -256,6 +256,24 @@ Set to nil to disable production highlighting entirely."
 (defvar-local kubed-ext--stale-list-buffer-p nil
   "Non-nil means this hidden list buffer should re-render when shown.")
 
+(defvar-local kubed-ext--marked-id-set nil
+  "Hash table of currently marked resource IDs in this list buffer.")
+
+(defvar-local kubed-ext--marked-id-set-dirty t
+  "Non-nil means `kubed-ext--marked-id-set' must be rebuilt from rows.")
+
+(defvar-local kubed-ext--filter-highlight-state nil
+  "Last filter highlight state as (FILTER . BUFFER-TICK).")
+
+(defvar kubed-ext--list-buffers nil
+  "Live kubed list buffers known to kubed-ext.")
+
+(defvar kubed-ext--selector-cache (make-hash-table :test 'equal)
+  "Cached label selectors keyed by (HOST TYPE CONTEXT NAMESPACE).")
+
+(defvar kubed-ext--stale-list-buffer-count 0
+  "Number of hidden list buffers currently marked stale.")
+
 ;; External package variable declarations (suppress byte-compiler warnings).
 (defvar vterm-shell)
 (defvar vterm-buffer-name)
@@ -272,6 +290,64 @@ Set to nil to disable production highlighting entirely."
 (defun kubed-ext--host-key (&optional directory)
   "Return kubed's cache host key for DIRECTORY or `default-directory'."
   (file-remote-p (or directory default-directory)))
+
+(defun kubed-ext--selector-cache-key (type context namespace host)
+  "Return the selector-cache key for TYPE/CONTEXT/NAMESPACE/HOST."
+  (list host type context namespace))
+
+(defun kubed-ext--cache-current-selector ()
+  "Store or clear this buffer's label selector in `kubed-ext--selector-cache'."
+  (when (derived-mode-p 'kubed-list-mode)
+    (let ((key (kubed-ext--selector-cache-key
+                kubed-list-type kubed-list-context kubed-list-namespace
+                (kubed-ext--host-key))))
+      (if (and (bound-and-true-p kubed-ext-list-label-selector)
+               (not (string-empty-p kubed-ext-list-label-selector)))
+          (puthash key kubed-ext-list-label-selector kubed-ext--selector-cache)
+        (remhash key kubed-ext--selector-cache)))))
+
+(defun kubed-ext--unregister-current-list-buffer ()
+  "Forget the current buffer from kubed-ext's list-buffer registries."
+  (setq kubed-ext--list-buffers
+        (delq (current-buffer) kubed-ext--list-buffers))
+  (when (derived-mode-p 'kubed-list-mode)
+    (remhash (kubed-ext--selector-cache-key
+              kubed-list-type kubed-list-context kubed-list-namespace
+              (kubed-ext--host-key))
+             kubed-ext--selector-cache)
+    (when kubed-ext--stale-list-buffer-p
+      (setq kubed-ext--stale-list-buffer-p nil)
+      (setq kubed-ext--stale-list-buffer-count
+            (max 0 (1- kubed-ext--stale-list-buffer-count))))))
+
+(defun kubed-ext--register-current-list-buffer ()
+  "Register the current kubed list buffer for fast hot-path iteration."
+  (when (derived-mode-p 'kubed-list-mode)
+    (cl-pushnew (current-buffer) kubed-ext--list-buffers :test #'eq)
+    (add-hook 'kill-buffer-hook
+              #'kubed-ext--unregister-current-list-buffer nil t)
+    (kubed-ext--cache-current-selector)))
+
+(defun kubed-ext--live-list-buffers ()
+  "Return live kubed list buffers and prune dead registry entries.
+If the registry is empty, fall back to one compatibility scan so list
+buffers created before kubed-ext loaded are still found."
+  (setq kubed-ext--list-buffers
+        (cl-remove-if-not #'buffer-live-p kubed-ext--list-buffers))
+  (or kubed-ext--list-buffers
+      (setq kubed-ext--list-buffers
+            (cl-loop for buf in (buffer-list)
+                     when (with-current-buffer buf
+                            (derived-mode-p 'kubed-list-mode))
+                     collect buf))))
+
+(defun kubed-ext--for-each-list-buffer (fn)
+  "Call FN with each known live kubed list buffer as current buffer."
+  (dolist (buf (kubed-ext--live-list-buffers))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (when (derived-mode-p 'kubed-list-mode)
+          (funcall fn buf))))))
 
 (defun kubed-ext-prefetch-namespaces (&optional context host)
   "Asynchronously prefetch namespace list for CONTEXT on HOST.
@@ -297,6 +373,7 @@ This ensures `kubed-read-namespace' completions appear without delay."
     (kubed-ext-prefetch-namespaces kubed-list-context)
     (kubed-ext-discover-crds-async kubed-list-context)))
 
+(add-hook 'kubed-list-mode-hook #'kubed-ext--register-current-list-buffer)
 (add-hook 'kubed-list-mode-hook #'kubed-ext--prefetch-namespaces-hook)
 
 (defun kubed-ext--prefetch-after-use-context (&rest _)
@@ -1541,39 +1618,101 @@ DESC format: type/name local:remote in namespace[context]."
 ;;; § 3b.  Mark / Unmark System (kubel-style)
 ;;; ═══════════════════════════════════════════════════════════════
 
-(defun kubed-ext-marked-items ()
-  "Return list of resource IDs marked with `*' in current buffer."
+(defconst kubed-ext--mark-tags '(?* ?D)
+  "First-column tags treated as kubed-ext marks.")
+
+(defun kubed-ext--make-id-set (&optional ids)
+  "Return a hash-set initialized with IDS."
+  (let ((set (make-hash-table :test 'equal)))
+    (dolist (id ids set)
+      (puthash id t set))))
+
+(defun kubed-ext--marked-items-with-tags (tags)
+  "Return resource IDs whose first-column mark is any character in TAGS."
   (let (items)
     (save-excursion
       (goto-char (point-min))
       (while (not (eobp))
-        (when (eq (char-after) ?*)
+        (when (memq (char-after) tags)
           (when-let ((id (tabulated-list-get-id)))
             (push id items)))
         (forward-line)))
     (nreverse items)))
 
+(defun kubed-ext--rebuild-mark-cache ()
+  "Rebuild and return the current buffer's marked-ID hash-set."
+  (setq kubed-ext--marked-id-set
+        (kubed-ext--make-id-set
+         (kubed-ext--marked-items-with-tags kubed-ext--mark-tags)))
+  (setq kubed-ext--marked-id-set-dirty nil)
+  kubed-ext--marked-id-set)
+
+(defun kubed-ext--mark-cache-items ()
+  "Return marked IDs from `kubed-ext--marked-id-set' in stable order."
+  (let (ids)
+    (maphash (lambda (id _marked) (push id ids)) kubed-ext--marked-id-set)
+    (sort ids #'string<)))
+
+(defun kubed-ext--ensure-mark-cache ()
+  "Return a fresh marked-ID cache for the current buffer."
+  (if (and (hash-table-p kubed-ext--marked-id-set)
+           (not kubed-ext--marked-id-set-dirty))
+      kubed-ext--marked-id-set
+    (kubed-ext--rebuild-mark-cache)))
+
+(defun kubed-ext--mark-cache-put (id)
+  "Record ID as marked in the current buffer mark cache."
+  (when id
+    (unless (hash-table-p kubed-ext--marked-id-set)
+      (setq kubed-ext--marked-id-set (kubed-ext--make-id-set)))
+    (puthash id t kubed-ext--marked-id-set)
+    (setq kubed-ext--marked-id-set-dirty nil)))
+
+(defun kubed-ext--mark-cache-remove (id)
+  "Record ID as unmarked in the current buffer mark cache."
+  (when (and id (hash-table-p kubed-ext--marked-id-set))
+    (remhash id kubed-ext--marked-id-set)
+    (setq kubed-ext--marked-id-set-dirty nil)))
+
+(defun kubed-ext--mark-cache-dirty (&rest _)
+  "Mark the current buffer's marked-ID cache dirty."
+  (when (derived-mode-p 'kubed-list-mode)
+    (setq kubed-ext--marked-id-set-dirty t)))
+
+(defun kubed-ext-marked-items ()
+  "Return list of resource IDs marked with `*' or `D' in current buffer."
+  (kubed-ext--ensure-mark-cache)
+  (kubed-ext--mark-cache-items))
+
 (defun kubed-ext-mark-item ()
   "Mark the resource at point with `*'."
   (interactive nil kubed-list-mode)
-  (tabulated-list-put-tag
-   (propertize "*" 'face 'dired-marked 'help-echo "Selected") t))
+  (let ((id (tabulated-list-get-id)))
+    (tabulated-list-put-tag
+     (propertize "*" 'face 'dired-marked 'help-echo "Selected") t)
+    (kubed-ext--mark-cache-put id)))
 
 (defun kubed-ext-unmark-item ()
   "Unmark the resource at point."
   (interactive nil kubed-list-mode)
-  (tabulated-list-put-tag " " t))
+  (let ((id (tabulated-list-get-id)))
+    (tabulated-list-put-tag " " t)
+    (kubed-ext--mark-cache-remove id)))
 
 (defun kubed-ext-mark-all ()
   "Mark all visible resources in the current buffer."
   (interactive nil kubed-list-mode)
-  (save-excursion
-    (goto-char (point-min))
-    (while (not (eobp))
-      (when (tabulated-list-get-id)
-        (tabulated-list-put-tag
-         (propertize "*" 'face 'dired-marked)))
-      (forward-line)))
+  (let ((set (kubed-ext--make-id-set)))
+    (save-excursion
+      (goto-char (point-min))
+      (while (not (eobp))
+        (when-let ((id (tabulated-list-get-id)))
+          (tabulated-list-put-tag
+           (propertize "*" 'face 'dired-marked))
+          (puthash id t set))
+        (forward-line)))
+    (setq kubed-ext--marked-id-set set)
+    (setq kubed-ext--marked-id-set-dirty nil))
   (message "Marked all items."))
 
 (defun kubed-ext-unmark-all ()
@@ -1582,9 +1721,11 @@ DESC format: type/name local:remote in namespace[context]."
   (save-excursion
     (goto-char (point-min))
     (while (not (eobp))
-      (when (memq (char-after) '(?* ?D))
+      (when (memq (char-after) kubed-ext--mark-tags)
         (tabulated-list-put-tag " "))
       (forward-line)))
+  (setq kubed-ext--marked-id-set (kubed-ext--make-id-set))
+  (setq kubed-ext--marked-id-set-dirty nil)
   (message "Unmarked all items."))
 
 ;;; ── Mark Persistence Across Refreshes ──────────────────────────────
@@ -1607,28 +1748,34 @@ Installed as `:before' advice on `kubed-list-revert'."
 (defun kubed-ext--restore-persisted-marks (&rest _)
   "Re-mark any rows whose IDs were saved before the last refresh.
 Installed as `:after' advice on `kubed-list-revert'.
-Walks every visible row; any whose tabulated-list ID appears in
-`kubed-ext--persisted-mark-ids' gets a fresh `*' tag with the
-correct face.  Rows that no longer exist after the refresh are
+Walks every visible row once; hash-set membership keeps restore cost
+linear in row count.  Rows that no longer exist after the refresh are
 silently skipped."
-  (when (and (derived-mode-p 'kubed-list-mode)
-             kubed-ext--persisted-mark-ids)
-    (let ((ids kubed-ext--persisted-mark-ids))
-      (save-excursion
-        (goto-char (point-min))
-        (while (not (eobp))
-          (when-let ((id (tabulated-list-get-id)))
-            (when (member id ids)
-              (tabulated-list-put-tag
-               (propertize "*"
-                           'face       'dired-marked
-                           'help-echo  "Selected"))))
-          (forward-line))))))
+  (when (derived-mode-p 'kubed-list-mode)
+    (setq kubed-ext--marked-id-set (kubed-ext--make-id-set))
+    (setq kubed-ext--marked-id-set-dirty nil)
+    (when kubed-ext--persisted-mark-ids
+      (let ((ids (kubed-ext--make-id-set kubed-ext--persisted-mark-ids)))
+        (save-excursion
+          (goto-char (point-min))
+          (while (not (eobp))
+            (when-let ((id (tabulated-list-get-id)))
+              (when (gethash id ids)
+                (tabulated-list-put-tag
+                 (propertize "*"
+                             'face       'dired-marked
+                             'help-echo  "Selected"))
+                (puthash id t kubed-ext--marked-id-set)))
+            (forward-line)))))))
 
 (advice-add 'kubed-list-revert :before
             #'kubed-ext--persist-marks-before-revert)
 (advice-add 'kubed-list-revert :after
             #'kubed-ext--restore-persisted-marks)
+(advice-add 'kubed-list-mark-for-deletion :after
+            #'kubed-ext--mark-cache-dirty)
+(advice-add 'kubed-list-unmark :after
+            #'kubed-ext--mark-cache-dirty)
 
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 3c.  Substring Filter with Highlight (kubel-style)
@@ -1644,29 +1791,34 @@ silently skipped."
 
 (defun kubed-ext--apply-filter-highlights ()
   "Apply filter highlighting to current buffer.
-Matching rows stay normal; non-matching rows get `shadow' face."
+Matching rows stay normal; non-matching rows get `shadow' face.  If the
+filter and buffer contents are unchanged since the last pass, do no work."
   (when (derived-mode-p 'kubed-list-mode)
-    (remove-overlays (point-min) (point-max) 'kubed-ext-filter t)
-    (when (and (bound-and-true-p kubed-ext-resource-filter)
-               (not (string-empty-p kubed-ext-resource-filter)))
-      (save-excursion
-        (let ((block-start nil))
-          (goto-char (point-min))
-          (while (not (eobp))
-            (let* ((entry (tabulated-list-get-entry))
-                   (matched (or (null entry)
-                                (kubed-ext--entry-matches-filter-p
-                                 entry kubed-ext-resource-filter))))
-              (cond
-               ((and matched block-start)
-                (kubed-ext--make-filter-overlay
-                 block-start (line-beginning-position))
-                (setq block-start nil))
-               ((and (not matched) (null block-start))
-                (setq block-start (line-beginning-position)))))
-            (forward-line))
-          (when block-start
-            (kubed-ext--make-filter-overlay block-start (point-max))))))))
+    (let* ((filter (or (bound-and-true-p kubed-ext-resource-filter) ""))
+           (tick (buffer-chars-modified-tick))
+           (state (cons filter tick)))
+      (unless (equal kubed-ext--filter-highlight-state state)
+        (remove-overlays (point-min) (point-max) 'kubed-ext-filter t)
+        (when (not (string-empty-p filter))
+          (save-excursion
+            (let ((block-start nil))
+              (goto-char (point-min))
+              (while (not (eobp))
+                (let* ((entry (tabulated-list-get-entry))
+                       (matched (or (null entry)
+                                    (kubed-ext--entry-matches-filter-p
+                                     entry filter))))
+                  (cond
+                   ((and matched block-start)
+                    (kubed-ext--make-filter-overlay
+                     block-start (line-beginning-position))
+                    (setq block-start nil))
+                   ((and (not matched) (null block-start))
+                    (setq block-start (line-beginning-position)))))
+                (forward-line))
+              (when block-start
+                (kubed-ext--make-filter-overlay block-start (point-max))))))
+        (setq kubed-ext--filter-highlight-state state)))))
 
 (defun kubed-ext--make-filter-overlay (beg end)
   "Create a filter dimming overlay from BEG to END."
@@ -2362,11 +2514,11 @@ ORIG-FN is the original function, ARGS its arguments."
 ;;; ═══════════════════════════════════════════════════════════════
 
 (defun kubed-ext-delete-marked ()
-  "Delete all resources marked with `*'."
+  "Delete all resources marked with `*' or `D'."
   (interactive nil kubed-list-mode)
   (let ((items (kubed-ext-marked-items)))
     (unless items
-      (user-error "No resources marked with `*'"))
+      (user-error "No resources marked with `*' or `D'"))
     (when (y-or-n-p (format "Delete %d marked %s?"
                             (length items) kubed-list-type))
       (kubed-delete-resources kubed-list-type items
@@ -2374,13 +2526,13 @@ ORIG-FN is the original function, ARGS its arguments."
       (kubed-list-update t))))
 
 (defun kubed-ext-logs-marked ()
-  "Show logs for all pods marked with `*'."
+  "Show logs for all pods marked with `*' or `D'."
   (interactive nil kubed-list-mode)
   (unless (member kubed-list-type '("pod" "pods"))
     (user-error "Marked logs are only supported from pod lists"))
   (let ((items (kubed-ext-marked-items)))
     (unless items
-      (user-error "No resources marked with `*'"))
+      (user-error "No resources marked with `*' or `D'"))
     (dolist (pod items)
       (kubed-logs kubed-list-type pod kubed-list-context kubed-list-namespace
                   t t nil nil nil nil nil))))
@@ -4470,18 +4622,24 @@ ERRBACK is called with error message on failure."
   "History list for label selectors.")
 
 (defun kubed-ext--find-active-selector (type context namespace &optional host)
-  "Find the label selector for TYPE/CONTEXT/NAMESPACE on HOST."
-  (catch 'found
-    (dolist (buf (buffer-list))
-      (when (buffer-live-p buf)
-        (with-current-buffer buf
-          (when (and (derived-mode-p 'kubed-list-mode)
-                     kubed-ext-list-label-selector
-                     (equal kubed-list-type type)
-                     (equal kubed-list-context context)
-                     (equal kubed-list-namespace namespace)
-                     (equal (kubed-ext--host-key) host))
-            (throw 'found kubed-ext-list-label-selector)))))))
+  "Find the label selector for TYPE/CONTEXT/NAMESPACE on HOST.
+Selectors are cached by list identity to keep the update hot path from
+walking every Emacs buffer on each refresh.  A one-pass list-buffer scan
+is retained for cache misses and preexisting buffers."
+  (let* ((key (kubed-ext--selector-cache-key type context namespace host))
+         (cached (gethash key kubed-ext--selector-cache)))
+    (or cached
+        (catch 'found
+          (kubed-ext--for-each-list-buffer
+           (lambda (_buf)
+             (when (and (bound-and-true-p kubed-ext-list-label-selector)
+                        (equal kubed-list-type type)
+                        (equal kubed-list-context context)
+                        (equal kubed-list-namespace namespace)
+                        (equal (kubed-ext--host-key) host))
+               (puthash key kubed-ext-list-label-selector
+                        kubed-ext--selector-cache)
+               (throw 'found kubed-ext-list-label-selector))))))))
 
 (defun kubed-ext-list-set-label-selector (selector)
   "Set label SELECTOR for server-side filtering.  Empty clears it."
@@ -4492,6 +4650,7 @@ ERRBACK is called with error message on failure."
    kubed-list-mode)
   (setq-local kubed-ext-list-label-selector
               (if (string-empty-p selector) nil selector))
+  (kubed-ext--cache-current-selector)
   (kubed-list-update))
 
 ;; replaced in section § 21
@@ -5338,27 +5497,33 @@ selector."
     (setq tabulated-list-format format)
     (tabulated-list-init-header)))
 
+(defun kubed-ext--set-stale-list-buffer (stale)
+  "Set current buffer's stale-list state to STALE and maintain the count."
+  (unless (eq kubed-ext--stale-list-buffer-p stale)
+    (setq kubed-ext--stale-list-buffer-p stale)
+    (setq kubed-ext--stale-list-buffer-count
+          (max 0 (+ kubed-ext--stale-list-buffer-count (if stale 1 -1))))))
+
 (defun kubed-ext--refresh-list-buffers-after-update
     (type context namespace host &optional format)
   "Revert visible list buffers for TYPE/CONTEXT/NAMESPACE on HOST.
 When FORMAT is non-nil, install it as the buffer-local table format first.
 Hidden matching buffers are marked stale and re-rendered lazily when shown."
   (let ((bufs nil))
-    (dolist (buf (buffer-list))
-      (when (kubed-ext--matching-list-buffer-p buf type context namespace host)
-        (with-current-buffer buf
-          (when (derived-mode-p 'kubed-list-mode)
-            (if-let ((win (get-buffer-window buf t)))
-                (progn
-                  (kubed-ext--apply-list-update-format format)
-                  (setq kubed-ext--stale-list-buffer-p nil)
-                  (revert-buffer)
-                  (kubed-ext--clear-header-error)
-                  (set-window-point win (point))
-                  (push buf bufs))
-              (when format
-                (setq tabulated-list-format format))
-              (setq kubed-ext--stale-list-buffer-p t))))))
+    (kubed-ext--for-each-list-buffer
+     (lambda (buf)
+       (when (kubed-ext--matching-list-buffer-p buf type context namespace host)
+         (if-let ((win (get-buffer-window buf t)))
+             (progn
+               (kubed-ext--apply-list-update-format format)
+               (kubed-ext--set-stale-list-buffer nil)
+               (revert-buffer)
+               (kubed-ext--clear-header-error)
+               (set-window-point win (point))
+               (push buf bufs))
+           (when format
+             (setq tabulated-list-format format))
+           (kubed-ext--set-stale-list-buffer t)))))
     (walk-windows
      (lambda (win)
        (let ((buf (window-buffer win)))
@@ -5373,26 +5538,28 @@ scroll); this timer coalesces those events into a single idle callback.")
 
 (defun kubed-ext--refresh-stale-visible-list-buffers ()
   "Re-render visible list buffers that were marked stale while hidden."
-  (dolist (win (window-list))
-    (let ((buf (window-buffer win)))
-      (when (buffer-live-p buf)
-        (with-current-buffer buf
-          (when (and kubed-ext--stale-list-buffer-p
-                     (derived-mode-p 'kubed-list-mode))
-            (setq kubed-ext--stale-list-buffer-p nil)
-            (tabulated-list-init-header)
-            (revert-buffer)
-            (kubed-ext--clear-header-error)))))))
+  (when (> kubed-ext--stale-list-buffer-count 0)
+    (dolist (win (window-list))
+      (let ((buf (window-buffer win)))
+        (when (buffer-live-p buf)
+          (with-current-buffer buf
+            (when (and kubed-ext--stale-list-buffer-p
+                       (derived-mode-p 'kubed-list-mode))
+              (kubed-ext--set-stale-list-buffer nil)
+              (tabulated-list-init-header)
+              (revert-buffer)
+              (kubed-ext--clear-header-error))))))))
 
 (defun kubed-ext--schedule-stale-refresh ()
   "Schedule a debounced idle callback to re-render stale list buffers.
 Runs after 0.3 s of idle time so rapid window-configuration changes
 \(resize drag, frame split) coalesce into a single pass."
-  (when (timerp kubed-ext--stale-refresh-timer)
-    (cancel-timer kubed-ext--stale-refresh-timer))
-  (setq kubed-ext--stale-refresh-timer
-        (run-with-idle-timer 0.3 nil
-                             #'kubed-ext--refresh-stale-visible-list-buffers)))
+  (when (> kubed-ext--stale-list-buffer-count 0)
+    (when (timerp kubed-ext--stale-refresh-timer)
+      (cancel-timer kubed-ext--stale-refresh-timer))
+    (setq kubed-ext--stale-refresh-timer
+          (run-with-idle-timer 0.3 nil
+                               #'kubed-ext--refresh-stale-visible-list-buffers))))
 
 (add-hook 'window-configuration-change-hook
           #'kubed-ext--schedule-stale-refresh)
@@ -5400,12 +5567,10 @@ Runs after 0.3 s of idle time so rapid window-configuration changes
 (defun kubed-ext--cb-in-context-bufs (context fn)
   "Call FN with no args in every live kubed list buffer using CONTEXT."
   (let ((ctx (or context "")))
-    (dolist (buf (buffer-list))
-      (when (buffer-live-p buf)
-        (with-current-buffer buf
-          (when (and (derived-mode-p 'kubed-list-mode)
-                     (equal kubed-list-context ctx))
-            (funcall fn)))))))
+    (kubed-ext--for-each-list-buffer
+     (lambda (_buf)
+       (when (equal kubed-list-context ctx)
+         (funcall fn))))))
 
 (defun kubed-ext--cb-set-header (context message)
   "Display MESSAGE as the error header in every list buffer for CONTEXT."
@@ -5426,17 +5591,15 @@ Runs after 0.3 s of idle time so rapid window-configuration changes
   "Refresh each visible TYPE/NAMESPACE list in CONTEXT at most once."
   (let ((ctx (or context ""))
         (seen (make-hash-table :test 'equal)))
-    (dolist (buf (buffer-list))
-      (when (buffer-live-p buf)
-        (with-current-buffer buf
-          (when (and (derived-mode-p 'kubed-list-mode)
-                     (equal kubed-list-context ctx))
-            (let ((key (list kubed-list-type kubed-list-namespace)))
-              (unless (gethash key seen)
-                (puthash key t seen)
-                (condition-case nil
-                    (kubed-list-update t)
-                  (error nil))))))))))
+    (kubed-ext--for-each-list-buffer
+     (lambda (_buf)
+       (when (equal kubed-list-context ctx)
+         (let ((key (list kubed-list-type kubed-list-namespace)))
+           (unless (gethash key seen)
+             (puthash key t seen)
+             (condition-case nil
+                 (kubed-list-update t)
+               (error nil)))))))))
 
 ;; ── Auth-error summary extraction ────────────────────────────────
 
@@ -5589,27 +5752,25 @@ other error    → server responded; close circuit."
     (type context namespace host status err-buf-name)
   "Update list buffer headers for TYPE/CONTEXT/NAMESPACE/HOST after STATUS.
 ERR-BUF-NAME is the stderr buffer name for failed updates."
-  (dolist (buf (buffer-list))
-    (when (kubed-ext--matching-list-buffer-p buf type context namespace host)
-      (with-current-buffer buf
-        (when (derived-mode-p 'kubed-list-mode)
-          (if (string= status "exited abnormally with code 1\n")
-              (let ((err-buf (get-buffer err-buf-name)))
-                (kubed-ext--set-header-error
-                 (if (and err-buf (buffer-live-p err-buf))
-                     (with-current-buffer err-buf
-                       (string-trim (buffer-string)))
-                   "kubectl command failed")))
-            (kubed-ext--clear-header-error)))))))
+  (kubed-ext--for-each-list-buffer
+   (lambda (buf)
+     (when (kubed-ext--matching-list-buffer-p buf type context namespace host)
+       (if (string= status "exited abnormally with code 1\n")
+           (let ((err-buf (get-buffer err-buf-name)))
+             (kubed-ext--set-header-error
+              (if (and err-buf (buffer-live-p err-buf))
+                  (with-current-buffer err-buf
+                    (string-trim (buffer-string)))
+                "kubectl command failed")))
+         (kubed-ext--clear-header-error))))))
 
 (defun kubed-ext--set-list-buffer-error-after-update
     (type context namespace host message)
   "Display parse/update MESSAGE in list buffers matching TYPE/CONTEXT/NAMESPACE/HOST."
-  (dolist (buf (buffer-list))
-    (when (kubed-ext--matching-list-buffer-p buf type context namespace host)
-      (with-current-buffer buf
-        (when (derived-mode-p 'kubed-list-mode)
-          (kubed-ext--set-header-error message))))))
+  (kubed-ext--for-each-list-buffer
+   (lambda (buf)
+     (when (kubed-ext--matching-list-buffer-p buf type context namespace host)
+       (kubed-ext--set-header-error message)))))
 
 (defun kubed-ext--kubed-update (type context &optional namespace host)
   "Update Kubernetes resources TYPE in CONTEXT and NAMESPACE on HOST.
@@ -6000,11 +6161,19 @@ Reschedules itself after each tick with a fresh random delay."
   (require 'ansi-color)
   (when (buffer-live-p (process-buffer proc))
     (with-current-buffer (process-buffer proc)
-      (let ((inhibit-read-only t)
-            (beg               (point-max)))
-        (goto-char beg)
-        (insert string)
-        (ansi-color-apply-on-region beg (point-max))))))
+      (unless (local-variable-p 'ansi-color-context)
+        (setq-local ansi-color-context nil))
+      (let* ((inhibit-read-only t)
+             (mark (or (process-mark proc)
+                       (set-marker (process-mark proc) (point-max))))
+             (moving (= (point) mark))
+             (text (ansi-color-apply string)))
+        (save-excursion
+          (goto-char mark)
+          (insert text)
+          (set-marker (process-mark proc) (point)))
+        (when moving
+          (goto-char (process-mark proc)))))))
 
 ;;; ─── Core launch helper ───────────────────────────────────────
 
@@ -6707,6 +6876,7 @@ CONTEXT and NAMESPACE are optional; defaults to current context/namespace."
 
 (defun kubed-ext-unload-function ()
   "Remove kubed-ext hooks, advice, timers, display rules, and keybindings."
+  (remove-hook 'kubed-list-mode-hook #'kubed-ext--register-current-list-buffer)
   (remove-hook 'kubed-list-mode-hook #'kubed-ext--prefetch-namespaces-hook)
   (remove-hook 'kubed-list-mode-hook #'kubed-ext-optimize-tramp)
   (remove-hook 'window-configuration-change-hook
@@ -6723,6 +6893,8 @@ CONTEXT and NAMESPACE are optional; defaults to current context/namespace."
   (advice-remove 'kubed-list-revert #'kubed-ext--reapply-overlays)
   (advice-remove 'kubed-list-revert #'kubed-ext--persist-marks-before-revert)
   (advice-remove 'kubed-list-revert #'kubed-ext--restore-persisted-marks)
+  (advice-remove 'kubed-list-mark-for-deletion #'kubed-ext--mark-cache-dirty)
+  (advice-remove 'kubed-list-unmark #'kubed-ext--mark-cache-dirty)
   (advice-remove 'kubed-stop-port-forward
                  #'kubed-ext-refresh-pf-markers-in-visible-buffers)
   (advice-remove 'kubed-display-resource-revert
@@ -6734,6 +6906,9 @@ CONTEXT and NAMESPACE are optional; defaults to current context/namespace."
   (advice-remove 'make-process 'kubed-ext--make-process-logger)
   (advice-remove 'call-process 'kubed-ext--call-process-logger)
   (advice-remove 'call-process-region 'kubed-ext--call-process-region-logger)
+  (setq kubed-ext--list-buffers nil)
+  (clrhash kubed-ext--selector-cache)
+  (setq kubed-ext--stale-list-buffer-count 0)
   (kubed-ext--auto-refresh-cancel-timer)
   (kubed-ext--cancel-circuit-breaker-timers)
   (kubed-ext--cancel-tracked-timers)
