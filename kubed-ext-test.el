@@ -23,7 +23,8 @@
 (ert-deftest kubed-ext-current-context-safe-filters-auth-prompt-fallback ()
   "Do not fall back to auth-prompt lines from `kubed-contexts'."
   (let ((auth-prompt
-         "Run the command below to authenticate interactively; additional arguments may be added as needed:"))
+         "Run the command below to authenticate interactively; additional arguments may be added as needed:")
+        (kubed-default-context-and-namespace-alist nil))
     (cl-letf (((symbol-function 'kubed-contexts)
                (lambda () (list auth-prompt)))
               ((symbol-function 'process-file)
@@ -69,6 +70,192 @@
     (should-not (plist-get entry :namespaced))
     (should (equal (alist-get 'name (car (plist-get entry :printer-columns)))
                    "Phase"))))
+
+(ert-deftest kubed-ext-list-command-omits-nil-context-and-keeps-chunking ()
+  "Server-side list commands should omit nil contexts and not disable chunking."
+  (let ((cmd (kubed-ext--list-command
+              "secrets" nil "ocdp" nil t nil)))
+    (should (equal (seq-take cmd 3) (list (kubed-kubectl-program) "get" "secrets")))
+    (should-not (member "--context" cmd))
+    (should (member "--server-print=true" cmd))
+    (should-not (member "--chunk-size=0" cmd))
+    (should (member "--namespace" cmd))
+    (should (member "ocdp" cmd))))
+
+(ert-deftest kubed-ext-list-command-keeps-custom-columns-for-normal-resources ()
+  "Normal resources should keep the custom-column list path."
+  (let ((cmd (kubed-ext--list-command
+              "pods" "ctx" nil
+              '(("NAME:.metadata.name") ("STATUS:.status.phase"))
+              nil "app=demo")))
+    (should (member "--context" cmd))
+    (should (member "ctx" cmd))
+    (should (member "--output=custom-columns=NAME:.metadata.name,STATUS:.status.phase" cmd))
+    (should (member "--selector" cmd))
+    (should (member "app=demo" cmd))))
+
+(ert-deftest kubed-ext-current-context-safe-does-not-call-process-file ()
+  "Safe context lookup must use cached state, not synchronous kubectl calls."
+  (let ((called nil)
+        (buf (generate-new-buffer " *kubed-current-context-safe-test*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (setq-local kubed-list-context "ctx-a")
+          (cl-letf (((symbol-function 'kubed-contexts)
+                     (lambda ()
+                       (setq called t)
+                       '("ctx-a" "ctx-b")))
+                    ((symbol-function 'process-file)
+                     (lambda (&rest _args)
+                       (setq called t)
+                       0)))
+            (should (equal (kubed-ext--current-context-safe) "ctx-a"))
+            (should-not called)))
+      (kill-buffer buf))))
+
+(ert-deftest kubed-ext-refresh-list-buffers-marks-hidden-stale ()
+  "Successful updates should render visible buffers and mark hidden ones stale."
+  (let ((visible (generate-new-buffer " *kubed-visible-test*"))
+        (hidden (generate-new-buffer " *kubed-hidden-test*"))
+        (reverted nil))
+    (unwind-protect
+        (progn
+          (dolist (buf (list visible hidden))
+            (with-current-buffer buf
+              (setq-local kubed-list-type "pods")
+              (setq-local kubed-list-context "ctx")
+              (setq-local kubed-list-namespace "ns")))
+          (cl-letf (((symbol-function 'buffer-list)
+                     (lambda (&optional _frame) (list visible hidden)))
+                    ((symbol-function 'derived-mode-p)
+                     (lambda (&rest _modes) t))
+                    ((symbol-function 'get-buffer-window)
+                     (lambda (&optional buffer _all-frames)
+                       (and (eq (or buffer (current-buffer)) visible) 'visible-window)))
+                    ((symbol-function 'revert-buffer)
+                     (lambda (&rest _args)
+                       (push (current-buffer) reverted)))
+                    ((symbol-function 'tabulated-list-init-header)
+                     (lambda (&rest _args) nil))
+                    ((symbol-function 'set-window-point)
+                     (lambda (&rest _args) nil))
+                    ((symbol-function 'walk-windows)
+                     (lambda (&rest _args) nil)))
+            (kubed-ext--refresh-list-buffers-after-update
+             "pods" "ctx" "ns" nil)
+            (should (equal reverted (list visible)))
+            (with-current-buffer hidden
+              (should (bound-and-true-p kubed-ext--stale-list-buffer-p)))))
+      (kill-buffer visible)
+      (kill-buffer hidden))))
+
+(ert-deftest kubed-ext-handle-server-table-empty-output-does-not-signal ()
+  "Unexpected empty table output should not signal from the process sentinel path."
+  (let ((out (generate-new-buffer " *kubed-empty-table-test*")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'kubed-ext--refresh-list-buffers-after-update)
+                   (lambda (&rest _args) nil)))
+          (should-not (kubed-ext--handle-server-table-success
+                       out nil "widgets.example.com" "ctx" "ns")))
+      (kill-buffer out))))
+
+(ert-deftest kubed-ext-large-list-skip-remembers-known-large-lists ()
+  "Auto-refresh should skip resources previously observed as large."
+  (let ((kubed-ext-auto-refresh-large-list-threshold 2))
+    (clrhash kubed-ext--known-large-lists)
+    (cl-letf (((symbol-function 'kubed-ext--cached-resource-count)
+               (lambda (&rest _args) 0)))
+      (should-not (kubed-ext--large-list-auto-refresh-skip-p
+                   "secrets" "ctx" "ns" nil))
+      (kubed-ext--remember-large-list-if-needed "secrets" "ctx" "ns" nil 5)
+      (should (kubed-ext--large-list-auto-refresh-skip-p
+               "secrets" "ctx" "ns" nil)))))
+
+(ert-deftest kubed-ext-find-active-selector-is-host-aware ()
+  "Label selectors should not leak between local and remote host caches."
+  (let ((local (generate-new-buffer " *kubed-selector-local-test*"))
+        (remote (generate-new-buffer " *kubed-selector-remote-test*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer local
+            (setq-local default-directory "/tmp/")
+            (setq-local kubed-list-type "pods")
+            (setq-local kubed-list-context "ctx")
+            (setq-local kubed-list-namespace "ns")
+            (setq-local kubed-ext-list-label-selector "app=local"))
+          (with-current-buffer remote
+            (setq-local default-directory "/ssh:demo:/tmp/")
+            (setq-local kubed-list-type "pods")
+            (setq-local kubed-list-context "ctx")
+            (setq-local kubed-list-namespace "ns")
+            (setq-local kubed-ext-list-label-selector "app=remote"))
+          (cl-letf (((symbol-function 'buffer-list)
+                     (lambda (&optional _frame) (list local remote)))
+                    ((symbol-function 'derived-mode-p)
+                     (lambda (&rest _modes) t)))
+            (should (equal (kubed-ext--find-active-selector
+                            "pods" "ctx" "ns" nil)
+                           "app=local"))
+            (should (equal (kubed-ext--find-active-selector
+                            "pods" "ctx" "ns" "/ssh:demo:")
+                           "app=remote"))))
+      (kill-buffer local)
+      (kill-buffer remote))))
+
+(ert-deftest kubed-ext-auto-refresh-mode-allows-disabled-interval ()
+  "Enabling auto-refresh mode with nil interval should not signal."
+  (let ((kubed-ext-auto-refresh-interval nil)
+        (kubed-ext-auto-refresh-mode nil))
+    (should (kubed-ext-auto-refresh-mode 1))
+    (kubed-ext-auto-refresh-mode -1)))
+
+(ert-deftest kubed-ext-stern-logs-falls-back-when-stern-missing ()
+  "Basic kubed logs should still work when stern is not installed."
+  (let ((called nil))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (_program) nil))
+              ((symbol-function 'kubed-ext--call-original-kubed-logs)
+               (lambda (&rest args)
+                 (setq called args)
+                 :fallback)))
+      (should (eq (kubed-ext-stern-logs
+                   "pods" "pod-a" "ctx" "ns" nil nil nil nil nil nil nil)
+                  :fallback))
+      (should (equal called
+                     '("pods" "pod-a" "ctx" "ns" nil nil nil nil nil nil nil))))))
+
+(ert-deftest kubed-ext-keybinding-snapshots-restore-old-binding ()
+  "Overwritten keybindings should be restored, not merely unset."
+  (let ((test-map (make-sparse-keymap))
+        (kubed-ext--keybinding-snapshots nil))
+    (defvar kubed-ext-test-map nil)
+    (setq kubed-ext-test-map test-map)
+    (keymap-set kubed-ext-test-map "d" #'ignore)
+    (kubed-ext--set-key 'kubed-ext-test-map "d" #'identity)
+    (should (eq (keymap-lookup kubed-ext-test-map "d") #'identity))
+    (kubed-ext--restore-keybinding-snapshots)
+    (should (eq (keymap-lookup kubed-ext-test-map "d") #'ignore))))
+
+(ert-deftest kubed-ext-column-state-restore-resets-kubed-columns ()
+  "Column restoration should reset `kubed--columns' and display variables."
+  (let ((kubed--columns '(("pods" . (("NAME:.metadata.name")))))
+        (kubed-pods-columns '(("Name" 40 t)))
+        (kubed-ext--original-kubed-columns '(("pods" . (("NAME:.metadata.name")))))
+        (kubed-ext--original-column-variables nil))
+    (kubed-ext--snapshot-column-variable 'kubed-pods-columns)
+    (setq kubed--columns '(("pods" . (("BROKEN:.spec.broken")))))
+    (setq kubed-pods-columns '(("Broken" 10 t)))
+    (kubed-ext--restore-column-state)
+    (should (equal kubed--columns '(("pods" . (("NAME:.metadata.name"))))))
+    (should (equal kubed-pods-columns '(("Name" 40 t))))))
+
+(ert-deftest kubed-ext-cancel-tracked-timers-cancels-pending-timers ()
+  "Tracked short-lived timers should be cancellable on unload."
+  (let ((kubed-ext--tracked-timers nil))
+    (kubed-ext--run-at-time-tracked 3600 nil #'ignore)
+    (should (= (length kubed-ext--tracked-timers) 1))
+    (kubed-ext--cancel-tracked-timers)
+    (should-not kubed-ext--tracked-timers)))
 
 (provide 'kubed-ext-test)
 ;;; kubed-ext-test.el ends here
