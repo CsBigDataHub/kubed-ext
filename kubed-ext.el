@@ -186,6 +186,11 @@ Set to nil to disable production highlighting entirely."
   :type 'directory
   :group 'kubed-ext)
 
+(defcustom kubed-ext-crd-discovery-batch-size 25
+  "Maximum number of CRD resources to define per idle discovery batch."
+  :type 'natnum
+  :group 'kubed-ext)
+
 ;;; ═══════════════════════════════════════════════════════════════
 ;;; § 0c.  Buffer-Local Variables
 ;;; ═══════════════════════════════════════════════════════════════
@@ -334,6 +339,21 @@ when an update is already in progress or the minibuffer is active."
 
 (defvar kubed-ext--crd-warm-timer nil
   "Timer used to warm the CRD cache after loading kubed-ext.")
+
+(defconst kubed-ext--crd-discovery-jsonpath
+  (concat "jsonpath="
+          "{range .items[*]}"
+          "{.spec.group}{\"\\t\"}"
+          "{.spec.names.kind}{\"\\t\"}"
+          "{.spec.names.plural}{\"\\t\"}"
+          "{.spec.scope}{\"\\t\"}"
+          "{range .spec.versions[?(@.storage==true)].additionalPrinterColumns[*]}"
+          "{.name}{\"|||\"}{.type}{\"|||\"}{.jsonPath}{\";;;\"}"
+          "{end}{\"\\t\"}"
+          "{range .spec.additionalPrinterColumns[*]}"
+          "{.name}{\"|||\"}{.type}{\"|||\"}{.jsonPath}{\";;;\"}"
+          "{end}{\"\\n\"}{end}")
+  "Compact jsonpath for CRD discovery without large OpenAPI schemas.")
 
 (defvar kubed-ext--domain-action-bindings nil
   "Dynamic domain action bindings installed into CRD mode maps.
@@ -750,6 +770,70 @@ Non-nil FORCE reloads even when this context was already loaded."
             (when (file-exists-p temp)
               (ignore-errors (delete-file temp)))))))))
 
+(defun kubed-ext--parse-crd-printer-columns-compact (text)
+  "Parse compact printer column TEXT from CRD discovery jsonpath output."
+  (delq
+   nil
+   (mapcar
+    (lambda (chunk)
+      (pcase-let ((`(,name ,type ,json-path)
+                   (split-string chunk (regexp-quote "|||"))))
+        (let ((column `((name . ,name)
+                        (type . ,type)
+                        (jsonPath . ,json-path))))
+          (when (kubed-ext--crd-printer-column-safe-p column)
+            column))))
+    (split-string (or text "") (regexp-quote ";;;") t))))
+
+(defun kubed-ext--parse-crd-compact-list (text)
+  "Parse compact CRD discovery TEXT into cache entry plists."
+  (delq
+   nil
+   (mapcar
+    (lambda (line)
+      (pcase-let ((`(,group ,kind ,plural ,scope ,storage-columns
+                    ,spec-columns . ,_)
+                   (split-string line "\t")))
+        (let* ((type (and (not (string-empty-p (or plural "")))
+                          (not (string-empty-p (or group "")))
+                          (concat plural "." group)))
+               (printer-columns
+                (or (kubed-ext--parse-crd-printer-columns-compact
+                     storage-columns)
+                    (kubed-ext--parse-crd-printer-columns-compact
+                     spec-columns)))
+               (entry (list :type type
+                            :kind kind
+                            :group group
+                            :plural plural
+                            :namespaced (string= scope "Namespaced")
+                            :printer-columns printer-columns)))
+          (when (kubed-ext--crd-cache-entry-valid-p entry)
+            entry))))
+    (split-string text "\n" t))))
+
+(defun kubed-ext--define-crd-entries-async
+    (context entries key callback count &optional clear-registry)
+  "Define CRD ENTRIES for CONTEXT in small timer batches.
+KEY is the discovery-state key.  CALLBACK receives the final COUNT.
+When CLEAR-REGISTRY is non-nil, clear CONTEXT registry before defining
+this batch sequence."
+  (when clear-registry
+    (kubed-ext--clear-crd-context-registry context))
+  (let ((batch-size (max 1 kubed-ext-crd-discovery-batch-size))
+        (remaining entries))
+    (dotimes (_ batch-size)
+      (when remaining
+        (when (kubed-ext--define-crd-entry context (pop remaining))
+          (cl-incf count))))
+    (if remaining
+        (run-at-time
+         0 nil #'kubed-ext--define-crd-entries-async
+         context remaining key callback count nil)
+      (puthash key 'done kubed-ext--crd-discovery-state)
+      (when callback
+        (funcall callback count)))))
+
 (defun kubed-ext--parse-crd-list (json-text)
   "Parse kubectl CRD list JSON-TEXT into CRD item alists."
   (let* ((json-object-type 'alist)
@@ -778,7 +862,10 @@ number of CRD resources defined or updated."
       (when force
         (kubed-ext--forget-crd-context-state ctx))
       (let* ((key (kubed-ext--crd-context-key ctx))
-             (cache-count (kubed-ext--load-crd-cache ctx force))
+             ;; Manual force refresh should not synchronously re-define the
+             ;; old cache before starting fresh discovery.
+             (cache-count (and (not force)
+                               (kubed-ext--load-crd-cache ctx)))
              (state (gethash key kubed-ext--crd-discovery-state)))
         (when (or force (not (memq state '(inflight done))))
           (puthash key 'inflight kubed-ext--crd-discovery-state)
@@ -786,24 +873,15 @@ number of CRD resources defined or updated."
            "kubed-ext-crd-discovery"
            (append (list (kubed-kubectl-program)
                          "get" "customresourcedefinitions.apiextensions.k8s.io"
-                         "-o" "json")
+                         "-o" kubed-ext--crd-discovery-jsonpath)
                    (when ctx (list "--context" ctx)))
            (lambda (output)
              (condition-case err
-                 (let ((count 0)
-                       (entries (kubed-ext--sort-crd-cache-entries
-                                 (delq nil
-                                       (mapcar
-                                        #'kubed-ext--crd-cache-entry-from-crd
-                                        (kubed-ext--parse-crd-list output))))))
-                   (kubed-ext--clear-crd-context-registry ctx)
-                   (dolist (entry entries)
-                     (when (kubed-ext--define-crd-entry ctx entry)
-                       (cl-incf count)))
+                 (let ((entries (kubed-ext--sort-crd-cache-entries
+                                 (kubed-ext--parse-crd-compact-list output))))
                    (kubed-ext--write-crd-cache ctx entries)
-                   (puthash key 'done kubed-ext--crd-discovery-state)
-                   (when callback
-                     (funcall callback count)))
+                   (kubed-ext--define-crd-entries-async
+                    ctx entries key callback 0 t))
                (error
                 (remhash key kubed-ext--crd-discovery-state)
                 (message "Kubed-ext CRD discovery parse failed: %s" err))))

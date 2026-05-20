@@ -46,5 +46,29 @@
            (concat "kubectl exited 1: Run the command below to authenticate "
                    "interactively; additional arguments may be added as needed:"))))
 
+(ert-deftest kubed-ext-parse-crd-compact-list-builds-cache-entry ()
+  "Parse compact CRD discovery output without full OpenAPI schema JSON."
+  (let* ((text (concat "example.com\tWidget\twidgets\tNamespaced\t"
+                       "Ready|||string|||.status.ready;;;"
+                       "Warnings|||string|||.status.warnings;;;\t\n"))
+         (entries (kubed-ext--parse-crd-compact-list text))
+         (entry (car entries)))
+    (should (= (length entries) 1))
+    (should (equal (plist-get entry :type) "widgets.example.com"))
+    (should (eq (plist-get entry :namespaced) t))
+    (should (equal (alist-get 'jsonPath
+                              (car (plist-get entry :printer-columns)))
+                   ".status.ready"))))
+
+(ert-deftest kubed-ext-parse-crd-compact-list-falls-back-to-spec-columns ()
+  "Use legacy spec-level printer columns when storage-version columns are empty."
+  (let* ((text (concat "example.com\tClusterWidget\tclusterwidgets\tCluster\t\t"
+                       "Phase|||string|||.status.phase;;;\n"))
+         (entry (car (kubed-ext--parse-crd-compact-list text))))
+    (should (equal (plist-get entry :type) "clusterwidgets.example.com"))
+    (should-not (plist-get entry :namespaced))
+    (should (equal (alist-get 'name (car (plist-get entry :printer-columns)))
+                   "Phase"))))
+
 (provide 'kubed-ext-test)
 ;;; kubed-ext-test.el ends here
