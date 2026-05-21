@@ -113,10 +113,53 @@
             (should-not called)))
       (kill-buffer buf))))
 
+(ert-deftest kubed-ext-kubed-update-override-skips-unsupported-version ()
+  "Unsupported kubed versions should not be overridden by default."
+  (let ((added nil)
+        (warning-message nil)
+        (kubed-ext-force-unsupported-kubed-update-override nil))
+    (cl-letf (((symbol-function 'kubed-ext--kubed-package-version)
+               (lambda () "9.9.9"))
+              ((symbol-function 'kubed-ext--kubed-update-compatible-p)
+               (lambda () t))
+              ((symbol-function 'advice-add)
+               (lambda (&rest _args) (setq added t)))
+              ((symbol-function 'advice-remove)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'display-warning)
+               (lambda (_type message &rest _args)
+                 (setq warning-message message))))
+      (kubed-ext--install-kubed-update-override)
+      (should-not added)
+      (should (string-match-p "Not overriding kubed-update" warning-message)))))
+
+(ert-deftest kubed-ext-kubed-update-override-force-allows-unsupported-version ()
+  "Force option should allow overriding unsupported kubed versions."
+  (let ((added nil)
+        (warning-message nil)
+        (kubed-ext-force-unsupported-kubed-update-override t))
+    (cl-letf (((symbol-function 'kubed-ext--kubed-package-version)
+               (lambda () "9.9.9"))
+              ((symbol-function 'kubed-ext--kubed-update-compatible-p)
+               (lambda () t))
+              ((symbol-function 'advice-add)
+               (lambda (&rest _args) (setq added t)))
+              ((symbol-function 'advice-remove)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'display-warning)
+               (lambda (_type message &rest _args)
+                 (setq warning-message message))))
+      (kubed-ext--install-kubed-update-override)
+      (should added)
+      (should (string-match-p "Forcing kubed-update override" warning-message)))))
+
 (ert-deftest kubed-ext-refresh-list-buffers-marks-hidden-stale ()
   "Successful updates should render visible buffers and mark hidden ones stale."
   (let ((visible (generate-new-buffer " *kubed-visible-test*"))
         (hidden (generate-new-buffer " *kubed-hidden-test*"))
+        (kubed-ext--list-buffers nil)
+        (kubed-ext--list-buffer-initial-scan-done nil)
+        (kubed-ext--stale-list-buffer-count 0)
         (reverted nil))
     (unwind-protect
         (progn
@@ -174,7 +217,9 @@
 (ert-deftest kubed-ext-find-active-selector-is-host-aware ()
   "Label selectors should not leak between local and remote host caches."
   (let ((local (generate-new-buffer " *kubed-selector-local-test*"))
-        (remote (generate-new-buffer " *kubed-selector-remote-test*")))
+        (remote (generate-new-buffer " *kubed-selector-remote-test*"))
+        (kubed-ext--list-buffers nil)
+        (kubed-ext--list-buffer-initial-scan-done nil))
     (unwind-protect
         (progn
           (with-current-buffer local
@@ -201,6 +246,59 @@
                            "app=remote"))))
       (kill-buffer local)
       (kill-buffer remote))))
+
+(ert-deftest kubed-ext-list-buffer-scan-keeps-preexisting-buffers ()
+  "Initial registry scan should include old buffers even if registry is non-empty."
+  (let ((old (generate-new-buffer " *kubed-old-list-test*"))
+        (new (generate-new-buffer " *kubed-new-list-test*"))
+        (kubed-ext--list-buffers nil)
+        (kubed-ext--list-buffer-initial-scan-done nil))
+    (unwind-protect
+        (progn
+          (setq kubed-ext--list-buffers (list new))
+          (cl-letf (((symbol-function 'buffer-list)
+                     (lambda (&optional _frame) (list old new)))
+                    ((symbol-function 'derived-mode-p)
+                     (lambda (&rest _modes) t)))
+            (let ((buffers (kubed-ext--live-list-buffers)))
+              (should (memq old buffers))
+              (should (memq new buffers)))
+            (with-current-buffer old
+              (should (memq #'kubed-ext--unregister-current-list-buffer
+                            kill-buffer-hook)))))
+      (kill-buffer old)
+      (kill-buffer new))))
+
+(ert-deftest kubed-ext-cleanup-list-buffer-state-removes-local-hooks ()
+  "Unload cleanup should remove local registry hooks and cache state."
+  (let ((buf (generate-new-buffer " *kubed-cleanup-list-test*"))
+        (kubed-ext--list-buffers nil)
+        (kubed-ext--list-buffer-initial-scan-done t))
+    (unwind-protect
+        (progn
+          (setq kubed-ext--list-buffers (list buf))
+          (with-current-buffer buf
+            (add-hook 'kill-buffer-hook
+                      #'kubed-ext--unregister-current-list-buffer nil t)
+            (setq-local kubed-ext--stale-list-buffer-p t)
+            (setq-local kubed-ext--marked-id-set (make-hash-table :test 'equal))
+            (setq-local kubed-ext--marked-id-order '("pod-a"))
+            (setq-local kubed-ext--marked-id-set-dirty nil)
+            (setq-local kubed-ext--filter-highlight-state '("pod" . 1))
+            (setq-local kubed-ext--persisted-mark-tags '(("pod-a" . ?D))))
+          (cl-letf (((symbol-function 'derived-mode-p)
+                     (lambda (&rest _modes) t)))
+            (kubed-ext--cleanup-list-buffer-state))
+          (with-current-buffer buf
+            (should-not (memq #'kubed-ext--unregister-current-list-buffer
+                              kill-buffer-hook))
+            (should-not kubed-ext--stale-list-buffer-p)
+            (should-not kubed-ext--marked-id-set)
+            (should-not kubed-ext--marked-id-order)
+            (should kubed-ext--marked-id-set-dirty)
+            (should-not kubed-ext--filter-highlight-state)
+            (should-not kubed-ext--persisted-mark-tags)))
+      (kill-buffer buf))))
 
 (ert-deftest kubed-ext-auto-refresh-mode-allows-disabled-interval ()
   "Enabling auto-refresh mode with nil interval should not signal."
@@ -235,6 +333,36 @@
                    (1 "pod-a")
                    (2 "pod-b")
                    (_ nil)))))
+      (should (equal (kubed-ext-marked-items)
+                     '("pod-a" "pod-b"))))))
+
+(ert-deftest kubed-ext-restore-persisted-marks-preserves-delete-tag ()
+  "Refresh mark persistence should restore upstream `D' marks as `D'."
+  (with-temp-buffer
+    (insert "* pod-a\nD pod-b\n  pod-c\n")
+    (cl-letf (((symbol-function 'derived-mode-p)
+               (lambda (&rest _modes) t))
+              ((symbol-function 'tabulated-list-get-id)
+               (lambda ()
+                 (pcase (line-number-at-pos)
+                   (1 "pod-a")
+                   (2 "pod-b")
+                   (_ nil))))
+              ((symbol-function 'tabulated-list-put-tag)
+               (lambda (tag &optional _advance)
+                 (let ((inhibit-read-only t))
+                   (delete-char 1)
+                   (insert tag)))))
+      (kubed-ext--persist-marks-before-revert)
+      (erase-buffer)
+      (insert "  pod-a\n  pod-b\n  pod-c\n")
+      (kubed-ext--restore-persisted-marks)
+      (should (eq (char-after (point-min)) ?*))
+      (should (eq (save-excursion
+                    (goto-char (point-min))
+                    (forward-line 1)
+                    (char-after))
+                  ?D))
       (should (equal (kubed-ext-marked-items)
                      '("pod-a" "pod-b"))))))
 
